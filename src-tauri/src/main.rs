@@ -142,6 +142,16 @@ struct BackgroundRemoveRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ImageMultiEditRequest {
+    model: String,
+    prompt: String,
+    images: Vec<String>,
+    resolution: Option<String>,
+    safe_mode: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueueMediaRequest {
     model: String,
     prompt: String,
@@ -424,18 +434,102 @@ fn fallback_model_cache() -> ModelCache {
         ],
         edit_models: vec![
             model(
-                "gpt-image-2-edit",
-                "GPT Image 2 Edit",
+                "firered-image-edit",
+                "Firered Image Edit",
                 "edit",
                 "edit-image",
-                json!({ "variantCount": { "min": 1, "max": 4 } }),
+                edit_controls_for_model("firered-image-edit", "Firered Image Edit"),
+            ),
+            model(
+                "qwen-edit",
+                "Qwen Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("qwen-edit", "Qwen Edit"),
+            ),
+            model(
+                "grok-imagine-edit",
+                "Grok Imagine Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("grok-imagine-edit", "Grok Imagine Edit"),
+            ),
+            model(
+                "grok-imagine-quality-edit",
+                "Grok Imagine Quality Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("grok-imagine-quality-edit", "Grok Imagine Quality Edit"),
             ),
             model(
                 "qwen-image-2-edit",
                 "Qwen Image 2 Edit",
                 "edit",
                 "edit-image",
-                json!({ "variantCount": { "min": 1, "max": 4 } }),
+                edit_controls_for_model("qwen-image-2-edit", "Qwen Image 2 Edit"),
+            ),
+            model(
+                "qwen-image-2-pro-edit",
+                "Qwen Image 2 Pro Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("qwen-image-2-pro-edit", "Qwen Image 2 Pro Edit"),
+            ),
+            model(
+                "wan-2-7-pro-edit",
+                "Wan 2.7 Pro Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("wan-2-7-pro-edit", "Wan 2.7 Pro Edit"),
+            ),
+            model(
+                "flux-2-max-edit",
+                "Flux 2 Max Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("flux-2-max-edit", "Flux 2 Max Edit"),
+            ),
+            model(
+                "gpt-image-2-edit",
+                "GPT Image 2 Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("gpt-image-2-edit", "GPT Image 2 Edit"),
+            ),
+            model(
+                "gpt-image-1-5-edit",
+                "GPT Image 1.5 Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("gpt-image-1-5-edit", "GPT Image 1.5 Edit"),
+            ),
+            model(
+                "nano-banana-2-edit",
+                "Nano Banana 2 Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("nano-banana-2-edit", "Nano Banana 2 Edit"),
+            ),
+            model(
+                "nano-banana-pro-edit",
+                "Nano Banana Pro Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("nano-banana-pro-edit", "Nano Banana Pro Edit"),
+            ),
+            model(
+                "seedream-v5-lite-edit",
+                "Seedream v5 Lite Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("seedream-v5-lite-edit", "Seedream v5 Lite Edit"),
+            ),
+            model(
+                "seedream-v4-edit",
+                "Seedream v4 Edit",
+                "edit",
+                "edit-image",
+                edit_controls_for_model("seedream-v4-edit", "Seedream v4 Edit"),
             ),
         ],
         video_models: vec![
@@ -563,7 +657,9 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
         cache.image_models = fallback.image_models;
     }
     if cache.edit_models.is_empty() {
-        cache.edit_models = fallback.edit_models;
+        cache.edit_models = fallback.edit_models.clone();
+    } else {
+        append_missing_models(&mut cache.edit_models, &fallback.edit_models);
     }
     if cache.video_models.is_empty() {
         cache.video_models = fallback.video_models;
@@ -583,6 +679,21 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
 
     for model in &mut cache.image_models {
         apply_known_image_resolution_controls(model);
+    }
+    for model in &mut cache.edit_models {
+        apply_known_image_resolution_controls(model);
+    }
+}
+
+fn append_missing_models(target: &mut Vec<ModelRecord>, fallback: &[ModelRecord]) {
+    let mut seen = target
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    for model in fallback {
+        if seen.insert(model.id.clone()) {
+            target.push(model.clone());
+        }
     }
 }
 
@@ -606,6 +717,17 @@ fn image_controls() -> Value {
 fn image_controls_with_resolutions(resolutions: &[&str]) -> Value {
     let mut controls = image_controls();
     controls["resolutionOptions"] = json!(resolutions);
+    controls
+}
+
+fn edit_controls_for_model(id: &str, name: &str) -> Value {
+    let mut controls = json!({
+        "variantCount": { "min": 1, "max": 1 }
+    });
+    let resolution_options = known_image_resolution_options(id, name);
+    if !resolution_options.is_empty() {
+        controls["resolutionOptions"] = json!(resolution_options);
+    }
     controls
 }
 
@@ -950,7 +1072,13 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
             let resolution_options =
                 image_resolution_options(&id, &name, &constraints, &capabilities);
             let controls = if is_edit {
-                json!({ "variantCount": { "min": 1, "max": 4 } })
+                let mut controls = edit_controls_for_model(&id, &name);
+                if !resolution_options.is_empty() {
+                    controls["resolutionOptions"] = json!(resolution_options);
+                }
+                controls["rawConstraints"] = constraints.clone();
+                controls["rawCapabilities"] = capabilities.clone();
+                controls
             } else {
                 json!({
                     "negativePrompt": true,
@@ -1718,6 +1846,14 @@ fn image_input_body(source_image: &str) -> Result<Value, String> {
     Ok(json!({ "image": payload }))
 }
 
+fn multi_edit_image_input(source_image: &str) -> Result<String, String> {
+    let trimmed = source_image.trim();
+    if trimmed.is_empty() {
+        return Err("Choose at least one image first".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn decode_data_url(value: &str) -> Result<(Vec<u8>, String), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1960,6 +2096,58 @@ async fn remove_background(
         "edits",
         "background-removed",
         json!({ "operation": "background-remove", "request": body }),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn multi_edit_image(
+    app: AppHandle,
+    request: ImageMultiEditRequest,
+) -> Result<MediaResult, String> {
+    let prompt = request.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("Enter an edit prompt first".to_string());
+    }
+
+    let images = request
+        .images
+        .iter()
+        .filter(|image| !image.trim().is_empty())
+        .map(|image| multi_edit_image_input(image))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if images.is_empty() {
+        return Err("Choose at least one image first".to_string());
+    }
+    if images.len() > 3 {
+        return Err("Edit/combine supports up to 3 images".to_string());
+    }
+
+    let mut body = json!({
+        "modelId": request.model.clone(),
+        "prompt": prompt,
+        "images": images,
+    });
+
+    if let Some(value) = request.resolution.filter(|value| !value.trim().is_empty()) {
+        body["resolution"] = json!(value);
+    }
+    if let Some(value) = request.safe_mode {
+        body["safe_mode"] = json!(value);
+    }
+
+    let response = venice_post_json("/image/multi-edit", body.clone()).await?;
+    save_binary_response(
+        &app,
+        response,
+        "edits",
+        &request.prompt,
+        json!({
+            "operation": "multi-edit",
+            "model": request.model,
+            "request": body
+        }),
     )
     .await
 }
@@ -2402,6 +2590,7 @@ fn main() {
             refresh_models,
             generate_image,
             remove_background,
+            multi_edit_image,
             queue_video,
             retrieve_video,
             queue_audio,

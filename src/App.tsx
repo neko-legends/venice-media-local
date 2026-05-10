@@ -712,6 +712,7 @@ export function App() {
 
   const [sourceImage, setSourceImage] = useState('')
   const [editSourceImages, setEditSourceImages] = useState<string[]>(() => Array(EDIT_SOURCE_LIMIT).fill(''))
+  const [editResolution, setEditResolution] = useState('')
   const [videoDuration, setVideoDuration] = useState('5s')
   const [videoResolution, setVideoResolution] = useState('720p')
   const [videoAspectRatio, setVideoAspectRatio] = useState('16:9')
@@ -871,13 +872,16 @@ export function App() {
   }, [actionStartedAt])
 
   const currentImageModel = imageModels.find((model) => model.id === imageModel)
+  const currentEditModel = editModels.find((model) => model.id === editModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
   const currentVoiceModel = voiceModels.find((model) => model.id === voiceModel)
   const currentTranscribeModel = transcribeModels.find((model) => model.id === transcribeModel)
   const imageRatios = controlArray(currentImageModel, 'sizeOptions', IMAGE_ASPECT_OPTIONS)
   const imageResolutions = controlArray(currentImageModel, 'resolutionOptions', EMPTY_OPTIONS)
+  const editResolutions = controlArray(currentEditModel, 'resolutionOptions', EMPTY_OPTIONS)
   const selectedAspectRatio = imageRatios.includes(aspectRatio) ? aspectRatio : imageRatios[0] ?? '1:1'
   const selectedImageResolution = imageResolutions.includes(imageResolution) ? imageResolution : ''
+  const selectedEditResolution = editResolutions.includes(editResolution) ? editResolution : editResolutions[0] ?? ''
   const videoDurations = controlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
   const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
   const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
@@ -1169,6 +1173,36 @@ export function App() {
       const output = await call<MediaResult[]>('generate_image', { request })
       rememberModelUse('image', request.model)
       setResultGroups((existing) => [createResultGroup(output, `Images · ${seedLabel} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
+  }
+
+  function editImage() {
+    const images = editSourceImages.map((source) => source.trim()).filter(Boolean)
+    if (images.length === 0) {
+      setError('Choose at least one image first')
+      setLastActionMs(null)
+      setStatus('Needs attention')
+      return
+    }
+    if (!prompt.trim()) {
+      setError('Enter an edit prompt first')
+      setLastActionMs(null)
+      setStatus('Needs attention')
+      return
+    }
+
+    const request = {
+      model: editModel,
+      prompt,
+      images,
+      resolution: selectedEditResolution || null,
+    }
+
+    enqueueJob('edit', 'Image edit/combine', async () => {
+      const startedAt = Date.now()
+      const output = await call<MediaResult>('multi_edit_image', { request })
+      rememberModelUse('edit', request.model)
+      setResultGroups((existing) => [createResultGroup([output], `Edit / Combine · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
 
@@ -1586,11 +1620,14 @@ export function App() {
                 </div>
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
+                  {editResolutions.length > 0 && (
+                    <SelectField label="Resolution" value={selectedEditResolution} onChange={setEditResolution} options={editResolutions} />
+                  )}
                   <NumberField label="Concurrent" value={concurrency.edit} min={1} max={12} step={1} onChange={(value) => updateConcurrency('edit', value)} />
                 </div>
                 <div className="action-row">
-                  <button className="secondary-action" type="button" disabled>
-                    <Scissors size={18} />
+                  <button className="secondary-action" type="button" onClick={editImage} disabled={!hasEditSource}>
+                    {jobStats.edit.running > 0 ? <Loader2 className="spin" size={18} /> : <Scissors size={18} />}
                     Edit / Combine
                   </button>
                   <button className="primary-action" type="button" onClick={removeBackground} disabled={!hasEditSource}>
