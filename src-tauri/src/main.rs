@@ -1307,7 +1307,24 @@ fn fill_corruption_buffer(buffer: &mut [u8], seed: &mut u64, pass: u8) {
     }
 }
 
-fn corrupt_regular_file(path: &Path) -> Result<u64, String> {
+fn mix_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn hash_seed_text(value: &str) -> u64 {
+    let mut hash = 14695981039346656037u64;
+    for byte in value.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    mix_seed(hash)
+}
+
+fn corrupt_regular_file(path: &Path, burn_seed: u64) -> Result<u64, String> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1329,9 +1346,11 @@ fn corrupt_regular_file(path: &Path) -> Result<u64, String> {
         .unwrap_or(0);
     let mut seed = now
         ^ len
+        ^ burn_seed
         ^ path.to_string_lossy().bytes().fold(0u64, |hash, byte| {
             hash.wrapping_mul(1099511628211).wrapping_add(byte as u64)
         });
+    seed = mix_seed(seed);
     let mut buffer = vec![0u8; 1024 * 1024];
 
     for pass in 0..2u8 {
@@ -1361,8 +1380,14 @@ fn get_burn_folder_stats(app: AppHandle) -> Result<BurnFolderStats, String> {
 }
 
 #[tauri::command]
-fn burn_folder(app: AppHandle) -> Result<BurnFolderStats, String> {
+fn burn_folder(app: AppHandle, seed: Option<String>) -> Result<BurnFolderStats, String> {
     let dir = ensure_burn_dir(&app)?;
+    let burn_seed = seed
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(hash_seed_text)
+        .unwrap_or(0);
 
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -1377,7 +1402,7 @@ fn burn_folder(app: AppHandle) -> Result<BurnFolderStats, String> {
             continue;
         }
 
-        corrupt_regular_file(&path)?;
+        corrupt_regular_file(&path, burn_seed)?;
         let burned_name =
             path.with_file_name(format!("burned-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f")));
         let delete_path = if fs::rename(&path, &burned_name).is_ok() {

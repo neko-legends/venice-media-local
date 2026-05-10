@@ -15,8 +15,8 @@
         "title": "Venice Media Local",
         "width": 1280,
         "height": 860,
-        "minWidth": 980,
-        "minHeight": 680,
+        "minWidth": 1280,
+        "minHeight": 720,
         "resizable": true,
         "fullscreen": false
       }

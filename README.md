@@ -40,6 +40,7 @@ The goal is simple:
 - Results save to local files automatically. Images default to WebP to keep files smaller.
 - Clear only removes result cards from the app. Trash moves generated files into the output folder's `burn` subfolder.
 - The burn button corrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.
+- Settings shows a live burn seed that updates from time and mouse movement, then mixes into the burn overwrite pass.
 - Models can be refreshed from Venice and managed locally.
 - The app can expose Venice API features in one place, even when different Venice clients expose those features differently.
 - The interface can be tuned for creators who generate a lot of media, instead of behaving like a general chat or social feed.

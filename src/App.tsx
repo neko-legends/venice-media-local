@@ -163,6 +163,7 @@ const JOB_LABELS: Record<JobKind, string> = {
   transcribe: 'Speech -> Text',
 }
 const ACTIVE_QUEUE_STATUSES = new Set(['queued', 'pending', 'processing', 'running', 'in_progress', 'created', 'submitted'])
+const BURN_SEED_MASK = (1n << 64n) - 1n
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
@@ -475,12 +476,41 @@ function formatBuildVersion(version: string): string {
   return commit ? `${builtAt} · ${commit}` : builtAt
 }
 
+function mixBurnSeed64(value: bigint): bigint {
+  let mixed = value & BURN_SEED_MASK
+  mixed = ((mixed ^ (mixed >> 30n)) * 0xbf58476d1ce4e5b9n) & BURN_SEED_MASK
+  mixed = ((mixed ^ (mixed >> 27n)) * 0x94d049bb133111ebn) & BURN_SEED_MASK
+  return (mixed ^ (mixed >> 31n)) & BURN_SEED_MASK
+}
+
+function cryptoSeed64(): bigint {
+  try {
+    const values = new Uint32Array(2)
+    window.crypto?.getRandomValues(values)
+    return ((BigInt(values[0]) << 32n) ^ BigInt(values[1])) & BURN_SEED_MASK
+  } catch {
+    return 0n
+  }
+}
+
+function createBurnSeed(): bigint {
+  const timestamp = BigInt(Date.now())
+  const precisionTime = BigInt(Math.floor(performance.now() * 1000))
+  return mixBurnSeed64((timestamp << 20n) ^ precisionTime ^ cryptoSeed64())
+}
+
+function formatBurnSeed(seed: bigint): string {
+  return `0x${(seed & BURN_SEED_MASK).toString(16).padStart(16, '0')}`
+}
+
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
   const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '' })
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
+  const burnSeedRef = useRef(createBurnSeed())
+  const [burnSeed, setBurnSeed] = useState(() => formatBurnSeed(burnSeedRef.current))
   const [apiKey, setApiKey] = useState('')
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
@@ -500,6 +530,8 @@ export function App() {
   const runningJobsRef = useRef<Record<JobKind, number>>(createJobCounts())
   const runningJobStartsRef = useRef<Record<JobKind, number[]>>(createJobStartQueues())
   const concurrencyRef = useRef<JobConcurrency>(concurrency)
+  const pointerSeedRef = useRef(0n)
+  const pointerFrameRef = useRef<number | null>(null)
 
   const imageModels = useMemo(() => modelList(models, overrides, 'image'), [models, overrides])
   const editModels = useMemo(() => modelList(models, overrides, 'edit'), [models, overrides])
@@ -559,6 +591,28 @@ export function App() {
   const [customModelId, setCustomModelId] = useState('')
   const [customModelName, setCustomModelName] = useState('')
 
+  function updateBurnSeed(extra: bigint) {
+    const next = mixBurnSeed64(burnSeedRef.current ^ extra ^ BigInt(Date.now()))
+    burnSeedRef.current = next
+    setBurnSeed(formatBurnSeed(next))
+  }
+
+  function mixPointerBurnSeed(event: MouseEvent<HTMLDivElement>) {
+    const x = BigInt(Math.max(0, Math.trunc(event.clientX)))
+    const y = BigInt(Math.max(0, Math.trunc(event.clientY)))
+    const movementX = BigInt(Math.max(0, Math.trunc(event.movementX + 8192)))
+    const movementY = BigInt(Math.max(0, Math.trunc(event.movementY + 8192)))
+    pointerSeedRef.current ^= (x << 48n) ^ (y << 32n) ^ (movementX << 16n) ^ movementY ^ BigInt(Date.now())
+
+    if (pointerFrameRef.current !== null) return
+    pointerFrameRef.current = window.requestAnimationFrame(() => {
+      pointerFrameRef.current = null
+      const pointerSeed = pointerSeedRef.current
+      pointerSeedRef.current = 0n
+      updateBurnSeed(pointerSeed)
+    })
+  }
+
   useEffect(() => {
     call<AppState>('get_app_state')
       .then((state) => {
@@ -571,6 +625,22 @@ export function App() {
         setLastActionMs(null)
         setStatus('Preview mode')
       })
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      updateBurnSeed(BigInt(Date.now()))
+    }, 1000)
+
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (pointerFrameRef.current !== null) {
+        window.cancelAnimationFrame(pointerFrameRef.current)
+      }
+    }
   }, [])
 
   useEffect(() => {
@@ -951,7 +1021,7 @@ export function App() {
 
     const sizeLabel = formatByteCount(stats.totalBytes) || '0 KB'
     const confirmed = window.confirm(
-      `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\n${stats.burnDir}`,
+      `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\nBurn seed: ${burnSeed}\n${stats.burnDir}`,
     )
     if (!confirmed) {
       setLastActionMs(null)
@@ -959,7 +1029,7 @@ export function App() {
       return
     }
 
-    const burned = await runAction('Burning files', () => call<BurnFolderStats>('burn_folder'))
+    const burned = await runAction('Burning files', () => call<BurnFolderStats>('burn_folder', { seed: burnSeed }))
     if (burned) {
       setStatus(`Burned ${burned.fileCount.toLocaleString()} file${burned.fileCount === 1 ? '' : 's'}`)
     }
@@ -1154,6 +1224,7 @@ export function App() {
       className="app-shell"
       onMouseOver={(event) => showTooltipFromTarget(event.target)}
       onMouseOut={handleTooltipOut}
+      onMouseMove={mixPointerBurnSeed}
       onFocus={(event) => showTooltipFromTarget(event.target)}
       onBlur={handleTooltipBlur}
     >
@@ -1476,6 +1547,15 @@ export function App() {
                       <FolderOpen size={18} />
                     </button>
                   </div>
+                </div>
+
+                <div className="settings-block">
+                  <h2>Burn Seed</h2>
+                  <label className="field">
+                    <span>Live entropy</span>
+                    <input value={burnSeed} readOnly />
+                    <small className="field-help">Updates every second and mixes mouse movement before burning files.</small>
+                  </label>
                 </div>
               </div>
             )}
