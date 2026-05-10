@@ -32,6 +32,13 @@ impl Default for AppSettings {
     }
 }
 
+fn default_settings(app: &AppHandle) -> AppSettings {
+    AppSettings {
+        theme: "eva-dark".to_string(),
+        output_dir: default_output_dir(app).unwrap_or_default(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelRecord {
@@ -184,6 +191,11 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn default_output_dir(app: &AppHandle) -> Result<String, String> {
+    let desktop = app.path().desktop_dir().map_err(|err| err.to_string())?;
+    Ok(desktop.join("VeniceMedia").to_string_lossy().to_string())
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("settings.json"))
 }
@@ -214,9 +226,14 @@ where
 }
 
 fn read_settings(app: &AppHandle) -> AppSettings {
-    settings_path(app)
-        .map(|path| read_json_file(&path, AppSettings::default()))
-        .unwrap_or_default()
+    let fallback = default_settings(app);
+    let mut settings = settings_path(app)
+        .map(|path| read_json_file(&path, fallback.clone()))
+        .unwrap_or_else(|_| fallback.clone());
+    if settings.output_dir.trim().is_empty() {
+        settings.output_dir = fallback.output_dir;
+    }
+    settings
 }
 
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
@@ -640,7 +657,7 @@ fn output_root(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, Strin
     if !settings.output_dir.trim().is_empty() {
         return Ok(PathBuf::from(settings.output_dir.trim()));
     }
-    Ok(app_data_dir(app)?.join("outputs"))
+    Ok(PathBuf::from(default_output_dir(app)?))
 }
 
 fn save_media_bytes(
@@ -1088,6 +1105,7 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             save_settings,

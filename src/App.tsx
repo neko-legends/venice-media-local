@@ -1,7 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import {
   Database,
   Download,
+  FolderOpen,
   Image as ImageIcon,
   KeyRound,
   Loader2,
@@ -9,7 +11,6 @@ import {
   Music,
   Plus,
   RefreshCw,
-  Save,
   Scissors,
   Settings,
   Trash2,
@@ -358,6 +359,20 @@ export function App() {
     await call<AppSettings>('save_settings', { request: next }).catch(() => undefined)
   }
 
+  async function chooseOutputFolder() {
+    const selected = await runAction('Choosing output folder', () =>
+      open({
+        directory: true,
+        multiple: false,
+        defaultPath: settings.outputDir || undefined,
+        title: 'Choose output folder',
+      }),
+    )
+    if (typeof selected === 'string') {
+      await persistSettings({ ...settings, outputDir: selected })
+    }
+  }
+
   async function generateImage(event: FormEvent) {
     event.preventDefault()
     const output = await runAction('Generating image', () =>
@@ -700,11 +715,11 @@ export function App() {
                   <div className="key-row">
                     <input
                       value={settings.outputDir}
-                      onChange={(event) => setSettings({ ...settings, outputDir: event.target.value })}
-                      placeholder="Default app data folder"
+                      readOnly
+                      placeholder="Desktop\\VeniceMedia"
                     />
-                    <button className="icon-button" type="button" onClick={() => persistSettings(settings)} title="Save output folder">
-                      <Save size={18} />
+                    <button className="icon-button" type="button" onClick={chooseOutputFolder} title="Choose output folder">
+                      <FolderOpen size={18} />
                     </button>
                   </div>
                 </div>
