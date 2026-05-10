@@ -464,9 +464,22 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   min-height: 56px;
   padding: 0 16px;
   border-bottom: 1px solid var(--border);
+}
+
+.result-title,
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.result-actions {
+  flex-shrink: 0;
 }
 
 .result-header span {
@@ -479,6 +492,11 @@ button {
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
+}
+
+.icon-button.compact {
+  width: 30px;
+  height: 30px;
 }
 
 .results {
@@ -577,6 +595,31 @@ button {
   color: var(--accent-2);
   font-weight: 700;
   text-decoration: none;
+}
+
+.result-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent-2);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.link-button.danger {
+  color: var(--danger);
 }
 
 .settings-block {

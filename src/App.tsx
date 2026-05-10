@@ -3,6 +3,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import {
   Database,
   Download,
+  Eraser,
   FolderOpen,
   Image as ImageIcon,
   KeyRound,
@@ -333,6 +334,7 @@ export function App() {
   const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', ['16:9', '9:16', '1:1'])
   const voiceOptions = controlArray(currentVoiceModel, 'voices', ['am_eric', 'af_bella', 'af_nova'])
   const resultCount = resultGroups.reduce((total, group) => total + group.results.length, 0)
+  const resultFilePaths = resultGroups.flatMap((group) => group.results.map((result) => result.filePath))
 
   async function runAction<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setError('')
@@ -409,7 +411,30 @@ export function App() {
         },
       }),
     )
-    if (output) setResultGroups((existing) => [createResultGroup(output, `${output.length} image${output.length === 1 ? '' : 's'}`), ...existing])
+    if (output) setResultGroups((existing) => [createResultGroup(output, 'Images'), ...existing])
+  }
+
+  async function deleteResultFiles(paths: string[], label: string) {
+    const uniquePaths = Array.from(new Set(paths.filter(Boolean)))
+    if (uniquePaths.length === 0) return
+    if (!window.confirm(`Delete ${label} from disk? This cannot be undone.`)) return
+
+    const deleted = await runAction('Deleting files', () => call<string[]>('delete_media_files', { paths: uniquePaths }))
+    if (!deleted) return
+
+    const deletedSet = new Set(deleted)
+    setResultGroups((existing) =>
+      existing
+        .map((group) => ({
+          ...group,
+          results: group.results.filter((result) => !deletedSet.has(result.filePath)),
+        }))
+        .filter((group) => group.results.length > 0),
+    )
+  }
+
+  function clearResults() {
+    setResultGroups([])
   }
 
   async function loadSourceImage(event: ChangeEvent<HTMLInputElement>) {
@@ -760,8 +785,20 @@ export function App() {
               </div>
             )}
             <div className="result-header">
-              <h2>Results</h2>
-              <span>{resultCount}</span>
+              <div className="result-title">
+                <h2>Results</h2>
+                <span>{resultCount}</span>
+              </div>
+              {resultCount > 0 && (
+                <div className="result-actions">
+                  <button className="icon-button compact" type="button" onClick={clearResults} title="Clear results">
+                    <Eraser size={16} />
+                  </button>
+                  <button className="icon-button compact danger" type="button" onClick={() => deleteResultFiles(resultFilePaths, 'all result files')} title="Delete all result files">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              )}
             </div>
             <div className="results">
               {resultGroups.length === 0 && <div className="empty-results">No media yet</div>}
@@ -769,7 +806,12 @@ export function App() {
                 <section className="result-group" key={group.id}>
                   <div className="result-group-header">
                     <strong>{group.title}</strong>
-                    <span>{group.results.length}</span>
+                    <div className="result-actions">
+                      <span>{group.results.length}</span>
+                      <button className="icon-button compact danger" type="button" onClick={() => deleteResultFiles(group.results.map((result) => result.filePath), 'this result set')} title="Delete result set files">
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </div>
                   <div className={classNames('result-group-grid', group.kind !== 'images' && 'single')}>
                     {group.results.map((result) => (
@@ -780,10 +822,16 @@ export function App() {
                         <div className="result-meta">
                           <strong>{result.name}</strong>
                           <small>{result.filePath}</small>
-                          <a href={result.dataUrl} download={result.name}>
-                            <Download size={16} />
-                            Save
-                          </a>
+                          <div className="result-links">
+                            <a href={result.dataUrl} download={result.name}>
+                              <Download size={16} />
+                              Save
+                            </a>
+                            <button className="link-button danger" type="button" onClick={() => deleteResultFiles([result.filePath], 'this file')}>
+                              <Trash2 size={14} />
+                              Delete
+                            </button>
+                          </div>
                         </div>
                       </article>
                     ))}

@@ -694,6 +694,32 @@ fn save_media_bytes(
     })
 }
 
+#[tauri::command]
+fn delete_media_files(paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut deleted = Vec::new();
+
+    for raw_path in paths {
+        let trimmed = raw_path.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(&trimmed);
+        if !path.exists() {
+            deleted.push(trimmed);
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!("Refusing to delete non-file path: {trimmed}"));
+        }
+
+        fs::remove_file(&path).map_err(|err| format!("Failed to delete {trimmed}: {err}"))?;
+        deleted.push(trimmed);
+    }
+
+    Ok(deleted)
+}
+
 fn decode_base64_payload(value: &str) -> Result<Vec<u8>, String> {
     let payload = value
         .split_once(',')
@@ -1117,6 +1143,7 @@ fn main() {
             save_api_key,
             clear_api_key,
             get_models,
+            delete_media_files,
             refresh_models,
             generate_image,
             queue_video,
