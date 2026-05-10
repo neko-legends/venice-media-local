@@ -1,12 +1,12 @@
 # Venice Media Local
 
-Local Tauri desktop app for Venice-powered media generation.
+Venice Media Local is a fan-made desktop app for the Venice community. It lets you use your own Venice API key to generate media locally, with images, video, music, sound effects, voice, and speech-to-text grouped into one workspace.
 
-This app is intended to be shared with Venice community users as a local desktop tool. The UI is React/Vite, and the native shell/API layer is Tauri 2 with Rust.
+The purpose is simple: keep your API key and generated files on your machine, make heavy media sessions easier than a browser tab, and give users a privacy-minded cleanup path. Normal file deletion can leave recoverable traces for forensic tools, so this app has a burn folder workflow that overwrites/corrupts files before deleting them.
+
+This project is not affiliated with, endorsed by, or maintained by Venice. It is an independent community app built around Venice's API and aligned with the idea that users should control their own keys, files, and local workflow.
 
 ## For Humans
-
-Venice Media Local is a desktop media generator for people who want one local place to use Venice's media API.
 
 Use an official release build or build the app locally, paste in your own Venice API key, and generate media from your machine. The key stays on your computer in the operating system credential store. There is no shared server operated by this project.
 
