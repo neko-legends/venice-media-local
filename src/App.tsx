@@ -91,6 +91,12 @@ type RetrieveResult = {
   raw: unknown
 }
 
+type BurnFolderStats = {
+  fileCount: number
+  totalBytes: number
+  burnDir: string
+}
+
 type Overrides = {
   hidden: Partial<Record<ModelKind, string[]>>
   custom: Partial<Record<ModelKind, ModelRecord[]>>
@@ -256,6 +262,10 @@ function controlBool(model: ModelRecord | undefined, key: string, fallback: bool
 }
 
 function formatFileSize(bytes: number): string {
+  return formatByteCount(bytes)
+}
+
+function formatByteCount(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return ''
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -535,23 +545,46 @@ export function App() {
     if (output) setResultGroups((existing) => [createResultGroup([output], 'Background Removed'), ...existing])
   }
 
-  async function deleteResultFiles(paths: string[], label: string) {
+  async function moveResultFilesToBurn(paths: string[], label: string) {
     const uniquePaths = Array.from(new Set(paths.filter(Boolean)))
     if (uniquePaths.length === 0) return
-    if (!window.confirm(`Delete ${label} from disk? This cannot be undone.`)) return
+    if (!window.confirm(`Move ${label} to the burn folder? This removes it from Results but does not burn it yet.`)) return
 
-    const deleted = await runAction('Deleting files', () => call<string[]>('delete_media_files', { paths: uniquePaths }))
-    if (!deleted) return
+    const moved = await runAction('Moving files to burn folder', () => call<string[]>('move_media_files_to_burn', { paths: uniquePaths }))
+    if (!moved) return
 
-    const deletedSet = new Set(deleted)
+    const movedSet = new Set(moved)
     setResultGroups((existing) =>
       existing
         .map((group) => ({
           ...group,
-          results: group.results.filter((result) => !deletedSet.has(result.filePath)),
+          results: group.results.filter((result) => !movedSet.has(result.filePath)),
         }))
         .filter((group) => group.results.length > 0),
     )
+  }
+
+  async function burnFolder() {
+    const stats = await runAction('Checking burn folder', () => call<BurnFolderStats>('get_burn_folder_stats'))
+    if (!stats) return
+    if (stats.fileCount === 0) {
+      setStatus('Burn folder is empty')
+      return
+    }
+
+    const sizeLabel = formatByteCount(stats.totalBytes) || '0 KB'
+    const confirmed = window.confirm(
+      `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\n${stats.burnDir}`,
+    )
+    if (!confirmed) {
+      setStatus('Ready')
+      return
+    }
+
+    const burned = await runAction('Burning files', () => call<BurnFolderStats>('burn_folder'))
+    if (burned) {
+      setStatus(`Burned ${burned.fileCount.toLocaleString()} file${burned.fileCount === 1 ? '' : 's'}`)
+    }
   }
 
   function clearResults() {
@@ -1038,16 +1071,21 @@ export function App() {
                 <h2>Results</h2>
                 <span>{resultCount}</span>
               </div>
-              {resultCount > 0 && (
-                <div className="result-actions">
-                  <button className="icon-button compact" type="button" onClick={clearResults} title="Clear results">
-                    <Eraser size={16} />
-                  </button>
-                  <button className="icon-button compact danger" type="button" onClick={() => deleteResultFiles(resultFilePaths, 'all result files')} title="Delete all result files">
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-              )}
+              <div className="result-actions">
+                <button className="icon-button compact burn-button" type="button" onClick={burnFolder} title="Burn folder">
+                  <BlackFlameIcon size={16} />
+                </button>
+                {resultCount > 0 && (
+                  <>
+                    <button className="icon-button compact" type="button" onClick={clearResults} title="Clear results">
+                      <Eraser size={16} />
+                    </button>
+                    <button className="icon-button compact danger" type="button" onClick={() => moveResultFilesToBurn(resultFilePaths, 'all result files')} title="Move all result files to burn folder">
+                      <Trash2 size={16} />
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
             <div className="results">
               {resultGroups.length === 0 && <div className="empty-results">No media yet</div>}
@@ -1057,7 +1095,7 @@ export function App() {
                     <strong>{group.title}</strong>
                     <div className="result-actions">
                       <span>{group.results.length}</span>
-                      <button className="icon-button compact danger" type="button" onClick={() => deleteResultFiles(group.results.map((result) => result.filePath), 'this result set')} title="Delete result set files">
+                      <button className="icon-button compact danger" type="button" onClick={() => moveResultFilesToBurn(group.results.map((result) => result.filePath), 'this result set')} title="Move result set to burn folder">
                         <Trash2 size={14} />
                       </button>
                     </div>
@@ -1077,7 +1115,7 @@ export function App() {
                               <Download size={16} />
                               Save
                             </a>
-                            <button className="link-button danger" type="button" onClick={() => deleteResultFiles([result.filePath], 'this file')}>
+                            <button className="link-button danger" type="button" onClick={() => moveResultFilesToBurn([result.filePath], 'this file')}>
                               <Trash2 size={14} />
                               Delete
                             </button>
@@ -1093,6 +1131,22 @@ export function App() {
         </section>
       </main>
     </div>
+  )
+}
+
+function BlackFlameIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      className="burn-icon"
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      width={size}
+      height={size}
+      focusable="false"
+    >
+      <path d="M12.6 2.1c.4 3.1-.7 5-2.2 6.8-1.3 1.6-2.8 3.3-2.1 6 .3 1.1 1 2.1 2 2.7-.4-1.8.1-3.2 1.3-4.5.8-.8 1.5-1.7 1.7-3.1 2.5 2 3.6 4.1 3 6.4-.4 1.7-1.8 3-3.8 3.5 4.4-.2 7.4-3.1 7.4-7.2 0-3.1-1.9-5.5-4.2-7.6-.9-.8-1.8-1.6-3.1-3z" />
+      <path d="M7.2 10.2c-2.1 1.4-3.1 3.2-3.1 5.2 0 3.1 2.4 5.5 6.1 5.9-2.1-1.2-3.3-3-3.4-5.2-.1-1.9.6-3.4.4-5.9z" />
+    </svg>
   )
 }
 

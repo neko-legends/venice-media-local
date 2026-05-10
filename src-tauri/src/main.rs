@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, OpenOptions},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
@@ -202,6 +204,14 @@ struct RetrieveResult {
     progress_label: String,
     result: Option<MediaResult>,
     raw: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BurnFolderStats {
+    file_count: usize,
+    total_bytes: u64,
+    burn_dir: String,
 }
 
 fn keyring_entry() -> Result<keyring::Entry, String> {
@@ -1114,11 +1124,61 @@ fn save_text_result(
     Ok(result)
 }
 
-#[tauri::command]
-fn delete_media_files(paths: Vec<String>) -> Result<Vec<String>, String> {
-    let mut deleted = Vec::new();
+fn burn_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let settings = read_settings(app);
+    Ok(output_root(app, &settings)?.join("burn"))
+}
 
-    for raw_path in paths {
+fn canonical_output_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let settings = read_settings(app);
+    let root = output_root(app, &settings)?;
+    fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+    root.canonicalize().map_err(|err| err.to_string())
+}
+
+fn ensure_under_output(app: &AppHandle, path: &Path) -> Result<(), String> {
+    let root = canonical_output_root(app)?;
+    let canonical = path.canonicalize().map_err(|err| err.to_string())?;
+    if canonical.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to move a file outside the output folder: {}",
+            path.to_string_lossy()
+        ))
+    }
+}
+
+fn unique_burn_path(dir: &Path, original_name: &str, index: usize) -> PathBuf {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    let clean_name = original_name
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            _ => ch,
+        })
+        .collect::<String>();
+    let name = if clean_name.trim().is_empty() {
+        format!("{timestamp}-{index}.bin")
+    } else {
+        format!("{timestamp}-{index}-{clean_name}")
+    };
+    let mut candidate = dir.join(&name);
+    let mut attempt = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{timestamp}-{index}-{attempt}-{clean_name}"));
+        attempt += 1;
+    }
+    candidate
+}
+
+#[tauri::command]
+fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut moved = Vec::new();
+    let burn_dir = burn_dir(&app)?;
+    fs::create_dir_all(&burn_dir).map_err(|err| err.to_string())?;
+
+    for (index, raw_path) in paths.into_iter().enumerate() {
         let trimmed = raw_path.trim().to_string();
         if trimmed.is_empty() {
             continue;
@@ -1126,18 +1186,167 @@ fn delete_media_files(paths: Vec<String>) -> Result<Vec<String>, String> {
 
         let path = PathBuf::from(&trimmed);
         if !path.exists() {
-            deleted.push(trimmed);
+            moved.push(trimmed);
             continue;
         }
         if !path.is_file() {
-            return Err(format!("Refusing to delete non-file path: {trimmed}"));
+            return Err(format!("Refusing to move non-file path: {trimmed}"));
         }
 
-        fs::remove_file(&path).map_err(|err| format!("Failed to delete {trimmed}: {err}"))?;
-        deleted.push(trimmed);
+        ensure_under_output(&app, &path)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("media.bin");
+        let target = unique_burn_path(&burn_dir, file_name, index);
+        fs::rename(&path, &target)
+            .map_err(|err| format!("Failed to move {trimmed} to burn folder: {err}"))?;
+        moved.push(trimmed);
     }
 
-    Ok(deleted)
+    Ok(moved)
+}
+
+fn collect_burn_entries(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    dirs: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dir).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            files.push(path);
+        } else if metadata.is_dir() {
+            collect_burn_entries(&path, files, dirs)?;
+            dirs.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn burn_folder_stats_for_dir(dir: &Path) -> Result<BurnFolderStats, String> {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    collect_burn_entries(dir, &mut files, &mut dirs)?;
+
+    let mut total_bytes = 0;
+    for path in &files {
+        total_bytes += fs::symlink_metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+    }
+
+    Ok(BurnFolderStats {
+        file_count: files.len(),
+        total_bytes,
+        burn_dir: dir.to_string_lossy().to_string(),
+    })
+}
+
+fn fill_corruption_buffer(buffer: &mut [u8], seed: &mut u64, pass: u8) {
+    for byte in buffer.iter_mut() {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *byte = ((*seed >> 24) as u8) ^ pass.wrapping_mul(0xa5);
+    }
+}
+
+fn corrupt_regular_file(path: &Path) -> Result<u64, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))?;
+    let len = file
+        .metadata()
+        .map_err(|err| format!("Failed to inspect {}: {err}", path.to_string_lossy()))?
+        .len();
+    if len == 0 {
+        file.sync_data()
+            .map_err(|err| format!("Failed to flush {}: {err}", path.to_string_lossy()))?;
+        return Ok(0);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = now
+        ^ len
+        ^ path.to_string_lossy().bytes().fold(0u64, |hash, byte| {
+            hash.wrapping_mul(1099511628211).wrapping_add(byte as u64)
+        });
+    let mut buffer = vec![0u8; 1024 * 1024];
+
+    for pass in 0..2u8 {
+        file.seek(SeekFrom::Start(0))
+            .map_err(|err| format!("Failed to seek {}: {err}", path.to_string_lossy()))?;
+        let mut remaining = len;
+        while remaining > 0 {
+            let write_len = remaining.min(buffer.len() as u64) as usize;
+            fill_corruption_buffer(&mut buffer[..write_len], &mut seed, pass);
+            file.write_all(&buffer[..write_len])
+                .map_err(|err| format!("Failed to overwrite {}: {err}", path.to_string_lossy()))?;
+            remaining -= write_len as u64;
+        }
+        file.flush()
+            .map_err(|err| format!("Failed to flush {}: {err}", path.to_string_lossy()))?;
+        file.sync_data()
+            .map_err(|err| format!("Failed to sync {}: {err}", path.to_string_lossy()))?;
+    }
+
+    Ok(len)
+}
+
+#[tauri::command]
+fn get_burn_folder_stats(app: AppHandle) -> Result<BurnFolderStats, String> {
+    let dir = burn_dir(&app)?;
+    burn_folder_stats_for_dir(&dir)
+}
+
+#[tauri::command]
+fn burn_folder(app: AppHandle) -> Result<BurnFolderStats, String> {
+    let dir = burn_dir(&app)?;
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    collect_burn_entries(&dir, &mut files, &mut dirs)?;
+    let stats = burn_folder_stats_for_dir(&dir)?;
+
+    for path in files {
+        let metadata = fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+        if metadata.file_type().is_symlink() {
+            fs::remove_file(&path)
+                .map_err(|err| format!("Failed to delete {}: {err}", path.to_string_lossy()))?;
+            continue;
+        }
+
+        corrupt_regular_file(&path)?;
+        let burned_name =
+            path.with_file_name(format!("burned-{}", Utc::now().format("%Y%m%d-%H%M%S-%3f")));
+        let delete_path = if fs::rename(&path, &burned_name).is_ok() {
+            burned_name
+        } else {
+            path
+        };
+        fs::remove_file(&delete_path)
+            .map_err(|err| format!("Failed to delete {}: {err}", delete_path.to_string_lossy()))?;
+    }
+
+    for dir in dirs.into_iter().rev() {
+        let _ = fs::remove_dir(&dir);
+    }
+
+    Ok(stats)
 }
 
 fn decode_base64_payload(value: &str) -> Result<Vec<u8>, String> {
@@ -1818,7 +2027,9 @@ fn main() {
             save_api_key,
             clear_api_key,
             get_models,
-            delete_media_files,
+            move_media_files_to_burn,
+            get_burn_folder_stats,
+            burn_folder,
             refresh_models,
             generate_image,
             remove_background,

@@ -246,6 +246,25 @@ button {
   color: var(--danger);
 }
 
+.burn-button {
+  background: color-mix(in srgb, #f2a65a 86%, var(--surface-2));
+  border-color: color-mix(in srgb, #f2a65a 72%, var(--border));
+  color: #050505;
+}
+
+.burn-button:hover {
+  background: #f7b96f;
+  border-color: #f7b96f;
+  color: #050505;
+}
+
+.burn-icon {
+  fill: #050505;
+  stroke: rgb(255 255 255 / 0.32);
+  stroke-width: 0.55;
+  filter: drop-shadow(0 1px 0 rgb(255 255 255 / 0.18));
+}
+
 .notice {
   display: flex;
   align-items: center;
