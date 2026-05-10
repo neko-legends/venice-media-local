@@ -6,6 +6,10 @@ The purpose is simple: keep your API key and generated files on your machine, ma
 
 This project is not affiliated with, endorsed by, or maintained by Venice. It is an independent community app built around Venice's API and aligned with the idea that users should control their own keys, files, and local workflow.
 
+## Demo
+
+Watch the quick demo: [video.mp4](./video.mp4)
+
 ## For Humans
 
 Use an official release build or build the app locally, paste in your own Venice API key, and generate media from your machine. The key stays on your computer in the operating system credential store. There is no shared server operated by this project.
