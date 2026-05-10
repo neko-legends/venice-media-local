@@ -1179,18 +1179,16 @@ export function App() {
         </header>
 
         {error && <div className="notice error">{error}</div>}
-        {(status || tooltip) && (
-          <div className="notice">
-            {loading || hasRunningJobs ? <Loader2 className="spin" size={16} /> : null}
-            <span className="notice-message">{status || 'Ready'}</span>
-            {(runningJobCount > 0 || queuedJobCount > 0) && (
-              <span className="elapsed-pill">{runningJobCount} running · {queuedJobCount} queued</span>
-            )}
-            {activeElapsedLabel && <span className="elapsed-pill">{activeElapsedLabel}</span>}
-            {completedElapsedLabel && <span className="elapsed-pill">{completedElapsedLabel}</span>}
-            {tooltip && <span className="tooltip-hint">{tooltip}</span>}
-          </div>
-        )}
+        <div className="notice">
+          {loading || hasRunningJobs ? <Loader2 className="spin" size={16} /> : null}
+          <span className="notice-message">{status || 'Ready'}</span>
+          {(runningJobCount > 0 || queuedJobCount > 0) && (
+            <span className="elapsed-pill">{runningJobCount} running · {queuedJobCount} queued</span>
+          )}
+          {activeElapsedLabel && <span className="elapsed-pill">{activeElapsedLabel}</span>}
+          {completedElapsedLabel && <span className="elapsed-pill">{completedElapsedLabel}</span>}
+          {tooltip && <span className="tooltip-hint">{tooltip}</span>}
+        </div>
 
         <section className="content-grid">
           <div className="tool-surface">
