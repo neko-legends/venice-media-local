@@ -132,9 +132,13 @@ type Overrides = {
   custom: Partial<Record<ModelKind, ModelRecord[]>>
 }
 
+type RecentModels = Partial<Record<ModelKind, string[]>>
+
 const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
 const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
+const STORAGE_RECENT_MODELS = 'veniceMediaLocal:recentModels:v1'
 const EDIT_SOURCE_LIMIT = 3
+const MAX_RECENT_MODELS = 5
 const IMAGE_ASPECT_OPTIONS = ['1:1', '4:3', '3:4', '16:9', '9:16']
 const VIDEO_DURATION_OPTIONS = ['5s', '10s']
 const VIDEO_RESOLUTION_OPTIONS = ['480p', '720p', '1080p']
@@ -292,6 +296,53 @@ function writeConcurrency(value: JobConcurrency) {
   localStorage.setItem(STORAGE_CONCURRENCY, JSON.stringify(value))
 }
 
+function normalizeRecentModelIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const id = entry.trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+    if (ids.length >= MAX_RECENT_MODELS) break
+  }
+  return ids
+}
+
+function normalizeRecentModels(value: unknown): RecentModels {
+  if (!value || typeof value !== 'object') return {}
+  const raw = value as Record<string, unknown>
+  return JOB_KINDS.reduce((recent, kind) => {
+    const ids = normalizeRecentModelIds(raw[kind])
+    if (ids.length > 0) recent[kind] = ids
+    return recent
+  }, {} as RecentModels)
+}
+
+function readRecentModels(): RecentModels {
+  try {
+    const raw = localStorage.getItem(STORAGE_RECENT_MODELS)
+    return raw ? normalizeRecentModels(JSON.parse(raw)) : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeRecentModels(value: RecentModels) {
+  localStorage.setItem(STORAGE_RECENT_MODELS, JSON.stringify(normalizeRecentModels(value)))
+}
+
+function promoteRecentModel(value: RecentModels, kind: ModelKind, modelId: string): RecentModels {
+  const id = modelId.trim()
+  if (!id) return value
+  return {
+    ...value,
+    [kind]: [id, ...(value[kind] ?? []).filter((existing) => existing !== id)].slice(0, MAX_RECENT_MODELS),
+  }
+}
+
 function createJobStats(): JobStats {
   return JOB_KINDS.reduce((stats, kind) => {
     stats[kind] = { running: 0, queued: 0, completed: 0, failed: 0, lastMs: null, oldestStartedAt: null }
@@ -340,6 +391,19 @@ function modelList(cache: ModelCache, overrides: Overrides, kind: ModelKind): Mo
     if (!hidden.has(model.id)) byId.set(model.id, model)
   }
   return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name))
+}
+
+function sortModelsByRecent(models: ModelRecord[], recentIds: string[] = []): ModelRecord[] {
+  if (recentIds.length === 0) return models
+  const byId = new Map(models.map((model) => [model.id, model]))
+  const used = new Set<string>()
+  const recent = recentIds.flatMap((id) => {
+    const model = byId.get(id)
+    if (!model) return []
+    used.add(id)
+    return [model]
+  })
+  return [...recent, ...models.filter((model) => !used.has(model.id))]
 }
 
 function firstModelId(models: ModelRecord[]): string {
@@ -521,6 +585,7 @@ export function App() {
   const [lastActionMs, setLastActionMs] = useState<number | null>(null)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [overrides, setOverrides] = useState<Overrides>(() => readOverrides())
+  const [recentModels, setRecentModels] = useState<RecentModels>(() => readRecentModels())
   const [concurrency, setConcurrency] = useState<JobConcurrency>(() => readConcurrency())
   const [jobStats, setJobStats] = useState<JobStats>(() => createJobStats())
   const [remoteQueues, setRemoteQueues] = useState<RemoteQueueJob[]>([])
@@ -533,13 +598,20 @@ export function App() {
   const pointerSeedRef = useRef(0n)
   const pointerFrameRef = useRef<number | null>(null)
 
-  const imageModels = useMemo(() => modelList(models, overrides, 'image'), [models, overrides])
-  const editModels = useMemo(() => modelList(models, overrides, 'edit'), [models, overrides])
-  const videoModels = useMemo(() => modelList(models, overrides, 'video'), [models, overrides])
-  const musicModels = useMemo(() => modelList(models, overrides, 'music'), [models, overrides])
-  const sfxModels = useMemo(() => modelList(models, overrides, 'sfx'), [models, overrides])
-  const voiceModels = useMemo(() => modelList(models, overrides, 'voice'), [models, overrides])
-  const transcribeModels = useMemo(() => modelList(models, overrides, 'transcribe'), [models, overrides])
+  const rawImageModels = useMemo(() => modelList(models, overrides, 'image'), [models, overrides])
+  const rawEditModels = useMemo(() => modelList(models, overrides, 'edit'), [models, overrides])
+  const rawVideoModels = useMemo(() => modelList(models, overrides, 'video'), [models, overrides])
+  const rawMusicModels = useMemo(() => modelList(models, overrides, 'music'), [models, overrides])
+  const rawSfxModels = useMemo(() => modelList(models, overrides, 'sfx'), [models, overrides])
+  const rawVoiceModels = useMemo(() => modelList(models, overrides, 'voice'), [models, overrides])
+  const rawTranscribeModels = useMemo(() => modelList(models, overrides, 'transcribe'), [models, overrides])
+  const imageModels = useMemo(() => sortModelsByRecent(rawImageModels, recentModels.image), [rawImageModels, recentModels.image])
+  const editModels = useMemo(() => sortModelsByRecent(rawEditModels, recentModels.edit), [rawEditModels, recentModels.edit])
+  const videoModels = useMemo(() => sortModelsByRecent(rawVideoModels, recentModels.video), [rawVideoModels, recentModels.video])
+  const musicModels = useMemo(() => sortModelsByRecent(rawMusicModels, recentModels.music), [rawMusicModels, recentModels.music])
+  const sfxModels = useMemo(() => sortModelsByRecent(rawSfxModels, recentModels.sfx), [rawSfxModels, recentModels.sfx])
+  const voiceModels = useMemo(() => sortModelsByRecent(rawVoiceModels, recentModels.voice), [rawVoiceModels, recentModels.voice])
+  const transcribeModels = useMemo(() => sortModelsByRecent(rawTranscribeModels, recentModels.transcribe), [rawTranscribeModels, recentModels.transcribe])
 
   const [imageModel, setImageModel] = useState('')
   const [editModel, setEditModel] = useState('')
@@ -595,6 +667,15 @@ export function App() {
     const next = mixBurnSeed64(burnSeedRef.current ^ extra ^ BigInt(Date.now()))
     burnSeedRef.current = next
     setBurnSeed(formatBurnSeed(next))
+  }
+
+  function rememberModelUse(kind: ModelKind, modelId: string) {
+    if (!modelId.trim()) return
+    setRecentModels((existing) => {
+      const next = promoteRecentModel(existing, kind, modelId)
+      writeRecentModels(next)
+      return next
+    })
   }
 
   function mixPointerBurnSeed(event: MouseEvent<HTMLDivElement>) {
@@ -966,6 +1047,7 @@ export function App() {
     enqueueJob('image', `Image generation · ${seedLabel}`, async () => {
       const startedAt = Date.now()
       const output = await call<MediaResult[]>('generate_image', { request })
+      rememberModelUse('image', request.model)
       setResultGroups((existing) => [createResultGroup(output, `Images · ${seedLabel} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
@@ -986,6 +1068,7 @@ export function App() {
           sourceImage: backgroundSource,
         },
       })
+      rememberModelUse('edit', editModel)
       setResultGroups((existing) => [createResultGroup([output], `Background Removed · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
@@ -1122,6 +1205,7 @@ export function App() {
     enqueueJob('video', 'Video generation', async () => {
       const startedAt = Date.now()
       const queued = await call<QueueResult>('queue_video', { request })
+      rememberModelUse('video', request.model)
       const result = await waitForQueuedMedia('video', queued, request.model)
       setResultGroups((existing) => [createResultGroup([result], `Video · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
@@ -1141,6 +1225,7 @@ export function App() {
     enqueueJob(kind, `${JOB_LABELS[kind]} generation`, async () => {
       const startedAt = Date.now()
       const queued = await call<QueueResult>('queue_audio', { request })
+      rememberModelUse(kind, request.model)
       const result = await waitForQueuedMedia(kind, queued, request.model)
       setResultGroups((existing) => [createResultGroup([result], `${JOB_LABELS[kind]} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
@@ -1160,6 +1245,7 @@ export function App() {
     enqueueJob('voice', 'Voice generation', async () => {
       const startedAt = Date.now()
       const output = await call<MediaResult>('generate_speech', { request })
+      rememberModelUse('voice', request.model)
       setResultGroups((existing) => [createResultGroup([output], `Voice · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
@@ -1186,6 +1272,7 @@ export function App() {
     enqueueJob('transcribe', 'Speech transcription', async () => {
       const startedAt = Date.now()
       const output = await call<MediaResult>('transcribe_audio', { request })
+      rememberModelUse('transcribe', request.model)
       setResultGroups((existing) => [createResultGroup([output], `Speech -> Text · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
@@ -1293,7 +1380,7 @@ export function App() {
           <div className="tool-surface">
             {mode === 'image' && (
               <form onSubmit={generateImage} className="tool-form">
-                <ModelSelect label="Model" value={imageModel} onChange={setImageModel} models={imageModels} />
+                <ModelSelect label="Model" value={imageModel} onChange={setImageModel} models={imageModels} recentModelIds={recentModels.image} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
@@ -1347,7 +1434,7 @@ export function App() {
 
             {mode === 'edit' && (
               <form className="tool-form">
-                <ModelSelect label="Model" value={editModel} onChange={setEditModel} models={editModels} />
+                <ModelSelect label="Model" value={editModel} onChange={setEditModel} models={editModels} recentModelIds={recentModels.edit} />
                 <div className="edit-source-layout">
                   <SourcePicker
                     className="edit-source-main"
@@ -1390,7 +1477,7 @@ export function App() {
 
             {mode === 'video' && (
               <form onSubmit={queueVideo} className="tool-form">
-                <ModelSelect label="Model" value={videoModel} onChange={setVideoModel} models={videoModels} />
+                <ModelSelect label="Model" value={videoModel} onChange={setVideoModel} models={videoModels} recentModelIds={recentModels.video} />
                 <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />
                 <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
@@ -1407,7 +1494,7 @@ export function App() {
 
             {mode === 'music' && (
               <form onSubmit={(event) => queueAudio(event, 'music')} className="tool-form">
-                <ModelSelect label="Model" value={musicModel} onChange={setMusicModel} models={musicModels} />
+                <ModelSelect label="Model" value={musicModel} onChange={setMusicModel} models={musicModels} recentModelIds={recentModels.music} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />
                 <div className="control-grid">
@@ -1429,7 +1516,7 @@ export function App() {
 
             {mode === 'sfx' && (
               <form onSubmit={(event) => queueAudio(event, 'sfx')} className="tool-form">
-                <ModelSelect label="Model" value={sfxModel} onChange={setSfxModel} models={sfxModels} />
+                <ModelSelect label="Model" value={sfxModel} onChange={setSfxModel} models={sfxModels} recentModelIds={recentModels.sfx} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
                   <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />
@@ -1442,7 +1529,7 @@ export function App() {
 
             {mode === 'voice' && (
               <form onSubmit={generateVoice} className="tool-form">
-                <ModelSelect label="Model" value={voiceModel} onChange={setVoiceModel} models={voiceModels} />
+                <ModelSelect label="Model" value={voiceModel} onChange={setVoiceModel} models={voiceModels} recentModelIds={recentModels.voice} />
                 <PromptArea label="Text" value={voiceText} onChange={setVoiceText} rows={7} />
                 <div className="control-grid">
                   <SelectField label="Voice" value={voiceName || voiceOptions[0] || ''} onChange={setVoiceName} options={voiceOptions} />
@@ -1458,7 +1545,7 @@ export function App() {
 
             {mode === 'transcribe' && (
               <form onSubmit={transcribeSpeech} className="tool-form">
-                <ModelSelect label="Model" value={transcribeModel} onChange={setTranscribeModel} models={transcribeModels} />
+                <ModelSelect label="Model" value={transcribeModel} onChange={setTranscribeModel} models={transcribeModels} recentModelIds={recentModels.transcribe} />
                 <TranscribeFilePicker
                   fileName={transcribeFileName}
                   mimeType={transcribeMimeType}
@@ -1719,18 +1806,23 @@ function ModelSelect({
   value,
   onChange,
   models,
+  recentModelIds = [],
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   models: ModelRecord[]
+  recentModelIds?: string[]
 }) {
+  const recentSet = new Set(recentModelIds)
   return (
     <label className="field">
       <span>{label}</span>
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {models.map((model) => (
-          <option key={model.id} value={model.id}>{model.name || model.id}</option>
+          <option key={model.id} value={model.id}>
+            {model.name || model.id}{recentSet.has(model.id) ? ' (Recently Used)' : ''}
+          </option>
         ))}
       </select>
     </label>
