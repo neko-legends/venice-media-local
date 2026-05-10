@@ -12,11 +12,15 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
+const MIN_WINDOW_WIDTH: u32 = 960;
+const MIN_WINDOW_HEIGHT: u32 = 540;
+const FALLBACK_WINDOW_WIDTH: u32 = 1280;
+const FALLBACK_WINDOW_HEIGHT: u32 = 720;
 const EDIT_MODEL_PATTERNS: &[&str] = &[
     "inpaint",
     "image_edit",
@@ -40,6 +44,10 @@ const EDIT_MODEL_PATTERNS: &[&str] = &[
 struct AppSettings {
     theme: String,
     output_dir: String,
+    #[serde(default)]
+    window_width: Option<u32>,
+    #[serde(default)]
+    window_height: Option<u32>,
 }
 
 impl Default for AppSettings {
@@ -47,6 +55,8 @@ impl Default for AppSettings {
         Self {
             theme: "eva-dark".to_string(),
             output_dir: String::new(),
+            window_width: None,
+            window_height: None,
         }
     }
 }
@@ -55,6 +65,8 @@ fn default_settings(app: &AppHandle) -> AppSettings {
     AppSettings {
         theme: "eva-dark".to_string(),
         output_dir: default_output_dir(app).unwrap_or_default(),
+        window_width: None,
+        window_height: None,
     }
 }
 
@@ -291,6 +303,65 @@ fn read_settings(app: &AppHandle) -> AppSettings {
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_path(app)?;
     write_json_file(&path, settings)
+}
+
+fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
+    let max = monitor_max.max(1);
+    value.max(min.min(max)).min(max)
+}
+
+fn preferred_window_size(
+    settings: &AppSettings,
+    monitor_size: Option<PhysicalSize<u32>>,
+) -> PhysicalSize<u32> {
+    let monitor_width = monitor_size
+        .as_ref()
+        .map(|size| size.width)
+        .unwrap_or(FALLBACK_WINDOW_WIDTH);
+    let monitor_height = monitor_size
+        .as_ref()
+        .map(|size| size.height)
+        .unwrap_or(FALLBACK_WINDOW_HEIGHT);
+
+    let width = settings
+        .window_width
+        .unwrap_or_else(|| monitor_width.saturating_div(2).max(1));
+    let height = settings
+        .window_height
+        .unwrap_or_else(|| monitor_height.saturating_div(2).max(1));
+
+    PhysicalSize::new(
+        clamp_window_dimension(width, MIN_WINDOW_WIDTH, monitor_width),
+        clamp_window_dimension(height, MIN_WINDOW_HEIGHT, monitor_height),
+    )
+}
+
+fn apply_initial_window_size(app: &AppHandle, window: &WebviewWindow) -> Result<(), String> {
+    let settings = read_settings(app);
+    let monitor_size = window
+        .current_monitor()
+        .map_err(|err| err.to_string())?
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| *monitor.size());
+    let size = preferred_window_size(&settings, monitor_size);
+
+    window
+        .set_size(Size::Physical(size))
+        .map_err(|err| err.to_string())?;
+    let _ = window.center();
+
+    Ok(())
+}
+
+fn persist_window_size(app: &AppHandle, size: PhysicalSize<u32>) -> Result<(), String> {
+    if size.width == 0 || size.height == 0 {
+        return Ok(());
+    }
+
+    let mut settings = read_settings(app);
+    settings.window_width = Some(size.width);
+    settings.window_height = Some(size.height);
+    save_settings_file(app, &settings)
 }
 
 fn fallback_model_cache() -> ModelCache {
@@ -2103,6 +2174,23 @@ fn main() {
             if let Err(err) = ensure_output_folders(app.handle()) {
                 eprintln!("Failed to initialize output folders: {err}");
             }
+
+            let app_handle = app.handle().clone();
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(err) = apply_initial_window_size(&app_handle, &window) {
+                    eprintln!("Failed to initialize window size: {err}");
+                }
+
+                let resize_app = app_handle.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::Resized(size) = event {
+                        if let Err(err) = persist_window_size(&resize_app, *size) {
+                            eprintln!("Failed to save window size: {err}");
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
