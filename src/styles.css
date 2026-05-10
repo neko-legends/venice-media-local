@@ -402,6 +402,14 @@ button {
 
 .source-picker {
   display: grid;
+  position: relative;
+  min-width: 0;
+}
+
+.source-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .source-input {
@@ -415,6 +423,16 @@ button {
   cursor: pointer;
 }
 
+.source-grid .source-input {
+  min-height: 0;
+  aspect-ratio: 1;
+}
+
+.source-input.dragging {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--surface) 82%, var(--accent) 18%);
+}
+
 .source-input input {
   position: absolute;
   width: 1px;
@@ -423,6 +441,9 @@ button {
 }
 
 .source-input span {
+  display: inline-grid;
+  place-items: center;
+  gap: 8px;
   color: var(--muted);
   font-weight: 700;
 }
@@ -432,6 +453,12 @@ button {
   height: 100%;
   max-height: 420px;
   object-fit: contain;
+}
+
+.source-clear {
+  position: absolute;
+  top: 8px;
+  right: 8px;
 }
 
 .result-panel {

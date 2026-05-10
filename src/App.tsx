@@ -20,7 +20,7 @@ import {
   Wand2,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
+import { ChangeEvent, DragEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
 
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice'
@@ -94,6 +94,7 @@ type Overrides = {
 }
 
 const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
+const EDIT_SOURCE_LIMIT = 3
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
@@ -273,6 +274,7 @@ export function App() {
   const [hideWatermark, setHideWatermark] = useState(true)
 
   const [sourceImage, setSourceImage] = useState('')
+  const [editSourceImages, setEditSourceImages] = useState<string[]>(() => Array(EDIT_SOURCE_LIMIT).fill(''))
   const [videoDuration, setVideoDuration] = useState('5s')
   const [videoResolution, setVideoResolution] = useState('720p')
   const [videoAspectRatio, setVideoAspectRatio] = useState('16:9')
@@ -335,6 +337,7 @@ export function App() {
   const voiceOptions = controlArray(currentVoiceModel, 'voices', ['am_eric', 'af_bella', 'af_nova'])
   const resultCount = resultGroups.reduce((total, group) => total + group.results.length, 0)
   const resultFilePaths = resultGroups.flatMap((group) => group.results.map((result) => result.filePath))
+  const hasEditSource = editSourceImages.some(Boolean)
 
   async function runAction<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setError('')
@@ -415,7 +418,8 @@ export function App() {
   }
 
   async function removeBackground() {
-    if (!sourceImage) {
+    const backgroundSource = editSourceImages.find(Boolean) ?? ''
+    if (!backgroundSource) {
       setError('Choose a source image first')
       setStatus('Needs attention')
       return
@@ -424,7 +428,7 @@ export function App() {
     const output = await runAction('Removing background', () =>
       call<MediaResult>('remove_background', {
         request: {
-          sourceImage,
+          sourceImage: backgroundSource,
         },
       }),
     )
@@ -454,11 +458,18 @@ export function App() {
     setResultGroups([])
   }
 
-  async function loadSourceImage(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (!file) return
+  async function loadSourceImage(file: File) {
     const dataUrl = await fileToDataUrl(file)
     setSourceImage(dataUrl)
+  }
+
+  async function loadEditSourceImage(index: number, file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    setEditSourceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? dataUrl : source)))
+  }
+
+  function clearEditSourceImage(index: number) {
+    setEditSourceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? '' : source)))
   }
 
   async function queueVideo(event: FormEvent) {
@@ -641,14 +652,24 @@ export function App() {
             {mode === 'edit' && (
               <form className="tool-form">
                 <ModelSelect label="Model" value={editModel} onChange={setEditModel} models={editModels} />
-                <SourcePicker source={sourceImage} onChange={loadSourceImage} />
+                <div className="source-grid">
+                  {editSourceImages.map((source, index) => (
+                    <SourcePicker
+                      key={index}
+                      label={index === 0 ? 'Base Image' : `Reference ${index + 1}`}
+                      source={source}
+                      onFile={(file) => loadEditSourceImage(index, file)}
+                      onClear={() => clearEditSourceImage(index)}
+                    />
+                  ))}
+                </div>
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="action-row">
                   <button className="secondary-action" type="button" disabled>
                     <Scissors size={18} />
                     Edit Image
                   </button>
-                  <button className="primary-action" type="button" onClick={removeBackground} disabled={loading || !sourceImage}>
+                  <button className="primary-action" type="button" onClick={removeBackground} disabled={loading || !hasEditSource}>
                     {loading ? <Loader2 className="spin" size={18} /> : <Eraser size={18} />}
                     Remove Background
                   </button>
@@ -659,7 +680,7 @@ export function App() {
             {mode === 'video' && (
               <form onSubmit={queueVideo} className="tool-form">
                 <ModelSelect label="Model" value={videoModel} onChange={setVideoModel} models={videoModels} />
-                <SourcePicker source={sourceImage} onChange={loadSourceImage} />
+                <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} />
                 <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
@@ -973,18 +994,61 @@ function TextField({
 }
 
 function SourcePicker({
+  label,
   source,
-  onChange,
+  onFile,
+  onClear,
 }: {
+  label: string
   source: string
-  onChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onFile: (file: File) => void | Promise<void>
+  onClear?: () => void
 }) {
+  const [dragging, setDragging] = useState(false)
+
+  function chooseFile(file: File | undefined) {
+    if (!file || !file.type.startsWith('image/')) return
+    void onFile(file)
+  }
+
+  function handleInput(event: ChangeEvent<HTMLInputElement>) {
+    chooseFile(event.target.files?.[0])
+    event.currentTarget.value = ''
+  }
+
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault()
+    setDragging(false)
+    chooseFile(Array.from(event.dataTransfer.files).find((file) => file.type.startsWith('image/')))
+  }
+
   return (
     <div className="source-picker">
-      <label className="source-input">
-        <input type="file" accept="image/*" onChange={onChange} />
-        {source ? <img src={source} alt="Source" /> : <span>Drop / Browse</span>}
+      <label
+        className={classNames('source-input', dragging && 'dragging')}
+        onDragEnter={(event) => {
+          event.preventDefault()
+          setDragging(true)
+        }}
+        onDragOver={(event) => event.preventDefault()}
+        onDragLeave={() => setDragging(false)}
+        onDrop={handleDrop}
+      >
+        <input type="file" accept="image/*" onChange={handleInput} />
+        {source ? (
+          <img src={source} alt={label} />
+        ) : (
+          <span>
+            <ImageIcon size={18} />
+            {label}
+          </span>
+        )}
       </label>
+      {source && onClear && (
+        <button className="icon-button compact source-clear" type="button" onClick={onClear} title={`Clear ${label}`}>
+          <Trash2 size={14} />
+        </button>
+      )}
     </div>
   )
 }
