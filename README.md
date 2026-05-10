@@ -8,13 +8,22 @@ This app is intended to be shared with Venice community users as a local desktop
 
 Venice Media Local is a desktop media generator for people who want one local place to use Venice's media API.
 
-You build the app locally, paste in your own Venice API key, and generate media from your machine. The key stays on your computer in the operating system credential store. There is no shared server operated by this project.
+Use an official release build or build the app locally, paste in your own Venice API key, and generate media from your machine. The key stays on your computer in the operating system credential store. There is no shared server operated by this project.
 
-Security note:
+Release safety:
 
-This repo does not provide a prebuilt `.exe` by default. That is intentional. For a local API-key app, the safer path is to build from source on your own machine instead of installing random binaries from the internet. If you are not a developer, ask your AI coding agent to install the prerequisites, inspect the repo, and build it locally for you.
+Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
 
-Plain-English build path:
+Plain-English release path:
+
+1. Download the latest release from this repo's [GitHub Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases).
+2. Compare the downloaded file's SHA256 hash with the hash in the release notes.
+3. Optionally upload the file to [VirusTotal](https://www.virustotal.com/gui/home/upload).
+4. Run the installer or direct `.exe`.
+5. Paste your Venice API key when the app asks for it.
+6. Choose a media type from the left side, refresh models if needed, and generate media.
+
+Plain-English source build path:
 
 1. Install Node.js 20+ and Rust.
 2. Clone this repo.
@@ -58,18 +67,20 @@ If you are an AI coding agent helping a human with this repo:
 1. Do not commit API keys, generated media, build output, or local app data.
 2. Use the helper scripts on Windows because this machine may have a broken user-level `npm` shim.
 3. Use the committed lockfiles: `package-lock.json` and `src-tauri/Cargo.lock`.
-4. Build with Tauri before handing off an installer.
+4. Build with Tauri before handing off a local installer.
 5. Tell the human where the installer was produced.
 6. For release builds, commit first, then run the Windows build script so the generated version includes the release commit hash.
 7. Preserve the output cleanup behavior: clear only clears UI results, trash moves files to `<output folder>\burn`, and burn corrupts/deletes files from that burn folder.
+8. For public binary releases, include SHA256 hashes in the release notes and consider adding a VirusTotal scan link.
 
 Agent install/build handoff:
 
-1. Do not tell users to download a random `.exe`; this repo is source-first for security.
+1. If a human wants convenience, point them to this repo's official GitHub Releases page, not random third-party `.exe` mirrors.
 2. If building locally on Windows, run `.\Build-Windows.ps1` from the repo root.
 3. After a successful build, the installer is in `src-tauri\target\release\bundle\nsis\`.
 4. The direct executable is in `src-tauri\target\release\`.
 5. Do not commit `dist/`, `src-tauri/target/`, `node_modules/`, `.env*`, or generated media.
+6. If preparing release notes, include the build version, commit hash, SHA256 hashes, and a VirusTotal link if available.
 
 The Venice API key is stored through the OS credential store at runtime. It is not written into the repo. `VENICE_API_KEY` is supported as a developer fallback, but `.env*` files are ignored and must not be committed.
 
