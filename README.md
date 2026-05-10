@@ -12,7 +12,11 @@ Use an official release build or build the app locally, paste in your own Venice
 
 Release safety:
 
-Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
+Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience because Windows is the maintainer's main workstation. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
+
+Platform note:
+
+This is a Tauri desktop app, so it is not Windows-only. Windows, macOS, and Linux users can build it from source. This repo may only provide Windows `.exe` builds in releases because that is the machine used to package and test official binaries right now. macOS and Linux users should ask their AI coding agent, or a developer friend, to install the local prerequisites and build the app on their own machine.
 
 Plain-English release path:
 
@@ -28,8 +32,8 @@ Plain-English source build path:
 1. Install Node.js 20+ and Rust.
 2. Clone this repo.
 3. Run `npm install`.
-4. Run `.\Build-Windows.ps1`.
-5. Open the locally built app at `src-tauri\target\release\venice-media-local.exe`, or use the locally built installer in `src-tauri\target\release\bundle\nsis\`.
+4. On Windows, run `.\Build-Windows.ps1`. On macOS or Linux, use the generic Tauri build command in the build sections below.
+5. Open the locally built app from `src-tauri\target\release\`, or use the platform-specific bundle Tauri produced under `src-tauri\target\release\bundle\`.
 6. Paste your Venice API key when the app asks for it.
 7. Choose a media type from the left side, refresh models if needed, and generate media.
 
@@ -82,10 +86,11 @@ Agent install/build handoff:
 
 1. If a human wants convenience, point them to this repo's official GitHub Releases page, not random third-party `.exe` mirrors.
 2. If building locally on Windows, run `.\Build-Windows.ps1` from the repo root.
-3. After a successful build, the installer is in `src-tauri\target\release\bundle\nsis\`.
-4. The direct executable is in `src-tauri\target\release\`.
-5. Do not commit `dist/`, `src-tauri/target/`, `node_modules/`, `.env*`, or generated media.
-6. If preparing release notes, include the build version, commit hash, SHA256 hashes, and a VirusTotal link if available.
+3. If building locally on macOS or Linux, install the normal Tauri prerequisites for that OS, then run `npm run version:build` and `npm run tauri -- build --config src-tauri/tauri.version.conf.json`.
+4. After a successful Windows build, the installer is in `src-tauri\target\release\bundle\nsis\`.
+5. The direct Windows executable is in `src-tauri\target\release\`.
+6. Do not commit `dist/`, `src-tauri/target/`, `node_modules/`, `.env*`, or generated media.
+7. If preparing release notes, include the build version, commit hash, SHA256 hashes, and a VirusTotal link if available.
 
 The Venice API key is stored through the OS credential store at runtime. It is not written into the repo. `VENICE_API_KEY` is supported as a developer fallback, but `.env*` files are ignored and must not be committed.
 
@@ -100,6 +105,7 @@ venice-media-local / venice-api-key
 - Node.js 20+.
 - Rust/Cargo stable.
 - Windows WebView2 runtime for Windows users.
+- macOS or Linux system packages required by Tauri when building on those platforms.
 - Network access for first dependency install and first Tauri bundler download.
 
 On this Windows workstation, known-good paths are:
