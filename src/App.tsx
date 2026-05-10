@@ -1893,7 +1893,7 @@ export function App() {
                   <div className={classNames('result-group-grid', group.kind !== 'images' && 'single')}>
                     {group.results.map((result) => (
                       <ResultCard
-                        key={result.id}
+                        key={`${result.id}-${result.filePath}`}
                         result={result}
                         onDelete={() => moveResultFilesToBurn([result.filePath], 'this file')}
                         onEdit={result.mimeType.startsWith('image/') ? () => sendResultToEdit(result) : undefined}

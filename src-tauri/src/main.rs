@@ -1400,7 +1400,7 @@ fn save_media_bytes(
     fs::write(&path, bytes).map_err(|err| err.to_string())?;
     let encoded = general_purpose::STANDARD.encode(bytes);
     Ok(MediaResult {
-        id: format!("{kind}-{file_stem}"),
+        id: format!("{kind}-{name}"),
         kind: kind.to_string(),
         name,
         mime_type: mime_type.to_string(),
