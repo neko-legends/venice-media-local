@@ -89,6 +89,7 @@ struct AppState {
     settings: AppSettings,
     key_configured: bool,
     models: ModelCache,
+    build_version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1507,6 +1508,7 @@ fn get_app_state(app: AppHandle) -> Result<AppState, String> {
         settings,
         key_configured: has_api_key(),
         models: read_model_cache(&app),
+        build_version: app.package_info().version.to_string(),
     })
 }
 

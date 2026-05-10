@@ -56,6 +56,7 @@ type AppState = {
   settings: AppSettings
   keyConfigured: boolean
   models: ModelCache
+  buildVersion: string
 }
 
 type MediaResult = {
@@ -462,11 +463,24 @@ function createResultGroup(results: MediaResult[], title: string): ResultGroup {
   }
 }
 
+function formatBuildVersion(version: string): string {
+  const trimmed = version.trim()
+  const match = trimmed.match(/^(\d{4})\.(\d{1,2})\.(\d{7,8})(?:\+(g[0-9a-f]+(?:\.dirty)?))?$/i)
+  if (!match) return trimmed ? `Build ${trimmed}` : 'Build dev'
+
+  const [, year, month, patch, commit] = match
+  const day = patch.slice(0, -6).padStart(2, '0')
+  const time = patch.slice(-6)
+  const builtAt = `${year}-${month.padStart(2, '0')}-${day} ${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4, 6)}`
+  return commit ? `${builtAt} · ${commit}` : builtAt
+}
+
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
   const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '' })
   const [keyConfigured, setKeyConfigured] = useState(false)
+  const [buildVersion, setBuildVersion] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
@@ -551,6 +565,7 @@ export function App() {
         setSettings(state.settings)
         setKeyConfigured(state.keyConfigured)
         setModels(state.models)
+        setBuildVersion(state.buildVersion)
       })
       .catch(() => {
         setLastActionMs(null)
@@ -1160,6 +1175,9 @@ export function App() {
             )
           })}
         </nav>
+        <div className="rail-build" title={`Build ${buildVersion || 'dev'}`}>
+          {formatBuildVersion(buildVersion)}
+        </div>
       </aside>
 
       <main className="workspace">

@@ -147,10 +147,26 @@ button {
 
 .mode-nav {
   display: grid;
+  align-content: start;
   gap: 4px;
+  flex: 1;
   min-width: 0;
   padding: 12px;
   overflow-x: hidden;
+}
+
+.rail-build {
+  margin-top: auto;
+  min-width: 0;
+  padding: 8px 12px 12px;
+  overflow: hidden;
+  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mode-button,
@@ -1077,6 +1093,13 @@ button {
   .mode-nav {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 104px), 1fr));
     overflow-x: hidden;
+  }
+
+  .rail-build {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: 0;
+    text-align: right;
   }
 
   .mode-button {
