@@ -142,12 +142,15 @@ button {
   min-width: 0;
   border-right: 1px solid var(--border);
   background: var(--rail);
+  overflow-x: hidden;
 }
 
 .mode-nav {
   display: grid;
   gap: 4px;
+  min-width: 0;
   padding: 12px;
+  overflow-x: hidden;
 }
 
 .mode-button,
@@ -164,14 +167,27 @@ button {
 
 .mode-button {
   display: grid;
-  grid-template-columns: 24px 1fr;
+  grid-template-columns: 24px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 40px;
   padding: 0 10px;
   color: var(--muted);
   text-align: left;
+}
+
+.mode-button svg,
+.mode-button span {
+  min-width: 0;
+}
+
+.mode-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mode-button:hover,
@@ -222,7 +238,13 @@ button {
 .inline-header {
   display: flex;
   align-items: center;
+  min-width: 0;
   gap: 8px;
+}
+
+.inline-header {
+  flex-wrap: wrap;
+  justify-content: space-between;
 }
 
 .icon-button {
@@ -329,16 +351,19 @@ button {
 .result-panel {
   min-width: 0;
   min-height: 0;
-  overflow: auto;
 }
 
 .tool-surface {
   padding: 22px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .tool-form {
   display: grid;
   gap: 16px;
+  min-width: 0;
+  width: 100%;
   max-width: 860px;
 }
 
@@ -395,8 +420,9 @@ button {
 
 .control-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 112px), 1fr));
   gap: 12px;
+  min-width: 0;
 }
 
 .toggle-row {
@@ -930,12 +956,14 @@ button {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
+  min-width: 0;
 }
 
 .theme-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 144px), 1fr));
   gap: 10px;
+  min-width: 0;
 }
 
 .theme-button {
@@ -977,12 +1005,14 @@ button {
 
 .model-add {
   display: grid;
-  grid-template-columns: 150px minmax(160px, 1fr) minmax(160px, 1fr) auto;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
   gap: 10px;
   align-items: end;
+  min-width: 0;
 }
 
 .add-button {
+  justify-self: end;
   margin-bottom: 0;
 }
 
@@ -1045,13 +1075,12 @@ button {
   }
 
   .mode-nav {
-    grid-auto-flow: column;
-    grid-auto-columns: minmax(92px, 1fr);
-    overflow-x: auto;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 104px), 1fr));
+    overflow-x: hidden;
   }
 
   .mode-button {
-    grid-template-columns: 20px auto;
+    grid-template-columns: 20px minmax(0, 1fr);
   }
 
   .workspace {
