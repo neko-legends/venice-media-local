@@ -1264,7 +1264,7 @@ export function App() {
                     {[1, 2].map((index) => (
                       <SourcePicker
                         key={index}
-                        label={`Image ${index + 1}`}
+                        label={`Ref Image ${index + 1}`}
                         source={editSourceImages[index]}
                         onFile={(file) => loadEditSourceImage(index, file)}
                         onSource={(value) => setEditSourceImage(index, value)}
