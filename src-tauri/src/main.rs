@@ -1018,6 +1018,29 @@ fn apply_audio_support_controls(model: &mut ModelRecord) {
     }
 }
 
+fn audio_model_controls<'a>(cache: &'a ModelCache, model_id: &str) -> Option<&'a Value> {
+    cache
+        .music_models
+        .iter()
+        .chain(cache.sfx_models.iter())
+        .find(|model| model.id == model_id)
+        .map(|model| &model.controls)
+}
+
+fn audio_model_parameter_support(app: &AppHandle, model_id: &str) -> (bool, bool, bool, bool) {
+    let cache = read_model_cache(app);
+    audio_model_controls(&cache, model_id)
+        .map(|controls| {
+            (
+                bool_like(controls.get("supportsDurationSeconds")).unwrap_or(true),
+                bool_like(controls.get("supportsLyrics")).unwrap_or(false),
+                bool_like(controls.get("supportsInstrumental")).unwrap_or(false),
+                bool_like(controls.get("supportsLyricsOptimizer")).unwrap_or(false),
+            )
+        })
+        .unwrap_or((true, true, true, true))
+}
+
 fn response_data(payload: &Value) -> &Value {
     payload
         .get("data")
@@ -2402,28 +2425,38 @@ async fn retrieve_video(
 }
 
 #[tauri::command]
-async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> {
+async fn queue_audio(app: AppHandle, request: QueueMediaRequest) -> Result<QueueResult, String> {
+    let (
+        supports_duration_seconds,
+        supports_lyrics,
+        supports_instrumental,
+        supports_lyrics_optimizer,
+    ) = audio_model_parameter_support(&app, &request.model);
     let mut body = json!({
         "model": request.model,
         "prompt": request.prompt,
     });
-    if let Some(value) = request
-        .duration_seconds
-        .or(request.duration)
-        .filter(|value| !value.trim().is_empty())
-    {
-        body["duration_seconds"] = json!(value);
+    if supports_duration_seconds {
+        if let Some(value) = request
+            .duration_seconds
+            .or(request.duration)
+            .filter(|value| !value.trim().is_empty())
+        {
+            body["duration_seconds"] = json!(value);
+        }
     }
-    if request.force_instrumental.unwrap_or(false) {
+    if supports_instrumental && request.force_instrumental.unwrap_or(false) {
         body["force_instrumental"] = json!(true);
     }
-    if let Some(value) = request
-        .lyrics_prompt
-        .filter(|value| !value.trim().is_empty())
-    {
-        body["lyrics_prompt"] = json!(value);
+    if supports_lyrics {
+        if let Some(value) = request
+            .lyrics_prompt
+            .filter(|value| !value.trim().is_empty())
+        {
+            body["lyrics_prompt"] = json!(value);
+        }
     }
-    if request.lyrics_optimizer.unwrap_or(false) {
+    if supports_lyrics_optimizer && request.lyrics_optimizer.unwrap_or(false) {
         body["lyrics_optimizer"] = json!(true);
     }
 
