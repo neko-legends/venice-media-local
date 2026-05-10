@@ -159,6 +159,7 @@ struct QueueMediaRequest {
     source_image: Option<String>,
     source_video: Option<String>,
     duration: Option<String>,
+    duration_seconds: Option<String>,
     resolution: Option<String>,
     aspect_ratio: Option<String>,
     upscale_factor: Option<u8>,
@@ -568,7 +569,7 @@ fn fallback_model_cache() -> ModelCache {
                 "Stable Audio 2.5",
                 "music",
                 "generate-music",
-                audio_controls("music"),
+                audio_controls_with_support("music", false, false, false, true),
             ),
         ],
         sfx_models: vec![model(
@@ -683,6 +684,12 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
     for model in &mut cache.edit_models {
         apply_known_image_resolution_controls(model);
     }
+    for model in &mut cache.music_models {
+        apply_audio_support_controls(model);
+    }
+    for model in &mut cache.sfx_models {
+        apply_audio_support_controls(model);
+    }
 }
 
 fn append_missing_models(target: &mut Vec<ModelRecord>, fallback: &[ModelRecord]) {
@@ -742,12 +749,29 @@ fn video_controls() -> Value {
 }
 
 fn audio_controls(kind: &str) -> Value {
+    audio_controls_with_support(
+        kind,
+        kind == "music",
+        kind == "music",
+        kind == "music",
+        true,
+    )
+}
+
+fn audio_controls_with_support(
+    kind: &str,
+    supports_lyrics: bool,
+    supports_instrumental: bool,
+    supports_lyrics_optimizer: bool,
+    supports_duration_seconds: bool,
+) -> Value {
     json!({
         "audioKind": kind,
         "durationSeconds": { "min": 1, "max": 180 },
-        "supportsLyrics": kind == "music",
-        "supportsInstrumental": kind == "music",
-        "supportsLyricsOptimizer": kind == "music"
+        "supportsDurationSeconds": supports_duration_seconds,
+        "supportsLyrics": supports_lyrics,
+        "supportsInstrumental": supports_instrumental,
+        "supportsLyricsOptimizer": supports_lyrics_optimizer
     })
 }
 
@@ -854,6 +878,143 @@ fn bool_like(value: Option<&Value>) -> Option<bool> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| bool_like(value.get(*key)))
+}
+
+fn model_bool_field(
+    entry: &Value,
+    spec: &Value,
+    constraints: &Value,
+    capabilities: &Value,
+    keys: &[&str],
+) -> Option<bool> {
+    [entry, spec, constraints, capabilities]
+        .into_iter()
+        .find_map(|value| bool_field(value, keys))
+}
+
+fn has_duration_metadata(value: &Value) -> bool {
+    number_like(value.get("default_duration")).is_some()
+        || number_like(value.get("min_duration")).is_some()
+        || number_like(value.get("max_duration")).is_some()
+        || matches!(value.get("duration_options"), Some(Value::Array(items)) if !items.is_empty())
+        || matches!(value.get("durations"), Some(Value::Array(items)) if !items.is_empty())
+        || value.get("duration_seconds").is_some()
+        || value
+            .get("pricing")
+            .and_then(|pricing| pricing.get("durations"))
+            .is_some()
+}
+
+fn model_supports_duration_seconds(
+    entry: &Value,
+    spec: &Value,
+    constraints: &Value,
+    capabilities: &Value,
+) -> bool {
+    model_bool_field(
+        entry,
+        spec,
+        constraints,
+        capabilities,
+        &["supports_duration_seconds", "supports_duration"],
+    )
+    .unwrap_or_else(|| {
+        [entry, spec, constraints, capabilities]
+            .into_iter()
+            .any(has_duration_metadata)
+    })
+}
+
+fn audio_support_controls_from_raw(
+    kind: &str,
+    id: &str,
+    name: &str,
+    raw: &Value,
+) -> (bool, bool, bool, bool) {
+    let spec = raw.get("model_spec").unwrap_or(&Value::Null);
+    let constraints = spec.get("constraints").unwrap_or(&Value::Null);
+    let capabilities = spec.get("capabilities").unwrap_or(&Value::Null);
+    let label_id = if id.trim().is_empty() {
+        as_string(raw, "id")
+    } else {
+        id.to_string()
+    };
+    let label_name = if name.trim().is_empty() {
+        as_string(spec, "name")
+    } else {
+        name.to_string()
+    };
+    let label = format!("{} {}", label_id.to_lowercase(), label_name.to_lowercase());
+    let fallback_music_lyrics = kind == "music" && !label.contains("stable-audio");
+    let supports_lyrics = model_bool_field(
+        raw,
+        spec,
+        constraints,
+        capabilities,
+        &["supports_lyrics", "lyrics_supported"],
+    )
+    .unwrap_or(fallback_music_lyrics);
+    let supports_instrumental = model_bool_field(
+        raw,
+        spec,
+        constraints,
+        capabilities,
+        &["supports_force_instrumental", "supports_instrumental"],
+    )
+    .unwrap_or(kind == "music" && !label.contains("stable-audio"));
+    let supports_lyrics_optimizer = model_bool_field(
+        raw,
+        spec,
+        constraints,
+        capabilities,
+        &["supports_lyrics_optimizer", "lyrics_optimizer_supported"],
+    )
+    .unwrap_or(kind == "music" && !label.contains("stable-audio"));
+    let supports_duration_seconds = if raw.is_null() {
+        true
+    } else {
+        model_supports_duration_seconds(raw, spec, constraints, capabilities)
+    };
+
+    (
+        supports_lyrics,
+        supports_instrumental,
+        supports_lyrics_optimizer,
+        supports_duration_seconds,
+    )
+}
+
+fn apply_audio_support_controls(model: &mut ModelRecord) {
+    if model.kind != "music" && model.kind != "sfx" {
+        return;
+    }
+
+    let (supports_lyrics, supports_instrumental, supports_lyrics_optimizer, supports_duration) =
+        audio_support_controls_from_raw(&model.kind, &model.id, &model.name, &model.raw);
+
+    if !model.controls.is_object() {
+        model.controls = json!({});
+    }
+    if let Some(controls) = model.controls.as_object_mut() {
+        controls.insert("audioKind".to_string(), json!(model.kind));
+        controls.insert("supportsLyrics".to_string(), json!(supports_lyrics));
+        controls.insert(
+            "supportsInstrumental".to_string(),
+            json!(supports_instrumental),
+        );
+        controls.insert(
+            "supportsLyricsOptimizer".to_string(),
+            json!(supports_lyrics_optimizer),
+        );
+        controls.insert(
+            "supportsDurationSeconds".to_string(),
+            json!(supports_duration),
+        );
     }
 }
 
@@ -1134,6 +1295,12 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
             } else {
                 "generate-music"
             };
+            let (
+                supports_lyrics,
+                supports_instrumental,
+                supports_lyrics_optimizer,
+                supports_duration_seconds,
+            ) = audio_support_controls_from_raw(kind, &id, &name, &entry);
             Some(ModelRecord {
                 id,
                 name,
@@ -1141,9 +1308,10 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 modes: vec![mode.to_string()],
                 controls: json!({
                     "audioKind": kind,
-                    "supportsLyrics": !is_sfx,
-                    "supportsInstrumental": !is_sfx,
-                    "supportsLyricsOptimizer": !is_sfx,
+                    "supportsDurationSeconds": supports_duration_seconds,
+                    "supportsLyrics": supports_lyrics,
+                    "supportsInstrumental": supports_instrumental,
+                    "supportsLyricsOptimizer": supports_lyrics_optimizer,
                     "rawConstraints": constraints,
                     "rawCapabilities": capabilities
                 }),
@@ -2239,11 +2407,15 @@ async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> 
         "model": request.model,
         "prompt": request.prompt,
     });
-    if let Some(value) = request.duration.filter(|value| !value.trim().is_empty()) {
-        body["duration"] = json!(value);
+    if let Some(value) = request
+        .duration_seconds
+        .or(request.duration)
+        .filter(|value| !value.trim().is_empty())
+    {
+        body["duration_seconds"] = json!(value);
     }
-    if let Some(value) = request.force_instrumental {
-        body["force_instrumental"] = json!(value);
+    if request.force_instrumental.unwrap_or(false) {
+        body["force_instrumental"] = json!(true);
     }
     if let Some(value) = request
         .lyrics_prompt
@@ -2251,8 +2423,8 @@ async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> 
     {
         body["lyrics_prompt"] = json!(value);
     }
-    if let Some(value) = request.lyrics_optimizer {
-        body["lyrics_optimizer"] = json!(value);
+    if request.lyrics_optimizer.unwrap_or(false) {
+        body["lyrics_optimizer"] = json!(true);
     }
 
     let response = venice_post_json("/audio/queue", body).await?;

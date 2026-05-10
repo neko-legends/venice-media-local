@@ -874,6 +874,8 @@ export function App() {
   const currentImageModel = imageModels.find((model) => model.id === imageModel)
   const currentEditModel = editModels.find((model) => model.id === editModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
+  const currentMusicModel = musicModels.find((model) => model.id === musicModel)
+  const currentSfxModel = sfxModels.find((model) => model.id === sfxModel)
   const currentVoiceModel = voiceModels.find((model) => model.id === voiceModel)
   const currentTranscribeModel = transcribeModels.find((model) => model.id === transcribeModel)
   const imageRatios = controlArray(currentImageModel, 'sizeOptions', IMAGE_ASPECT_OPTIONS)
@@ -885,6 +887,11 @@ export function App() {
   const videoDurations = controlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
   const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
   const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
+  const supportsMusicDuration = controlBool(currentMusicModel, 'supportsDurationSeconds', true)
+  const supportsMusicLyrics = controlBool(currentMusicModel, 'supportsLyrics', true)
+  const supportsMusicInstrumental = controlBool(currentMusicModel, 'supportsInstrumental', true)
+  const supportsMusicLyricsOptimizer = controlBool(currentMusicModel, 'supportsLyricsOptimizer', true)
+  const supportsSfxDuration = controlBool(currentSfxModel, 'supportsDurationSeconds', true)
   const voiceOptions = controlArray(currentVoiceModel, 'voices', VOICE_OPTIONS)
   const transcribeResponseFormats = controlArray(currentTranscribeModel, 'responseFormats', ['json', 'text'])
   const supportsTranscribeLanguage = controlBool(currentTranscribeModel, 'supportsLanguage', true)
@@ -1365,20 +1372,23 @@ export function App() {
 
   function queueAudio(event: FormEvent, kind: 'music' | 'sfx') {
     event.preventDefault()
-    const request = {
-      model: kind === 'music' ? musicModel : sfxModel,
+    const model = kind === 'music' ? musicModel : sfxModel
+    const supportsDuration = kind === 'music' ? supportsMusicDuration : supportsSfxDuration
+    const useLyricsOptimizer = kind === 'music' && supportsMusicLyricsOptimizer && lyricsOptimizer
+    const request: Record<string, string | boolean> = {
+      model,
       prompt,
-      duration: audioDuration,
-      lyricsPrompt: kind === 'music' ? lyrics : '',
-      forceInstrumental: kind === 'music' ? instrumental : false,
-      lyricsOptimizer: kind === 'music' ? lyricsOptimizer : false,
     }
+    if (supportsDuration && audioDuration.trim()) request.durationSeconds = audioDuration.trim()
+    if (kind === 'music' && supportsMusicLyrics && lyrics.trim() && !useLyricsOptimizer) request.lyricsPrompt = lyrics.trim()
+    if (kind === 'music' && supportsMusicInstrumental && instrumental) request.forceInstrumental = true
+    if (useLyricsOptimizer) request.lyricsOptimizer = true
 
     enqueueJob(kind, `${JOB_LABELS[kind]} generation`, async () => {
       const startedAt = Date.now()
       const queued = await call<QueueResult>('queue_audio', { request })
-      rememberModelUse(kind, request.model)
-      const result = await waitForQueuedMedia(kind, queued, request.model)
+      rememberModelUse(kind, model)
+      const result = await waitForQueuedMedia(kind, queued, model)
       setResultGroups((existing) => [createResultGroup([result], `${JOB_LABELS[kind]} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
@@ -1655,19 +1665,24 @@ export function App() {
               <form onSubmit={(event) => queueAudio(event, 'music')} className="tool-form">
                 <ModelSelect label="Model" value={musicModel} onChange={setMusicModel} models={musicModels} recentModelIds={recentModels.music} />
                 <PromptArea value={prompt} onChange={setPrompt} />
-                <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />
+                {supportsMusicLyrics && !supportsMusicLyricsOptimizer && <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />}
+                {supportsMusicLyrics && supportsMusicLyricsOptimizer && !lyricsOptimizer && <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />}
                 <div className="control-grid">
-                  <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />
+                  {supportsMusicDuration && <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />}
                   <NumberField label="Concurrent" value={concurrency.music} min={1} max={12} step={1} onChange={(value) => updateConcurrency('music', value)} />
                 </div>
-                <label className="toggle-row">
-                  <input type="checkbox" checked={instrumental} onChange={(event) => setInstrumental(event.target.checked)} />
-                  <span>Instrumental</span>
-                </label>
-                <label className="toggle-row">
-                  <input type="checkbox" checked={lyricsOptimizer} onChange={(event) => setLyricsOptimizer(event.target.checked)} />
-                  <span>Auto lyrics</span>
-                </label>
+                {supportsMusicInstrumental && (
+                  <label className="toggle-row">
+                    <input type="checkbox" checked={instrumental} onChange={(event) => setInstrumental(event.target.checked)} />
+                    <span>Instrumental</span>
+                  </label>
+                )}
+                {supportsMusicLyricsOptimizer && (
+                  <label className="toggle-row">
+                    <input type="checkbox" checked={lyricsOptimizer} onChange={(event) => setLyricsOptimizer(event.target.checked)} />
+                    <span>Auto lyrics</span>
+                  </label>
+                )}
                 <QueueSummary label="Music queue" stats={jobStats.music} limit={concurrency.music} now={jobNow} />
                 <SubmitButton busy={jobStats.music.running > 0} icon={Music}>Queue Music</SubmitButton>
               </form>
@@ -1678,7 +1693,7 @@ export function App() {
                 <ModelSelect label="Model" value={sfxModel} onChange={setSfxModel} models={sfxModels} recentModelIds={recentModels.sfx} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
-                  <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />
+                  {supportsSfxDuration && <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />}
                   <NumberField label="Concurrent" value={concurrency.sfx} min={1} max={12} step={1} onChange={(value) => updateConcurrency('sfx', value)} />
                 </div>
                 <QueueSummary label="SFX queue" stats={jobStats.sfx} limit={concurrency.sfx} now={jobNow} />
