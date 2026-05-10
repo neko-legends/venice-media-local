@@ -729,22 +729,31 @@ export function App() {
             {mode === 'edit' && (
               <form className="tool-form">
                 <ModelSelect label="Model" value={editModel} onChange={setEditModel} models={editModels} />
-                <div className="source-grid">
-                  {editSourceImages.map((source, index) => (
-                    <SourcePicker
-                      key={index}
-                      label={index === 0 ? 'Base Image' : `Reference ${index + 1}`}
-                      source={source}
-                      onFile={(file) => loadEditSourceImage(index, file)}
-                      onClear={() => clearEditSourceImage(index)}
-                    />
-                  ))}
+                <div className="edit-source-layout">
+                  <SourcePicker
+                    className="edit-source-main"
+                    label="Image 1"
+                    source={editSourceImages[0]}
+                    onFile={(file) => loadEditSourceImage(0, file)}
+                    onClear={() => clearEditSourceImage(0)}
+                  />
+                  <div className="edit-source-row">
+                    {[1, 2].map((index) => (
+                      <SourcePicker
+                        key={index}
+                        label={`Image ${index + 1}`}
+                        source={editSourceImages[index]}
+                        onFile={(file) => loadEditSourceImage(index, file)}
+                        onClear={() => clearEditSourceImage(index)}
+                      />
+                    ))}
+                  </div>
                 </div>
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="action-row">
                   <button className="secondary-action" type="button" disabled>
                     <Scissors size={18} />
-                    Edit Image
+                    Edit / Combine
                   </button>
                   <button className="primary-action" type="button" onClick={removeBackground} disabled={loading || !hasEditSource}>
                     {loading ? <Loader2 className="spin" size={18} /> : <Eraser size={18} />}
@@ -1071,11 +1080,13 @@ function TextField({
 }
 
 function SourcePicker({
+  className,
   label,
   source,
   onFile,
   onClear,
 }: {
+  className?: string
   label: string
   source: string
   onFile: (file: File) => void | Promise<void>
@@ -1100,7 +1111,7 @@ function SourcePicker({
   }
 
   return (
-    <div className="source-picker">
+    <div className={classNames('source-picker', className)}>
       <label
         className={classNames('source-input', dragging && 'dragging')}
         onDragEnter={(event) => {
@@ -1112,14 +1123,11 @@ function SourcePicker({
         onDrop={handleDrop}
       >
         <input type="file" accept="image/*" onChange={handleInput} />
-        {source ? (
-          <img src={source} alt={label} />
-        ) : (
-          <span>
-            <ImageIcon size={18} />
-            {label}
-          </span>
-        )}
+        {source && <img src={source} alt={label} />}
+        <span className={classNames('source-label', source && 'loaded')}>
+          {!source && <ImageIcon size={18} />}
+          {label}
+        </span>
       </label>
       {source && onClear && (
         <button className="icon-button compact source-clear" type="button" onClick={onClear} title={`Clear ${label}`}>
