@@ -1038,6 +1038,13 @@ export function App() {
     }
   }
 
+  async function openOutputFolder() {
+    const folder = await runAction('Opening output folder', () => call<string>('open_output_folder'))
+    if (folder) {
+      setStatus(`Opened output folder: ${folder}`)
+    }
+  }
+
   function clearResults() {
     setResultGroups([])
   }
@@ -1607,6 +1614,9 @@ export function App() {
                     </button>
                   </>
                 )}
+                <button className="icon-button compact" type="button" onClick={openOutputFolder} title="Open output folder">
+                  <FolderOpen size={16} />
+                </button>
               </div>
             </div>
             <div className="results">

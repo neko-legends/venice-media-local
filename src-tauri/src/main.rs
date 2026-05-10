@@ -10,6 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
@@ -1457,6 +1458,41 @@ fn get_burn_folder_stats(app: AppHandle) -> Result<BurnFolderStats, String> {
     burn_folder_stats_for_dir(&dir)
 }
 
+fn open_folder_path(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
+}
+
+#[tauri::command]
+fn open_output_folder(app: AppHandle) -> Result<String, String> {
+    let root = ensure_output_folders(&app)?;
+    open_folder_path(&root)?;
+    Ok(root.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn burn_folder(app: AppHandle, seed: Option<String>) -> Result<BurnFolderStats, String> {
     let dir = ensure_burn_dir(&app)?;
@@ -2208,6 +2244,7 @@ fn main() {
             get_models,
             move_media_files_to_burn,
             get_burn_folder_stats,
+            open_output_folder,
             burn_folder,
             refresh_models,
             generate_image,
