@@ -657,7 +657,6 @@ export function App() {
   const [actionStartedAt, setActionStartedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState(0)
   const [lastActionMs, setLastActionMs] = useState<number | null>(null)
-  const [refreshingModels, setRefreshingModels] = useState(false)
   const [overrides, setOverrides] = useState<Overrides>(() => readOverrides())
   const [recentModels, setRecentModels] = useState<RecentModels>(() => readRecentModels())
   const [concurrency, setConcurrency] = useState<JobConcurrency>(() => readConcurrency())
@@ -1088,10 +1087,8 @@ export function App() {
   }
 
   async function refreshModelCatalog() {
-    setRefreshingModels(true)
     const cache = await runAction('Refreshing models', () => call<ModelCache>('refresh_models'))
     if (cache) setModels(cache)
-    setRefreshingModels(false)
   }
 
   async function persistSettings(next: AppSettings) {
@@ -1516,9 +1513,6 @@ export function App() {
             <p>{keyConfigured ? 'API key ready' : 'API key missing'} · Models: {formatDate(models.lastFetched)}</p>
           </div>
           <div className="topbar-actions">
-            <button className="icon-button" type="button" onClick={refreshModelCatalog} title="Get Latest From Venice">
-              <RefreshCw size={18} className={refreshingModels ? 'spin' : ''} />
-            </button>
             <button className="icon-button" type="button" onClick={() => setMode('settings')} title="Settings">
               <Settings size={18} />
             </button>
