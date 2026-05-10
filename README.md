@@ -29,6 +29,8 @@ The goal is simple:
 - Image, video, music, sound effects, and voice in one app.
 - No chat UI and no text-agent clutter.
 - Results save to local files automatically. Images default to WebP to keep files smaller.
+- Clear only removes result cards from the app. Trash moves generated files into the output folder's `burn` subfolder.
+- The burn button corrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.
 - Models can be refreshed from Venice and managed locally.
 - The app can expose Venice API features in one place, even when different Venice clients expose those features differently.
 - The interface can be tuned for creators who generate a lot of media, instead of behaving like a general chat or social feed.
@@ -38,6 +40,7 @@ Why this can be nicer than using a hosted web UI:
 - **Your API key stays local.** The app calls Venice directly from the local Tauri backend.
 - **Your outputs are local files.** Generated media is saved on disk instead of being trapped in a browser session.
 - **No browser storage quota wall.** Browser apps can hit local storage, IndexedDB, or cache limits when lots of media piles up. This app writes outputs to normal folders on disk, so practical storage is limited by the drive you choose.
+- **Cleaner local cleanup.** Result cards can be cleared without touching files, moved to the local burn folder with trash buttons, or burned later when the user wants to corrupt and delete the files.
 - **One media workspace.** Image, video, music, SFX, and voice are grouped by media type in the left rail.
 - **Less browser friction.** No browser tabs, browser profile issues, extension conflicts, or accidental refreshes.
 - **Better long-session potential.** Hosted web UIs can get laggy when a lot of images/results pile up. This app already saves outputs locally, and the UI can be optimized around local history, paging, folders, and cleanup.
@@ -58,6 +61,7 @@ If you are an AI coding agent helping a human with this repo:
 4. Build with Tauri before handing off an installer.
 5. Tell the human where the installer was produced.
 6. For release builds, commit first, then run the Windows build script so the generated version includes the release commit hash.
+7. Preserve the output cleanup behavior: clear only clears UI results, trash moves files to `<output folder>\burn`, and burn corrupts/deletes files from that burn folder.
 
 Agent install/build handoff:
 
@@ -215,6 +219,7 @@ Ignored/generated files include:
 - Image generation saves local image files and displays result cards.
 - Video, music, and SFX queue jobs through Venice and include polling hooks.
 - Voice generation calls Venice speech and saves local audio files.
+- Output cleanup supports clearing UI cards, moving generated files to the local `burn` folder, and burning that folder.
 - Model refresh calls Venice model catalog endpoints and caches normalized model lists locally.
 - Model manager supports local add/remove overrides.
 - Includes multiple dark and light color themes.
