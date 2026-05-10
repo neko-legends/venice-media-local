@@ -21,7 +21,7 @@ import {
   Wand2,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { ChangeEvent, DragEvent, FormEvent, ReactNode, useEffect, useMemo, useState } from 'react'
+import { ChangeEvent, DragEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
@@ -97,12 +97,42 @@ type BurnFolderStats = {
   burnDir: string
 }
 
+type JobKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
+
+type JobConcurrency = Record<JobKind, number>
+
+type JobStats = Record<JobKind, {
+  running: number
+  queued: number
+  completed: number
+  failed: number
+  lastMs: number | null
+  oldestStartedAt: number | null
+}>
+
+type LocalJob = {
+  id: string
+  kind: JobKind
+  label: string
+  run: () => Promise<void>
+}
+
+type RemoteQueueJob = {
+  id: string
+  kind: 'video' | 'music' | 'sfx'
+  queueId: string
+  status: string
+  progressLabel: string
+  startedAt: number
+}
+
 type Overrides = {
   hidden: Partial<Record<ModelKind, string[]>>
   custom: Partial<Record<ModelKind, ModelRecord[]>>
 }
 
 const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
+const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
 const EDIT_SOURCE_LIMIT = 3
 const IMAGE_ASPECT_OPTIONS = ['1:1', '4:3', '3:4', '16:9', '9:16']
 const VIDEO_DURATION_OPTIONS = ['5s', '10s']
@@ -112,6 +142,26 @@ const VOICE_OPTIONS = ['am_eric', 'af_bella', 'af_nova']
 const EMPTY_OPTIONS: string[] = []
 const MAX_IMAGE_SEED = 999_999_999
 const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg'
+const JOB_KINDS: JobKind[] = ['image', 'edit', 'video', 'music', 'sfx', 'voice', 'transcribe']
+const DEFAULT_CONCURRENCY: JobConcurrency = {
+  image: 4,
+  edit: 2,
+  video: 2,
+  music: 2,
+  sfx: 2,
+  voice: 4,
+  transcribe: 2,
+}
+const JOB_LABELS: Record<JobKind, string> = {
+  image: 'Image',
+  edit: 'Edit',
+  video: 'Video',
+  music: 'Music',
+  sfx: 'SFX',
+  voice: 'Voice',
+  transcribe: 'Speech -> Text',
+}
+const ACTIVE_QUEUE_STATUSES = new Set(['queued', 'pending', 'processing', 'running', 'in_progress', 'created', 'submitted'])
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
@@ -218,6 +268,60 @@ function writeOverrides(value: Overrides) {
   localStorage.setItem(STORAGE_OVERRIDES, JSON.stringify(value))
 }
 
+function clampConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.min(12, Math.max(1, Math.trunc(value)))
+}
+
+function readConcurrency(): JobConcurrency {
+  try {
+    const raw = localStorage.getItem(STORAGE_CONCURRENCY)
+    const parsed = raw ? JSON.parse(raw) as Partial<JobConcurrency> : {}
+    return JOB_KINDS.reduce((next, kind) => {
+      next[kind] = clampConcurrency(parsed[kind] ?? DEFAULT_CONCURRENCY[kind])
+      return next
+    }, { ...DEFAULT_CONCURRENCY })
+  } catch {
+    return { ...DEFAULT_CONCURRENCY }
+  }
+}
+
+function writeConcurrency(value: JobConcurrency) {
+  localStorage.setItem(STORAGE_CONCURRENCY, JSON.stringify(value))
+}
+
+function createJobStats(): JobStats {
+  return JOB_KINDS.reduce((stats, kind) => {
+    stats[kind] = { running: 0, queued: 0, completed: 0, failed: 0, lastMs: null, oldestStartedAt: null }
+    return stats
+  }, {} as JobStats)
+}
+
+function createJobQueues(): Record<JobKind, LocalJob[]> {
+  return JOB_KINDS.reduce((queues, kind) => {
+    queues[kind] = []
+    return queues
+  }, {} as Record<JobKind, LocalJob[]>)
+}
+
+function createJobStartQueues(): Record<JobKind, number[]> {
+  return JOB_KINDS.reduce((queues, kind) => {
+    queues[kind] = []
+    return queues
+  }, {} as Record<JobKind, number[]>)
+}
+
+function createJobCounts(value = 0): Record<JobKind, number> {
+  return JOB_KINDS.reduce((counts, kind) => {
+    counts[kind] = value
+    return counts
+  }, {} as Record<JobKind, number>)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 function formatDate(value: string): string {
   if (!value) return 'Never'
   const parsed = new Date(value)
@@ -316,8 +420,15 @@ export function App() {
   const [lastActionMs, setLastActionMs] = useState<number | null>(null)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [overrides, setOverrides] = useState<Overrides>(() => readOverrides())
+  const [concurrency, setConcurrency] = useState<JobConcurrency>(() => readConcurrency())
+  const [jobStats, setJobStats] = useState<JobStats>(() => createJobStats())
+  const [remoteQueues, setRemoteQueues] = useState<RemoteQueueJob[]>([])
+  const [jobClock, setJobClock] = useState(0)
   const [resultGroups, setResultGroups] = useState<ResultGroup[]>([])
-  const [queue, setQueue] = useState<QueueResult | null>(null)
+  const jobQueuesRef = useRef<Record<JobKind, LocalJob[]>>(createJobQueues())
+  const runningJobsRef = useRef<Record<JobKind, number>>(createJobCounts())
+  const runningJobStartsRef = useRef<Record<JobKind, number[]>>(createJobStartQueues())
+  const concurrencyRef = useRef<JobConcurrency>(concurrency)
 
   const imageModels = useMemo(() => modelList(models, overrides, 'image'), [models, overrides])
   const editModels = useMemo(() => modelList(models, overrides, 'edit'), [models, overrides])
@@ -405,14 +516,12 @@ export function App() {
   }, [editModel, editModels, imageModel, imageModels, musicModel, musicModels, sfxModel, sfxModels, transcribeModel, transcribeModels, videoModel, videoModels, voiceModel, voiceModels])
 
   useEffect(() => {
-    if (!queue) return
-    if (!['queued', 'pending', 'processing', 'running', 'in_progress'].includes(queue.status.toLowerCase())) return
-
-    const timer = window.setInterval(() => {
-      void pollQueue()
-    }, 7000)
-    return () => window.clearInterval(timer)
-  }, [queue])
+    concurrencyRef.current = concurrency
+    writeConcurrency(concurrency)
+    for (const kind of JOB_KINDS) {
+      pumpJobs(kind)
+    }
+  }, [concurrency])
 
   useEffect(() => {
     if (actionStartedAt === null) return
@@ -442,8 +551,155 @@ export function App() {
   const resultCount = resultGroups.reduce((total, group) => total + group.results.length, 0)
   const resultFilePaths = resultGroups.flatMap((group) => group.results.map((result) => result.filePath))
   const hasEditSource = editSourceImages.some(Boolean)
+  const runningJobCount = JOB_KINDS.reduce((total, kind) => total + jobStats[kind].running, 0)
+  const queuedJobCount = JOB_KINDS.reduce((total, kind) => total + jobStats[kind].queued, 0)
+  const hasRunningJobs = runningJobCount > 0
   const activeElapsedLabel = actionStartedAt !== null ? formatElapsed(elapsedMs) : ''
   const completedElapsedLabel = actionStartedAt === null && lastActionMs !== null ? `Took ${formatElapsed(lastActionMs)}` : ''
+  const jobNow = jobClock || Date.now()
+
+  useEffect(() => {
+    if (runningJobCount === 0 && remoteQueues.length === 0) return
+    const timer = window.setInterval(() => {
+      setJobClock(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [runningJobCount, remoteQueues.length])
+
+  function refreshJobCounts() {
+    setJobStats((existing) => {
+      const next = { ...existing } as JobStats
+      for (const kind of JOB_KINDS) {
+        next[kind] = {
+          ...next[kind],
+          running: runningJobsRef.current[kind],
+          queued: jobQueuesRef.current[kind].length,
+          oldestStartedAt: runningJobStartsRef.current[kind].length > 0
+            ? Math.min(...runningJobStartsRef.current[kind])
+            : null,
+        }
+      }
+      return next
+    })
+  }
+
+  function updateConcurrency(kind: JobKind, value: number) {
+    const nextValue = clampConcurrency(value)
+    setConcurrency((existing) => ({ ...existing, [kind]: nextValue }))
+  }
+
+  function enqueueJob(kind: JobKind, label: string, run: () => Promise<void>) {
+    const job: LocalJob = {
+      id: `${kind}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      kind,
+      label,
+      run,
+    }
+    jobQueuesRef.current[kind].push(job)
+    refreshJobCounts()
+    setError('')
+    setLastActionMs(null)
+    setStatus(`${label} queued`)
+    pumpJobs(kind)
+  }
+
+  function pumpJobs(kind: JobKind) {
+    const limit = clampConcurrency(concurrencyRef.current[kind])
+    const queue = jobQueuesRef.current[kind]
+    while (runningJobsRef.current[kind] < limit && queue.length > 0) {
+      const job = queue.shift()
+      if (!job) break
+      runningJobsRef.current[kind] += 1
+      refreshJobCounts()
+      void runQueuedJob(job)
+    }
+  }
+
+  async function runQueuedJob(job: LocalJob) {
+    const startedAt = Date.now()
+    runningJobStartsRef.current[job.kind].push(startedAt)
+    refreshJobCounts()
+    setError('')
+    setLastActionMs(null)
+    setStatus(`${job.label} running`)
+    try {
+      await job.run()
+      const duration = Date.now() - startedAt
+      setLastActionMs(duration)
+      setStatus(`${job.label} completed`)
+      setJobStats((existing) => ({
+        ...existing,
+        [job.kind]: {
+          ...existing[job.kind],
+          completed: existing[job.kind].completed + 1,
+          lastMs: duration,
+        },
+      }))
+    } catch (err) {
+      const duration = Date.now() - startedAt
+      setLastActionMs(duration)
+      setError(err instanceof Error ? err.message : String(err))
+      setStatus(`${job.label} failed`)
+      setJobStats((existing) => ({
+        ...existing,
+        [job.kind]: {
+          ...existing[job.kind],
+          failed: existing[job.kind].failed + 1,
+          lastMs: duration,
+        },
+      }))
+    } finally {
+      runningJobsRef.current[job.kind] = Math.max(0, runningJobsRef.current[job.kind] - 1)
+      runningJobStartsRef.current[job.kind] = runningJobStartsRef.current[job.kind].filter((value) => value !== startedAt)
+      refreshJobCounts()
+      pumpJobs(job.kind)
+    }
+  }
+
+  function remoteQueueId(kind: 'video' | 'music' | 'sfx', queueId: string) {
+    return `${kind}-${queueId}`
+  }
+
+  async function waitForQueuedMedia(kind: 'video' | 'music' | 'sfx', queued: QueueResult, model: string): Promise<MediaResult> {
+    const id = remoteQueueId(kind, queued.queueId)
+    const endpoint = kind === 'video' ? 'retrieve_video' : 'retrieve_audio'
+    const retrieveKind = kind === 'video' ? 'video' : 'audio'
+    setRemoteQueues((existing) => [
+      { id, kind, queueId: queued.queueId, status: queued.status, progressLabel: queued.progressLabel, startedAt: Date.now() },
+      ...existing.filter((entry) => entry.id !== id),
+    ])
+
+    let currentStatus = queued.status
+    let currentProgress = queued.progressLabel
+    let downloadUrl = queued.downloadUrl
+
+    while (ACTIVE_QUEUE_STATUSES.has(currentStatus.toLowerCase())) {
+      await sleep(7000)
+      const output = await call<RetrieveResult>(endpoint, {
+        request: {
+          queueId: queued.queueId,
+          kind: retrieveKind,
+          model,
+          downloadUrl,
+        },
+      })
+      currentStatus = output.status
+      currentProgress = output.progressLabel
+      downloadUrl = downloadUrl || ''
+      setRemoteQueues((existing) =>
+        existing.map((entry) =>
+          entry.id === id ? { ...entry, status: currentStatus, progressLabel: currentProgress } : entry,
+        ),
+      )
+      if (output.result) {
+        setRemoteQueues((existing) => existing.filter((entry) => entry.id !== id))
+        return output.result
+      }
+    }
+
+    setRemoteQueues((existing) => existing.filter((entry) => entry.id !== id))
+    throw new Error(`${JOB_LABELS[kind]} queue ended with status ${currentStatus}`)
+  }
 
   async function runAction<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     const startedAt = Date.now()
@@ -540,29 +796,40 @@ export function App() {
     return normalized
   }
 
-  async function generateImage(event: FormEvent) {
+  function generateImage(event: FormEvent) {
     event.preventDefault()
-    const output = await runAction('Generating image', () =>
-      call<MediaResult[]>('generate_image', {
-        request: {
-          model: imageModel,
-          prompt,
-          negativePrompt,
-          aspectRatio: selectedAspectRatio,
-          resolution: selectedImageResolution || null,
-          variants,
-          steps,
-          cfgScale,
-          seed: seedForImageRequest(),
-          hideWatermark,
-          format: imageFormat,
-        },
-      }),
-    )
-    if (output) setResultGroups((existing) => [createResultGroup(output, 'Images'), ...existing])
+    let requestSeed: number | null
+    try {
+      requestSeed = seedForImageRequest()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setLastActionMs(null)
+      setStatus('Needs attention')
+      return
+    }
+
+    const request = {
+      model: imageModel,
+      prompt,
+      negativePrompt,
+      aspectRatio: selectedAspectRatio,
+      resolution: selectedImageResolution || null,
+      variants,
+      steps,
+      cfgScale,
+      seed: requestSeed,
+      hideWatermark,
+      format: imageFormat,
+    }
+
+    enqueueJob('image', 'Image generation', async () => {
+      const startedAt = Date.now()
+      const output = await call<MediaResult[]>('generate_image', { request })
+      setResultGroups((existing) => [createResultGroup(output, `Images · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
   }
 
-  async function removeBackground() {
+  function removeBackground() {
     const backgroundSource = editSourceImages.find(Boolean) ?? ''
     if (!backgroundSource) {
       setError('Choose a source image first')
@@ -571,14 +838,15 @@ export function App() {
       return
     }
 
-    const output = await runAction('Removing background', () =>
-      call<MediaResult>('remove_background', {
+    enqueueJob('edit', 'Background removal', async () => {
+      const startedAt = Date.now()
+      const output = await call<MediaResult>('remove_background', {
         request: {
           sourceImage: backgroundSource,
         },
-      }),
-    )
-    if (output) setResultGroups((existing) => [createResultGroup([output], 'Background Removed'), ...existing])
+      })
+      setResultGroups((existing) => [createResultGroup([output], `Background Removed · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
   }
 
   async function moveResultFilesToBurn(paths: string[], label: string) {
@@ -658,81 +926,64 @@ export function App() {
     setEditSourceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? '' : source)))
   }
 
-  async function queueVideo(event: FormEvent) {
+  function queueVideo(event: FormEvent) {
     event.preventDefault()
-    const output = await runAction('Queueing video', () =>
-      call<QueueResult>('queue_video', {
-        request: {
-          model: videoModel,
-          prompt,
-          negativePrompt,
-          sourceImage,
-          duration: videoDuration,
-          resolution: videoResolution,
-          aspectRatio: videoAspectRatio,
-        },
-      }),
-    )
-    if (output) setQueue(output)
-  }
-
-  async function queueAudio(event: FormEvent, kind: 'music' | 'sfx') {
-    event.preventDefault()
-    const output = await runAction('Queueing audio', () =>
-      call<QueueResult>('queue_audio', {
-        request: {
-          model: kind === 'music' ? musicModel : sfxModel,
-          prompt,
-          duration: audioDuration,
-          lyricsPrompt: kind === 'music' ? lyrics : '',
-          forceInstrumental: kind === 'music' ? instrumental : false,
-          lyricsOptimizer: kind === 'music' ? lyricsOptimizer : false,
-        },
-      }),
-    )
-    if (output) setQueue(output)
-  }
-
-  async function pollQueue() {
-    if (!queue) return
-    const queueKind = mode === 'video' ? 'video' : 'audio'
-    const output = await runAction('Checking queue', () =>
-      call<RetrieveResult>(queueKind === 'video' ? 'retrieve_video' : 'retrieve_audio', {
-        request: {
-          queueId: queue.queueId,
-          kind: queueKind,
-          model: queueKind === 'video' ? videoModel : mode === 'music' ? musicModel : sfxModel,
-          downloadUrl: queue.downloadUrl,
-        },
-      }),
-    )
-    if (!output) return
-    setQueue((existing) => existing ? { ...existing, status: output.status, progressLabel: output.progressLabel } : existing)
-    if (output.result) {
-      const result = output.result
-      setResultGroups((existing) => [createResultGroup([result], result.kind), ...existing])
-      setQueue(null)
+    const request = {
+      model: videoModel,
+      prompt,
+      negativePrompt,
+      sourceImage,
+      duration: videoDuration,
+      resolution: videoResolution,
+      aspectRatio: videoAspectRatio,
     }
+
+    enqueueJob('video', 'Video generation', async () => {
+      const startedAt = Date.now()
+      const queued = await call<QueueResult>('queue_video', { request })
+      const result = await waitForQueuedMedia('video', queued, request.model)
+      setResultGroups((existing) => [createResultGroup([result], `Video · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
   }
 
-  async function generateVoice(event: FormEvent) {
+  function queueAudio(event: FormEvent, kind: 'music' | 'sfx') {
     event.preventDefault()
-    const output = await runAction('Generating voice', () =>
-      call<MediaResult>('generate_speech', {
-        request: {
-          model: voiceModel,
-          input: voiceText,
-          voice: voiceName,
-          speed: voiceSpeed,
-          responseFormat: voiceFormat,
-          stylePrompt: voiceStyle,
-        },
-      }),
-    )
-    if (output) setResultGroups((existing) => [createResultGroup([output], 'Voice'), ...existing])
+    const request = {
+      model: kind === 'music' ? musicModel : sfxModel,
+      prompt,
+      duration: audioDuration,
+      lyricsPrompt: kind === 'music' ? lyrics : '',
+      forceInstrumental: kind === 'music' ? instrumental : false,
+      lyricsOptimizer: kind === 'music' ? lyricsOptimizer : false,
+    }
+
+    enqueueJob(kind, `${JOB_LABELS[kind]} generation`, async () => {
+      const startedAt = Date.now()
+      const queued = await call<QueueResult>('queue_audio', { request })
+      const result = await waitForQueuedMedia(kind, queued, request.model)
+      setResultGroups((existing) => [createResultGroup([result], `${JOB_LABELS[kind]} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
   }
 
-  async function transcribeSpeech(event: FormEvent) {
+  function generateVoice(event: FormEvent) {
+    event.preventDefault()
+    const request = {
+      model: voiceModel,
+      input: voiceText,
+      voice: voiceName,
+      speed: voiceSpeed,
+      responseFormat: voiceFormat,
+      stylePrompt: voiceStyle,
+    }
+
+    enqueueJob('voice', 'Voice generation', async () => {
+      const startedAt = Date.now()
+      const output = await call<MediaResult>('generate_speech', { request })
+      setResultGroups((existing) => [createResultGroup([output], `Voice · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
+  }
+
+  function transcribeSpeech(event: FormEvent) {
     event.preventDefault()
     if (!transcribeAudio) {
       setError('Choose an audio or video file to transcribe')
@@ -741,20 +992,21 @@ export function App() {
       return
     }
 
-    const output = await runAction('Transcribing speech', () =>
-      call<MediaResult>('transcribe_audio', {
-        request: {
-          model: transcribeModel,
-          audio: transcribeAudio,
-          fileName: transcribeFileName || 'audio',
-          mimeType: transcribeMimeType,
-          responseFormat: selectedTranscribeResponseFormat,
-          timestamps: supportsTranscribeTimestamps ? transcribeTimestamps : false,
-          language: supportsTranscribeLanguage ? transcribeLanguage : '',
-        },
-      }),
-    )
-    if (output) setResultGroups((existing) => [createResultGroup([output], 'Speech -> Text'), ...existing])
+    const request = {
+      model: transcribeModel,
+      audio: transcribeAudio,
+      fileName: transcribeFileName || 'audio',
+      mimeType: transcribeMimeType,
+      responseFormat: selectedTranscribeResponseFormat,
+      timestamps: supportsTranscribeTimestamps ? transcribeTimestamps : false,
+      language: supportsTranscribeLanguage ? transcribeLanguage : '',
+    }
+
+    enqueueJob('transcribe', 'Speech transcription', async () => {
+      const startedAt = Date.now()
+      const output = await call<MediaResult>('transcribe_audio', { request })
+      setResultGroups((existing) => [createResultGroup([output], `Speech -> Text · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+    })
   }
 
   function addCustomModel(event: FormEvent) {
@@ -837,8 +1089,11 @@ export function App() {
         {error && <div className="notice error">{error}</div>}
         {status && (
           <div className="notice">
-            {loading ? <Loader2 className="spin" size={16} /> : null}
+            {loading || hasRunningJobs ? <Loader2 className="spin" size={16} /> : null}
             <span className="notice-message">{status}</span>
+            {(runningJobCount > 0 || queuedJobCount > 0) && (
+              <span className="elapsed-pill">{runningJobCount} running · {queuedJobCount} queued</span>
+            )}
             {activeElapsedLabel && <span className="elapsed-pill">{activeElapsedLabel}</span>}
             {completedElapsedLabel && <span className="elapsed-pill">{completedElapsedLabel}</span>}
           </div>
@@ -867,6 +1122,7 @@ export function App() {
                   <NumberField label="Steps" value={steps} min={1} max={80} step={1} onChange={setSteps} />
                   <NumberField label="CFG" value={cfgScale} min={1} max={20} step={0.5} onChange={setCfgScale} />
                   <TextField label="Seed" value={seed} onChange={setSeed} />
+                  <NumberField label="Concurrent" value={concurrency.image} min={1} max={12} step={1} onChange={(value) => updateConcurrency('image', value)} />
                 </div>
                 <label className="toggle-row">
                   <input type="checkbox" checked={hideWatermark} onChange={(event) => setHideWatermark(event.target.checked)} />
@@ -894,7 +1150,8 @@ export function App() {
                   />
                   <span>Random seed</span>
                 </label>
-                <SubmitButton loading={loading} icon={Wand2}>Generate Image</SubmitButton>
+                <QueueSummary label="Image queue" stats={jobStats.image} limit={concurrency.image} now={jobNow} />
+                <SubmitButton busy={jobStats.image.running > 0} icon={Wand2}>Generate Image</SubmitButton>
               </form>
             )}
 
@@ -922,16 +1179,20 @@ export function App() {
                   </div>
                 </div>
                 <PromptArea value={prompt} onChange={setPrompt} />
+                <div className="control-grid">
+                  <NumberField label="Concurrent" value={concurrency.edit} min={1} max={12} step={1} onChange={(value) => updateConcurrency('edit', value)} />
+                </div>
                 <div className="action-row">
                   <button className="secondary-action" type="button" disabled>
                     <Scissors size={18} />
                     Edit / Combine
                   </button>
-                  <button className="primary-action" type="button" onClick={removeBackground} disabled={loading || !hasEditSource}>
-                    {loading ? <Loader2 className="spin" size={18} /> : <Eraser size={18} />}
+                  <button className="primary-action" type="button" onClick={removeBackground} disabled={!hasEditSource}>
+                    {jobStats.edit.running > 0 ? <Loader2 className="spin" size={18} /> : <Eraser size={18} />}
                     Remove Background
                   </button>
                 </div>
+                <QueueSummary label="Edit queue" stats={jobStats.edit} limit={concurrency.edit} now={jobNow} />
               </form>
             )}
 
@@ -945,8 +1206,10 @@ export function App() {
                   <SelectField label="Duration" value={videoDuration} onChange={setVideoDuration} options={videoDurations} />
                   <SelectField label="Resolution" value={videoResolution} onChange={setVideoResolution} options={videoResolutions} />
                   <SelectField label="Aspect" value={videoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />
+                  <NumberField label="Concurrent" value={concurrency.video} min={1} max={12} step={1} onChange={(value) => updateConcurrency('video', value)} />
                 </div>
-                <SubmitButton loading={loading} icon={Video}>Queue Video</SubmitButton>
+                <QueueSummary label="Video queue" stats={jobStats.video} limit={concurrency.video} now={jobNow} />
+                <SubmitButton busy={jobStats.video.running > 0} icon={Video}>Queue Video</SubmitButton>
               </form>
             )}
 
@@ -957,6 +1220,7 @@ export function App() {
                 <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />
                 <div className="control-grid">
                   <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />
+                  <NumberField label="Concurrent" value={concurrency.music} min={1} max={12} step={1} onChange={(value) => updateConcurrency('music', value)} />
                 </div>
                 <label className="toggle-row">
                   <input type="checkbox" checked={instrumental} onChange={(event) => setInstrumental(event.target.checked)} />
@@ -966,7 +1230,8 @@ export function App() {
                   <input type="checkbox" checked={lyricsOptimizer} onChange={(event) => setLyricsOptimizer(event.target.checked)} />
                   <span>Auto lyrics</span>
                 </label>
-                <SubmitButton loading={loading} icon={Music}>Queue Music</SubmitButton>
+                <QueueSummary label="Music queue" stats={jobStats.music} limit={concurrency.music} now={jobNow} />
+                <SubmitButton busy={jobStats.music.running > 0} icon={Music}>Queue Music</SubmitButton>
               </form>
             )}
 
@@ -976,8 +1241,10 @@ export function App() {
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
                   <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />
+                  <NumberField label="Concurrent" value={concurrency.sfx} min={1} max={12} step={1} onChange={(value) => updateConcurrency('sfx', value)} />
                 </div>
-                <SubmitButton loading={loading} icon={Volume2}>Queue SFX</SubmitButton>
+                <QueueSummary label="SFX queue" stats={jobStats.sfx} limit={concurrency.sfx} now={jobNow} />
+                <SubmitButton busy={jobStats.sfx.running > 0} icon={Volume2}>Queue SFX</SubmitButton>
               </form>
             )}
 
@@ -989,9 +1256,11 @@ export function App() {
                   <SelectField label="Voice" value={voiceName || voiceOptions[0] || ''} onChange={setVoiceName} options={voiceOptions} />
                   <NumberField label="Speed" value={voiceSpeed} min={0.25} max={4} step={0.05} onChange={setVoiceSpeed} />
                   <SelectField label="Format" value={voiceFormat} onChange={setVoiceFormat} options={['mp3', 'wav', 'flac', 'aac', 'opus']} />
+                  <NumberField label="Concurrent" value={concurrency.voice} min={1} max={12} step={1} onChange={(value) => updateConcurrency('voice', value)} />
                 </div>
                 <PromptArea label="Style prompt" value={voiceStyle} onChange={setVoiceStyle} rows={3} />
-                <SubmitButton loading={loading} icon={Mic2}>Generate Voice</SubmitButton>
+                <QueueSummary label="Voice queue" stats={jobStats.voice} limit={concurrency.voice} now={jobNow} />
+                <SubmitButton busy={jobStats.voice.running > 0} icon={Mic2}>Generate Voice</SubmitButton>
               </form>
             )}
 
@@ -1010,6 +1279,7 @@ export function App() {
                   {supportsTranscribeLanguage && (
                     <TextField label="Language" value={transcribeLanguage} onChange={setTranscribeLanguage} />
                   )}
+                  <NumberField label="Concurrent" value={concurrency.transcribe} min={1} max={12} step={1} onChange={(value) => updateConcurrency('transcribe', value)} />
                 </div>
                 {supportsTranscribeTimestamps && (
                   <label className="toggle-row">
@@ -1017,7 +1287,8 @@ export function App() {
                     <span>Include timestamps</span>
                   </label>
                 )}
-                <SubmitButton loading={loading} icon={FileText}>Transcribe</SubmitButton>
+                <QueueSummary label="Speech queue" stats={jobStats.transcribe} limit={concurrency.transcribe} now={jobNow} />
+                <SubmitButton busy={jobStats.transcribe.running > 0} icon={FileText}>Transcribe</SubmitButton>
               </form>
             )}
 
@@ -1100,16 +1371,27 @@ export function App() {
           </div>
 
           <aside className="result-panel">
-            {queue && (
-              <div className="queue-panel">
-                <div>
-                  <span className="eyebrow">Queued</span>
-                  <strong>{queue.queueId}</strong>
-                  <small>{queue.progressLabel || queue.status}</small>
-                </div>
-                <button className="icon-button" type="button" onClick={pollQueue} title="Poll queue">
-                  <RefreshCw size={18} />
-                </button>
+            {(runningJobCount > 0 || queuedJobCount > 0 || remoteQueues.length > 0) && (
+              <div className="queue-stack">
+                {(runningJobCount > 0 || queuedJobCount > 0) && (
+                  <div className="queue-panel">
+                    <div>
+                      <span className="eyebrow">Local Queue</span>
+                      <strong>{runningJobCount} running · {queuedJobCount} waiting</strong>
+                      <small>{JOB_KINDS.filter((kind) => jobStats[kind].running > 0 || jobStats[kind].queued > 0).map((kind) => `${JOB_LABELS[kind]} ${jobStats[kind].running}/${jobStats[kind].queued}`).join(' · ')}</small>
+                    </div>
+                  </div>
+                )}
+                {remoteQueues.map((entry) => (
+                  <div className="queue-panel" key={entry.id}>
+                    <div>
+                      <span className="eyebrow">{JOB_LABELS[entry.kind]} Venice Queue</span>
+                      <strong>{entry.queueId}</strong>
+                      <small>{entry.progressLabel || entry.status} · {formatElapsed(jobNow - entry.startedAt)}</small>
+                    </div>
+                    <Loader2 className="spin" size={18} />
+                  </div>
+                ))}
               </div>
             )}
             <div className="result-header">
@@ -1427,19 +1709,32 @@ function SourcePicker({
 }
 
 function SubmitButton({
-  loading,
+  busy = false,
+  disabled = false,
   icon: Icon,
   children,
 }: {
-  loading: boolean
+  busy?: boolean
+  disabled?: boolean
   icon: LucideIcon
   children: ReactNode
 }) {
   return (
-    <button className="primary-action" type="submit" disabled={loading}>
-      {loading ? <Loader2 className="spin" size={18} /> : <Icon size={18} />}
+    <button className="primary-action" type="submit" disabled={disabled}>
+      {busy ? <Loader2 className="spin" size={18} /> : <Icon size={18} />}
       {children}
     </button>
+  )
+}
+
+function QueueSummary({ label, stats, limit, now }: { label: string; stats: JobStats[JobKind]; limit: number; now: number }) {
+  const runningLabel = stats.oldestStartedAt !== null ? ` · running ${formatElapsed(now - stats.oldestStartedAt)}` : ''
+  return (
+    <div className="queue-summary">
+      <span>{label}</span>
+      <strong>{stats.running}/{limit} running</strong>
+      <small>{stats.queued} queued{runningLabel} · {stats.completed} done · {stats.failed} failed{stats.lastMs !== null ? ` · last ${formatElapsed(stats.lastMs)}` : ''}</small>
+    </div>
   )
 }
 
