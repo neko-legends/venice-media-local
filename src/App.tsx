@@ -271,6 +271,18 @@ function formatByteCount(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, ms / 1000)
+  if (seconds < 60) {
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`
+  }
+
+  const wholeSeconds = Math.round(seconds)
+  const minutes = Math.floor(wholeSeconds / 60)
+  const remainingSeconds = String(wholeSeconds % 60).padStart(2, '0')
+  return `${minutes}m ${remainingSeconds}s`
+}
+
 function isTranscribableFile(file: File): boolean {
   if (file.type.startsWith('audio/') || file.type.startsWith('video/')) return true
   return /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg)$/i.test(file.name)
@@ -299,6 +311,9 @@ export function App() {
   const [status, setStatus] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [actionStartedAt, setActionStartedAt] = useState<number | null>(null)
+  const [elapsedMs, setElapsedMs] = useState(0)
+  const [lastActionMs, setLastActionMs] = useState<number | null>(null)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [overrides, setOverrides] = useState<Overrides>(() => readOverrides())
   const [resultGroups, setResultGroups] = useState<ResultGroup[]>([])
@@ -370,6 +385,7 @@ export function App() {
         setModels(state.models)
       })
       .catch(() => {
+        setLastActionMs(null)
         setStatus('Preview mode')
       })
   }, [])
@@ -398,6 +414,15 @@ export function App() {
     return () => window.clearInterval(timer)
   }, [queue])
 
+  useEffect(() => {
+    if (actionStartedAt === null) return
+    setElapsedMs(Date.now() - actionStartedAt)
+    const timer = window.setInterval(() => {
+      setElapsedMs(Date.now() - actionStartedAt)
+    }, 250)
+    return () => window.clearInterval(timer)
+  }, [actionStartedAt])
+
   const currentImageModel = imageModels.find((model) => model.id === imageModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
   const currentVoiceModel = voiceModels.find((model) => model.id === voiceModel)
@@ -417,11 +442,17 @@ export function App() {
   const resultCount = resultGroups.reduce((total, group) => total + group.results.length, 0)
   const resultFilePaths = resultGroups.flatMap((group) => group.results.map((result) => result.filePath))
   const hasEditSource = editSourceImages.some(Boolean)
+  const activeElapsedLabel = actionStartedAt !== null ? formatElapsed(elapsedMs) : ''
+  const completedElapsedLabel = actionStartedAt === null && lastActionMs !== null ? `Took ${formatElapsed(lastActionMs)}` : ''
 
   async function runAction<T>(label: string, action: () => Promise<T>): Promise<T | null> {
+    const startedAt = Date.now()
     setError('')
     setStatus(label)
     setLoading(true)
+    setActionStartedAt(startedAt)
+    setElapsedMs(0)
+    setLastActionMs(null)
     try {
       const value = await action()
       setStatus('Ready')
@@ -431,6 +462,10 @@ export function App() {
       setStatus('Needs attention')
       return null
     } finally {
+      const duration = Date.now() - startedAt
+      setElapsedMs(duration)
+      setLastActionMs(duration)
+      setActionStartedAt(null)
       setLoading(false)
     }
   }
@@ -531,6 +566,7 @@ export function App() {
     const backgroundSource = editSourceImages.find(Boolean) ?? ''
     if (!backgroundSource) {
       setError('Choose a source image first')
+      setLastActionMs(null)
       setStatus('Needs attention')
       return
     }
@@ -568,6 +604,7 @@ export function App() {
     const stats = await runAction('Checking burn folder', () => call<BurnFolderStats>('get_burn_folder_stats'))
     if (!stats) return
     if (stats.fileCount === 0) {
+      setLastActionMs(null)
       setStatus('Burn folder is empty')
       return
     }
@@ -577,6 +614,7 @@ export function App() {
       `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\n${stats.burnDir}`,
     )
     if (!confirmed) {
+      setLastActionMs(null)
       setStatus('Ready')
       return
     }
@@ -698,6 +736,7 @@ export function App() {
     event.preventDefault()
     if (!transcribeAudio) {
       setError('Choose an audio or video file to transcribe')
+      setLastActionMs(null)
       setStatus('Needs attention')
       return
     }
@@ -796,7 +835,14 @@ export function App() {
         </header>
 
         {error && <div className="notice error">{error}</div>}
-        {status && <div className="notice">{loading ? <Loader2 className="spin" size={16} /> : null}{status}</div>}
+        {status && (
+          <div className="notice">
+            {loading ? <Loader2 className="spin" size={16} /> : null}
+            <span className="notice-message">{status}</span>
+            {activeElapsedLabel && <span className="elapsed-pill">{activeElapsedLabel}</span>}
+            {completedElapsedLabel && <span className="elapsed-pill">{completedElapsedLabel}</span>}
+          </div>
+        )}
 
         <section className="content-grid">
           <div className="tool-surface">
