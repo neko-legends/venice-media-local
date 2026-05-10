@@ -838,7 +838,17 @@ button {
   min-width: 0;
 }
 
-.result-item img,
+.result-item img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 360px;
+  justify-self: center;
+  border-radius: 6px;
+  background: transparent;
+  object-fit: contain;
+}
+
 .result-item video {
   width: 100%;
   max-height: 360px;
