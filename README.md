@@ -8,7 +8,9 @@ This project is not affiliated with, endorsed by, or maintained by Venice. It is
 
 ## Demo
 
-Watch the quick demo: [demo.mp4](./docs/media/demo.mp4)
+![Demo preview](./docs/media/demo-preview.gif)
+
+[Watch the full MP4 demo](./docs/media/demo.mp4)
 
 ## For Humans
 

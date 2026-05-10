@@ -22,7 +22,7 @@ venice-models.json
 outputs/
 output/
 generated/
-media/
+/media/
 
 # Logs and OS/editor noise
 *.log
