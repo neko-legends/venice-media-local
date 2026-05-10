@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose, Engine as _};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1077,6 +1077,33 @@ fn output_root(app: &AppHandle, settings: &AppSettings) -> Result<PathBuf, Strin
     Ok(PathBuf::from(default_output_dir(app)?))
 }
 
+fn metadata_number(metadata: &Value, key: &str) -> Option<u64> {
+    metadata.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+    })
+}
+
+fn image_file_stem(metadata: &Value) -> Option<String> {
+    let seed = metadata_number(metadata, "seed")?;
+    let variant = metadata_number(metadata, "variantIndex").unwrap_or(1);
+    let date = Local::now().format("%Y-%m-%d").to_string();
+    Some(format!("{date}_seed-{seed}_v{variant}"))
+}
+
+fn unique_file_path(dir: &Path, stem: &str, ext: &str) -> (String, PathBuf) {
+    let mut name = format!("{stem}.{ext}");
+    let mut path = dir.join(&name);
+    let mut attempt = 2;
+    while path.exists() {
+        name = format!("{stem}_{attempt}.{ext}");
+        path = dir.join(&name);
+        attempt += 1;
+    }
+    (name, path)
+}
+
 fn save_media_bytes(
     app: &AppHandle,
     kind: &str,
@@ -1096,12 +1123,13 @@ fn save_media_bytes(
         .and_then(|value| value.as_u64())
         .map(|index| format!("-v{index}"))
         .unwrap_or_default();
-    let name = format!("{timestamp}-{stem}{variant_suffix}.{ext}");
-    let path = dir.join(&name);
+    let file_stem =
+        image_file_stem(&metadata).unwrap_or_else(|| format!("{timestamp}-{stem}{variant_suffix}"));
+    let (name, path) = unique_file_path(&dir, &file_stem, ext);
     fs::write(&path, bytes).map_err(|err| err.to_string())?;
     let encoded = general_purpose::STANDARD.encode(bytes);
     Ok(MediaResult {
-        id: format!("{kind}-{timestamp}-{stem}{variant_suffix}"),
+        id: format!("{kind}-{file_stem}"),
         kind: kind.to_string(),
         name,
         mime_type: mime_type.to_string(),
@@ -1587,6 +1615,7 @@ async fn generate_image(
         let metadata = json!({
             "model": body.get("model"),
             "prompt": body.get("prompt"),
+            "seed": body.get("seed"),
             "variantIndex": index + 1,
             "raw": payload
         });

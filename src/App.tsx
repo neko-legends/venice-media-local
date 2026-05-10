@@ -513,7 +513,7 @@ export function App() {
   const [cfgScale, setCfgScale] = useState(7.5)
   const [seed, setSeed] = useState('')
   const [lockSeed, setLockSeed] = useState(false)
-  const [randomSeed, setRandomSeed] = useState(false)
+  const [randomSeed, setRandomSeed] = useState(true)
   const [hideWatermark, setHideWatermark] = useState(true)
 
   const [sourceImage, setSourceImage] = useState('')
@@ -827,15 +827,13 @@ export function App() {
     return Math.floor(Math.random() * (MAX_IMAGE_SEED + 1))
   }
 
-  function seedForImageRequest(): number | null {
+  function seedForImageRequest(): number {
     const trimmed = seed.trim()
-    if (randomSeed || (lockSeed && !trimmed)) {
+    if (randomSeed || !trimmed) {
       const nextSeed = randomImageSeed()
       setSeed(String(nextSeed))
       return nextSeed
     }
-
-    if (!trimmed) return null
 
     const parsed = Number(trimmed)
     if (!Number.isFinite(parsed)) {
@@ -855,7 +853,7 @@ export function App() {
 
   function generateImage(event: FormEvent) {
     event.preventDefault()
-    let requestSeed: number | null
+    let requestSeed: number
     try {
       requestSeed = seedForImageRequest()
     } catch (err) {
@@ -879,10 +877,11 @@ export function App() {
       format: imageFormat,
     }
 
-    enqueueJob('image', 'Image generation', async () => {
+    const seedLabel = `seed ${requestSeed}`
+    enqueueJob('image', `Image generation · ${seedLabel}`, async () => {
       const startedAt = Date.now()
       const output = await call<MediaResult[]>('generate_image', { request })
-      setResultGroups((existing) => [createResultGroup(output, `Images · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+      setResultGroups((existing) => [createResultGroup(output, `Images · ${seedLabel} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
 
