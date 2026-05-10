@@ -95,11 +95,17 @@ type Overrides = {
 
 const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
 const EDIT_SOURCE_LIMIT = 3
+const IMAGE_ASPECT_OPTIONS = ['1:1', '4:3', '3:4', '16:9', '9:16']
+const VIDEO_DURATION_OPTIONS = ['5s', '10s']
+const VIDEO_RESOLUTION_OPTIONS = ['480p', '720p', '1080p']
+const VIDEO_ASPECT_OPTIONS = ['16:9', '9:16', '1:1']
+const VOICE_OPTIONS = ['am_eric', 'af_bella', 'af_nova']
+const EMPTY_OPTIONS: string[] = []
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
   imageModels: [
-    baseModel('gpt-image-2', 'GPT Image 2', 'image'),
+    baseModel('gpt-image-2', 'GPT Image 2', 'image', { resolutionOptions: ['1K', '2K', '4K'] }),
     baseModel('flux-2-max', 'Flux 2 Max', 'image'),
     baseModel('qwen-image-2', 'Qwen Image 2', 'image'),
   ],
@@ -124,8 +130,8 @@ const fallbackModels: ModelCache = {
   ],
 }
 
-function baseModel(id: string, name: string, kind: ModelKind): ModelRecord {
-  return { id, name, kind, modes: [kind], controls: {} }
+function baseModel(id: string, name: string, kind: ModelKind, controls: Record<string, unknown> = {}): ModelRecord {
+  return { id, name, kind, modes: [kind], controls }
 }
 
 const modes = [
@@ -266,6 +272,7 @@ export function App() {
   const [prompt, setPrompt] = useState('')
   const [negativePrompt, setNegativePrompt] = useState('')
   const [aspectRatio, setAspectRatio] = useState('1:1')
+  const [imageResolution, setImageResolution] = useState('')
   const [imageFormat, setImageFormat] = useState('webp')
   const [variants, setVariants] = useState(1)
   const [steps, setSteps] = useState(28)
@@ -329,12 +336,17 @@ export function App() {
     return () => window.clearInterval(timer)
   }, [queue])
 
+  const currentImageModel = imageModels.find((model) => model.id === imageModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
   const currentVoiceModel = voiceModels.find((model) => model.id === voiceModel)
-  const videoDurations = controlArray(currentVideoModel, 'durationOptions', ['5s', '10s'])
-  const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', ['480p', '720p', '1080p'])
-  const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', ['16:9', '9:16', '1:1'])
-  const voiceOptions = controlArray(currentVoiceModel, 'voices', ['am_eric', 'af_bella', 'af_nova'])
+  const imageRatios = controlArray(currentImageModel, 'sizeOptions', IMAGE_ASPECT_OPTIONS)
+  const imageResolutions = controlArray(currentImageModel, 'resolutionOptions', EMPTY_OPTIONS)
+  const selectedAspectRatio = imageRatios.includes(aspectRatio) ? aspectRatio : imageRatios[0] ?? '1:1'
+  const selectedImageResolution = imageResolutions.includes(imageResolution) ? imageResolution : ''
+  const videoDurations = controlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
+  const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
+  const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
+  const voiceOptions = controlArray(currentVoiceModel, 'voices', VOICE_OPTIONS)
   const resultCount = resultGroups.reduce((total, group) => total + group.results.length, 0)
   const resultFilePaths = resultGroups.flatMap((group) => group.results.map((result) => result.filePath))
   const hasEditSource = editSourceImages.some(Boolean)
@@ -404,7 +416,8 @@ export function App() {
           model: imageModel,
           prompt,
           negativePrompt,
-          aspectRatio,
+          aspectRatio: selectedAspectRatio,
+          resolution: selectedImageResolution || null,
           variants,
           steps,
           cfgScale,
@@ -634,7 +647,16 @@ export function App() {
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
-                  <SelectField label="Aspect" value={aspectRatio} onChange={setAspectRatio} options={['1:1', '4:3', '3:4', '16:9', '9:16']} />
+                  <SelectField label="Aspect" value={selectedAspectRatio} onChange={setAspectRatio} options={imageRatios} />
+                  {imageResolutions.length > 0 && (
+                    <label className="field compact">
+                      <span>Resolution</span>
+                      <select value={selectedImageResolution} onChange={(event) => setImageResolution(event.target.value)}>
+                        <option value="">Auto</option>
+                        {imageResolutions.map((option) => <option key={option} value={option}>{option}</option>)}
+                      </select>
+                    </label>
+                  )}
                   <SelectField label="Format" value={imageFormat} onChange={setImageFormat} options={['webp', 'png', 'jpeg']} />
                   <NumberField label="Variants" value={variants} min={1} max={4} step={1} onChange={setVariants} />
                   <NumberField label="Steps" value={steps} min={1} max={80} step={1} onChange={setSteps} />

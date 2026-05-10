@@ -284,7 +284,7 @@ fn fallback_model_cache() -> ModelCache {
                 "GPT Image 2",
                 "image",
                 "generate-image",
-                image_controls(),
+                image_controls_with_resolutions(&["1K", "2K", "4K"]),
             ),
             model(
                 "flux-2-max",
@@ -419,6 +419,10 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
     if cache.voice_models.is_empty() {
         cache.voice_models = fallback.voice_models;
     }
+
+    for model in &mut cache.image_models {
+        apply_known_image_resolution_controls(model);
+    }
 }
 
 fn save_model_cache(app: &AppHandle, cache: &ModelCache) -> Result<(), String> {
@@ -436,6 +440,12 @@ fn image_controls() -> Value {
         "variantCount": { "min": 1, "max": 4 },
         "sizeOptions": ["1:1", "4:3", "3:4", "16:9", "9:16"]
     })
+}
+
+fn image_controls_with_resolutions(resolutions: &[&str]) -> Value {
+    let mut controls = image_controls();
+    controls["resolutionOptions"] = json!(resolutions);
+    controls
 }
 
 fn video_controls() -> Value {
@@ -544,8 +554,107 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
             .filter(|entry| !entry.is_empty())
             .map(ToString::to_string)
             .collect(),
+        Some(Value::Object(map)) => {
+            for key in ["options", "values", "allowed", "enum"] {
+                let entries = string_array(map.get(key));
+                if !entries.is_empty() {
+                    return entries;
+                }
+            }
+            Vec::new()
+        }
+        Some(Value::String(entry)) => {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+fn first_string_array(value: &Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        let entries = string_array(value.get(key));
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+    Vec::new()
+}
+
+fn normalize_resolution_options(options: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    options
+        .into_iter()
+        .map(|entry| entry.trim().to_uppercase())
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| seen.insert(entry.clone()))
+        .collect()
+}
+
+fn known_image_resolution_options(id: &str, name: &str) -> Vec<String> {
+    let label = format!("{} {}", id.to_lowercase(), name.to_lowercase());
+    if label.contains("gpt-image-2") || label.contains("nano-banana") {
+        vec!["1K".to_string(), "2K".to_string(), "4K".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn image_resolution_options(
+    id: &str,
+    name: &str,
+    constraints: &Value,
+    capabilities: &Value,
+) -> Vec<String> {
+    let from_constraints = first_string_array(
+        constraints,
+        &[
+            "resolutions",
+            "resolution_options",
+            "supported_resolutions",
+            "resolutionTiers",
+            "resolution_tiers",
+        ],
+    );
+    if !from_constraints.is_empty() {
+        return normalize_resolution_options(from_constraints);
+    }
+
+    let from_capabilities = first_string_array(
+        capabilities,
+        &[
+            "resolutions",
+            "resolution_options",
+            "supported_resolutions",
+            "resolutionTiers",
+            "resolution_tiers",
+        ],
+    );
+    if !from_capabilities.is_empty() {
+        return normalize_resolution_options(from_capabilities);
+    }
+
+    known_image_resolution_options(id, name)
+}
+
+fn apply_known_image_resolution_controls(model: &mut ModelRecord) {
+    if !string_array(model.controls.get("resolutionOptions")).is_empty() {
+        return;
+    }
+
+    let options = known_image_resolution_options(&model.id, &model.name);
+    if options.is_empty() {
+        return;
+    }
+
+    if !model.controls.is_object() {
+        model.controls = json!({});
+    }
+    model.controls["resolutionOptions"] = json!(options);
 }
 
 fn text_contains_edit_signal(value: &str) -> bool {
@@ -635,6 +744,8 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 "generate-image"
             };
             let size_options = string_array(constraints.get("aspect_ratios"));
+            let resolution_options =
+                image_resolution_options(&id, &name, &constraints, &capabilities);
             let controls = if is_edit {
                 json!({ "variantCount": { "min": 1, "max": 4 } })
             } else {
@@ -650,6 +761,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                     } else {
                         size_options
                     },
+                    "resolutionOptions": resolution_options,
                     "rawConstraints": constraints,
                     "rawCapabilities": capabilities
                 })
