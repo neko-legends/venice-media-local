@@ -162,7 +162,8 @@ const VIDEO_ASPECT_OPTIONS = ['16:9', '9:16', '1:1']
 const VOICE_OPTIONS = ['am_eric', 'af_bella', 'af_nova']
 const EMPTY_OPTIONS: string[] = []
 const MAX_IMAGE_SEED = 999_999_999
-const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg'
+const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg,.mpg'
+const TRANSCRIBE_FILE_EXTENSION = /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg|mpg)$/i
 const JOB_KINDS: JobKind[] = ['image', 'edit', 'video', 'music', 'sfx', 'voice', 'transcribe']
 const DEFAULT_CONCURRENCY: JobConcurrency = {
   image: 4,
@@ -498,7 +499,7 @@ function resultModelLabel(result: MediaResult): string {
 
 function isTranscribableFile(file: File): boolean {
   if (file.type.startsWith('audio/') || file.type.startsWith('video/')) return true
-  return /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg)$/i.test(file.name)
+  return TRANSCRIBE_FILE_EXTENSION.test(file.name)
 }
 
 function isImageFile(file: File): boolean {
