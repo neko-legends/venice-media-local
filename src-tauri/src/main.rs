@@ -15,6 +15,23 @@ use tauri::{AppHandle, Manager};
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
+const EDIT_MODEL_PATTERNS: &[&str] = &[
+    "inpaint",
+    "image_edit",
+    "image-edit",
+    "imageedit",
+    "edit_image",
+    "edit-image",
+    "editimage",
+    "image_to_image",
+    "image-to-image",
+    "source_image",
+    "source image",
+    "reference_image",
+    "reference image",
+    "mask_image",
+    "mask image",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -182,7 +199,9 @@ fn read_api_key() -> Result<String, String> {
 }
 
 fn has_api_key() -> bool {
-    read_api_key().map(|key| !key.trim().is_empty()).unwrap_or(false)
+    read_api_key()
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -254,38 +273,145 @@ fn fallback_model_cache() -> ModelCache {
     ModelCache {
         last_fetched: String::new(),
         image_models: vec![
-            model("gpt-image-2", "GPT Image 2", "image", "generate-image", image_controls()),
-            model("flux-2-max", "Flux 2 Max", "image", "generate-image", image_controls()),
-            model("qwen-image-2", "Qwen Image 2", "image", "generate-image", image_controls()),
+            model(
+                "gpt-image-2",
+                "GPT Image 2",
+                "image",
+                "generate-image",
+                image_controls(),
+            ),
+            model(
+                "flux-2-max",
+                "Flux 2 Max",
+                "image",
+                "generate-image",
+                image_controls(),
+            ),
+            model(
+                "qwen-image-2",
+                "Qwen Image 2",
+                "image",
+                "generate-image",
+                image_controls(),
+            ),
         ],
         edit_models: vec![
-            model("gpt-image-2-edit", "GPT Image 2 Edit", "edit", "edit-image", json!({ "variantCount": { "min": 1, "max": 4 } })),
-            model("qwen-image-2-edit", "Qwen Image 2 Edit", "edit", "edit-image", json!({ "variantCount": { "min": 1, "max": 4 } })),
+            model(
+                "gpt-image-2-edit",
+                "GPT Image 2 Edit",
+                "edit",
+                "edit-image",
+                json!({ "variantCount": { "min": 1, "max": 4 } }),
+            ),
+            model(
+                "qwen-image-2-edit",
+                "Qwen Image 2 Edit",
+                "edit",
+                "edit-image",
+                json!({ "variantCount": { "min": 1, "max": 4 } }),
+            ),
         ],
         video_models: vec![
-            model("seedance-2-0-image-to-video", "Seedance 2.0", "video", "generate-video", video_controls()),
-            model("seedance-2-0-text-to-video", "Seedance 2.0 Text", "video", "generate-video", video_controls()),
-            model("wan-2-7-image-to-video", "Wan 2.7", "video", "generate-video", video_controls()),
+            model(
+                "seedance-2-0-image-to-video",
+                "Seedance 2.0",
+                "video",
+                "generate-video",
+                video_controls(),
+            ),
+            model(
+                "seedance-2-0-text-to-video",
+                "Seedance 2.0 Text",
+                "video",
+                "generate-video",
+                video_controls(),
+            ),
+            model(
+                "wan-2-7-image-to-video",
+                "Wan 2.7",
+                "video",
+                "generate-video",
+                video_controls(),
+            ),
         ],
         music_models: vec![
-            model("elevenlabs-music", "ElevenLabs Music", "music", "generate-music", audio_controls("music")),
-            model("stable-audio-25", "Stable Audio 2.5", "music", "generate-music", audio_controls("music")),
+            model(
+                "elevenlabs-music",
+                "ElevenLabs Music",
+                "music",
+                "generate-music",
+                audio_controls("music"),
+            ),
+            model(
+                "stable-audio-25",
+                "Stable Audio 2.5",
+                "music",
+                "generate-music",
+                audio_controls("music"),
+            ),
         ],
-        sfx_models: vec![
-            model("elevenlabs-sound-effects-v2", "ElevenLabs Sound Effects", "sfx", "generate-sfx", audio_controls("sfx")),
-        ],
+        sfx_models: vec![model(
+            "elevenlabs-sound-effects-v2",
+            "ElevenLabs Sound Effects",
+            "sfx",
+            "generate-sfx",
+            audio_controls("sfx"),
+        )],
         voice_models: vec![
-            model("tts-kokoro", "Kokoro TTS", "voice", "generate-voice", voice_controls(Value::Array(vec![]))),
-            model("tts-chatterbox-hd", "Chatterbox HD", "voice", "generate-voice", voice_controls(Value::Array(vec![]))),
-            model("tts-xai-v1", "xAI TTS", "voice", "generate-voice", voice_controls(Value::Array(vec![]))),
+            model(
+                "tts-kokoro",
+                "Kokoro TTS",
+                "voice",
+                "generate-voice",
+                voice_controls(Value::Array(vec![])),
+            ),
+            model(
+                "tts-chatterbox-hd",
+                "Chatterbox HD",
+                "voice",
+                "generate-voice",
+                voice_controls(Value::Array(vec![])),
+            ),
+            model(
+                "tts-xai-v1",
+                "xAI TTS",
+                "voice",
+                "generate-voice",
+                voice_controls(Value::Array(vec![])),
+            ),
         ],
     }
 }
 
 fn read_model_cache(app: &AppHandle) -> ModelCache {
-    match model_cache_path(app) {
+    let mut cache = match model_cache_path(app) {
         Ok(path) => read_json_file(&path, fallback_model_cache()),
         Err(_) => fallback_model_cache(),
+    };
+    apply_model_fallbacks(&mut cache);
+    cache
+}
+
+fn apply_model_fallbacks(cache: &mut ModelCache) {
+    let fallback = fallback_model_cache();
+
+    if cache.image_models.is_empty() {
+        cache.image_models = fallback.image_models;
+    }
+    if cache.edit_models.is_empty() {
+        cache.edit_models = fallback.edit_models;
+    }
+    if cache.video_models.is_empty() {
+        cache.video_models = fallback.video_models;
+    }
+    if cache.music_models.is_empty() {
+        cache.music_models = fallback.music_models;
+    }
+    if cache.sfx_models.is_empty() {
+        cache.sfx_models = fallback.sfx_models;
+    }
+    if cache.voice_models.is_empty() {
+        cache.voice_models = fallback.voice_models;
     }
 }
 
@@ -377,7 +503,10 @@ async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response
 
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
-    Err(format!("Venice API returned {status}: {}", trim_error_text(&text)))
+    Err(format!(
+        "Venice API returned {status}: {}",
+        trim_error_text(&text)
+    ))
 }
 
 fn trim_error_text(text: &str) -> String {
@@ -392,7 +521,12 @@ fn trim_error_text(text: &str) -> String {
 }
 
 fn as_string(value: &Value, key: &str) -> String {
-    value.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string()
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -405,6 +539,27 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
             .map(ToString::to_string)
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn text_contains_edit_signal(value: &str) -> bool {
+    let normalized = value.to_lowercase();
+    normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| matches!(part, "edit" | "edits" | "editing"))
+        || EDIT_MODEL_PATTERNS
+            .iter()
+            .any(|pattern| normalized.contains(pattern))
+}
+
+fn value_contains_edit_signal(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text_contains_edit_signal(text),
+        Value::Array(items) => items.iter().any(value_contains_edit_signal),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| text_contains_edit_signal(key) || value_contains_edit_signal(item)),
+        _ => false,
     }
 }
 
@@ -422,7 +577,11 @@ fn normalized_model_id(entry: &Value) -> String {
 
 fn is_deprecated_or_offline(entry: &Value) -> bool {
     let spec = entry.get("model_spec").unwrap_or(&Value::Null);
-    if spec.get("offline").and_then(Value::as_bool).unwrap_or(false) {
+    if spec
+        .get("offline")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return true;
     }
     let deprecation = spec.get("deprecation").unwrap_or(&Value::Null);
@@ -444,7 +603,11 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
     let capabilities = spec.get("capabilities").cloned().unwrap_or(Value::Null);
     let name = {
         let candidate = model_name(&entry);
-        if candidate.is_empty() { id.clone() } else { candidate }
+        if candidate.is_empty() {
+            id.clone()
+        } else {
+            candidate
+        }
     };
     let haystack = format!(
         "{} {} {}",
@@ -455,9 +618,16 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
 
     match model_type {
         "image" => {
-            let is_edit = haystack.contains("edit") || haystack.contains("inpaint");
+            let is_edit = text_contains_edit_signal(&haystack)
+                || value_contains_edit_signal(&constraints)
+                || value_contains_edit_signal(&capabilities)
+                || value_contains_edit_signal(&entry);
             let kind = if is_edit { "edit" } else { "image" };
-            let mode = if is_edit { "edit-image" } else { "generate-image" };
+            let mode = if is_edit {
+                "edit-image"
+            } else {
+                "generate-image"
+            };
             let size_options = string_array(constraints.get("aspect_ratios"));
             let controls = if is_edit {
                 json!({ "variantCount": { "min": 1, "max": 4 } })
@@ -478,7 +648,14 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                     "rawCapabilities": capabilities
                 })
             };
-            Some(ModelRecord { id, name, kind: kind.to_string(), modes: vec![mode.to_string()], controls, raw: entry })
+            Some(ModelRecord {
+                id,
+                name,
+                kind: kind.to_string(),
+                modes: vec![mode.to_string()],
+                controls,
+                raw: entry,
+            })
         }
         "video" => Some(ModelRecord {
             id,
@@ -503,7 +680,11 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 || haystack.contains("sfx")
                 || haystack.contains("foley");
             let kind = if is_sfx { "sfx" } else { "music" };
-            let mode = if is_sfx { "generate-sfx" } else { "generate-music" };
+            let mode = if is_sfx {
+                "generate-sfx"
+            } else {
+                "generate-music"
+            };
             Some(ModelRecord {
                 id,
                 name,
@@ -567,38 +748,50 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
         .into_iter()
         .filter_map(|entry| normalize_model(entry, "image"))
         .collect();
-    let video_models = push_unique(video_entries.into_iter().filter_map(|entry| normalize_model(entry, "video")).collect());
+    let video_models = push_unique(
+        video_entries
+            .into_iter()
+            .filter_map(|entry| normalize_model(entry, "video"))
+            .collect(),
+    );
     let audio_like = music_entries
         .into_iter()
         .filter_map(|entry| normalize_model(entry, "music"))
         .collect::<Vec<_>>();
-    let voice_models = push_unique(tts_entries.into_iter().filter_map(|entry| normalize_model(entry, "tts")).collect());
+    let voice_models = push_unique(
+        tts_entries
+            .into_iter()
+            .filter_map(|entry| normalize_model(entry, "tts"))
+            .collect(),
+    );
 
     let mut cache = ModelCache {
         last_fetched: Utc::now().to_rfc3339(),
-        image_models: image_like.iter().filter(|entry| entry.kind == "image").cloned().collect(),
-        edit_models: image_like.iter().filter(|entry| entry.kind == "edit").cloned().collect(),
+        image_models: image_like
+            .iter()
+            .filter(|entry| entry.kind == "image")
+            .cloned()
+            .collect(),
+        edit_models: image_like
+            .iter()
+            .filter(|entry| entry.kind == "edit")
+            .cloned()
+            .collect(),
         video_models,
-        music_models: audio_like.iter().filter(|entry| entry.kind == "music").cloned().collect(),
-        sfx_models: audio_like.iter().filter(|entry| entry.kind == "sfx").cloned().collect(),
+        music_models: audio_like
+            .iter()
+            .filter(|entry| entry.kind == "music")
+            .cloned()
+            .collect(),
+        sfx_models: audio_like
+            .iter()
+            .filter(|entry| entry.kind == "sfx")
+            .cloned()
+            .collect(),
         voice_models,
     };
 
-    if cache.image_models.is_empty() {
-        cache.image_models = fallback_model_cache().image_models;
-    }
-    if cache.video_models.is_empty() {
-        cache.video_models = fallback_model_cache().video_models;
-    }
-    if cache.music_models.is_empty() {
-        cache.music_models = fallback_model_cache().music_models;
-    }
-    if cache.sfx_models.is_empty() {
-        cache.sfx_models = fallback_model_cache().sfx_models;
-    }
-    if cache.voice_models.is_empty() {
-        cache.voice_models = fallback_model_cache().voice_models;
-    }
+    apply_model_fallbacks(&mut cache);
 
     save_model_cache(app, &cache)?;
     Ok(cache)
@@ -616,7 +809,11 @@ fn safe_stem(value: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() { "venice-media".to_string() } else { trimmed }
+    if trimmed.is_empty() {
+        "venice-media".to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn extension_for_mime(mime: &str) -> &'static str {
@@ -829,7 +1026,10 @@ fn get_models(app: AppHandle) -> Result<ModelCache, String> {
 }
 
 #[tauri::command]
-async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Result<Vec<MediaResult>, String> {
+async fn generate_image(
+    app: AppHandle,
+    request: ImageGenerationRequest,
+) -> Result<Vec<MediaResult>, String> {
     let variant_count = request.variants.unwrap_or(1).clamp(1, 4);
     let format = normalize_image_format(request.format.as_deref().unwrap_or("webp"));
     let mut body = json!({
@@ -840,10 +1040,16 @@ async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Resu
         "return_binary": false,
     });
 
-    if let Some(value) = request.negative_prompt.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .negative_prompt
+        .filter(|value| !value.trim().is_empty())
+    {
         body["negative_prompt"] = json!(value);
     }
-    if let Some(value) = request.aspect_ratio.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .aspect_ratio
+        .filter(|value| !value.trim().is_empty())
+    {
         body["aspect_ratio"] = json!(value);
     }
     if let Some(value) = request.resolution.filter(|value| !value.trim().is_empty()) {
@@ -873,7 +1079,9 @@ async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Resu
         for item in items {
             if let Some(raw) = item.as_str() {
                 encoded_images.push(raw.to_string());
-            } else if let Some(raw) = first_string_field(item, &["b64_json", "base64", "image", "url"]) {
+            } else if let Some(raw) =
+                first_string_field(item, &["b64_json", "base64", "image", "url"])
+            {
                 encoded_images.push(raw.to_string());
             }
         }
@@ -888,7 +1096,9 @@ async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Resu
     }
 
     if encoded_images.is_empty() {
-        return Err(format!("Venice image response did not include image data: {payload}"));
+        return Err(format!(
+            "Venice image response did not include image data: {payload}"
+        ));
     }
 
     let mime = mime_for_image_format(format);
@@ -901,7 +1111,14 @@ async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Resu
             "variantIndex": index + 1,
             "raw": payload
         });
-        results.push(save_media_bytes(&app, "images", &request.prompt, mime, &bytes, metadata)?);
+        results.push(save_media_bytes(
+            &app,
+            "images",
+            &request.prompt,
+            mime,
+            &bytes,
+            metadata,
+        )?);
     }
 
     Ok(results)
@@ -913,13 +1130,22 @@ async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> 
         "model": request.model,
         "prompt": request.prompt,
     });
-    if let Some(value) = request.negative_prompt.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .negative_prompt
+        .filter(|value| !value.trim().is_empty())
+    {
         body["negative_prompt"] = json!(value);
     }
-    if let Some(value) = request.source_image.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .source_image
+        .filter(|value| !value.trim().is_empty())
+    {
         body["image"] = json!(value);
     }
-    if let Some(value) = request.source_video.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .source_video
+        .filter(|value| !value.trim().is_empty())
+    {
         body["video"] = json!(value);
     }
     if let Some(value) = request.duration.filter(|value| !value.trim().is_empty()) {
@@ -928,7 +1154,10 @@ async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> 
     if let Some(value) = request.resolution.filter(|value| !value.trim().is_empty()) {
         body["resolution"] = json!(value);
     }
-    if let Some(value) = request.aspect_ratio.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .aspect_ratio
+        .filter(|value| !value.trim().is_empty())
+    {
         body["aspect_ratio"] = json!(value);
     }
     if let Some(value) = request.upscale_factor {
@@ -938,15 +1167,25 @@ async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> 
     let response = venice_post_json("/video/queue", body).await?;
     let payload: Value = response.json().await.map_err(|err| err.to_string())?;
     let queue_id = first_string_field(&payload, &["id", "queue_id", "request_id"])
-        .or_else(|| payload.get("data").and_then(|data| first_string_field(data, &["id", "queue_id", "request_id"])))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| first_string_field(data, &["id", "queue_id", "request_id"]))
+        })
         .unwrap_or("")
         .to_string();
     if queue_id.is_empty() {
-        return Err(format!("Venice video queue response did not include a queue id: {payload}"));
+        return Err(format!(
+            "Venice video queue response did not include a queue id: {payload}"
+        ));
     }
     let status = json_status_label(&payload);
     let download_url = first_string_field(&payload, &["download_url", "url"])
-        .or_else(|| payload.get("data").and_then(|data| first_string_field(data, &["download_url", "url"])))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| first_string_field(data, &["download_url", "url"]))
+        })
         .unwrap_or("")
         .to_string();
     Ok(QueueResult {
@@ -959,7 +1198,10 @@ async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> 
 }
 
 #[tauri::command]
-async fn retrieve_video(app: AppHandle, request: RetrieveRequest) -> Result<RetrieveResult, String> {
+async fn retrieve_video(
+    app: AppHandle,
+    request: RetrieveRequest,
+) -> Result<RetrieveResult, String> {
     retrieve_queued_media(app, request, "/video/retrieve", "videos").await
 }
 
@@ -975,7 +1217,10 @@ async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> 
     if let Some(value) = request.force_instrumental {
         body["force_instrumental"] = json!(value);
     }
-    if let Some(value) = request.lyrics_prompt.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .lyrics_prompt
+        .filter(|value| !value.trim().is_empty())
+    {
         body["lyrics_prompt"] = json!(value);
     }
     if let Some(value) = request.lyrics_optimizer {
@@ -985,15 +1230,25 @@ async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> 
     let response = venice_post_json("/audio/queue", body).await?;
     let payload: Value = response.json().await.map_err(|err| err.to_string())?;
     let queue_id = first_string_field(&payload, &["id", "queue_id", "request_id"])
-        .or_else(|| payload.get("data").and_then(|data| first_string_field(data, &["id", "queue_id", "request_id"])))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| first_string_field(data, &["id", "queue_id", "request_id"]))
+        })
         .unwrap_or("")
         .to_string();
     if queue_id.is_empty() {
-        return Err(format!("Venice audio queue response did not include a queue id: {payload}"));
+        return Err(format!(
+            "Venice audio queue response did not include a queue id: {payload}"
+        ));
     }
     let status = json_status_label(&payload);
     let download_url = first_string_field(&payload, &["download_url", "url"])
-        .or_else(|| payload.get("data").and_then(|data| first_string_field(data, &["download_url", "url"])))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| first_string_field(data, &["download_url", "url"]))
+        })
         .unwrap_or("")
         .to_string();
     Ok(QueueResult {
@@ -1006,7 +1261,10 @@ async fn queue_audio(request: QueueMediaRequest) -> Result<QueueResult, String> 
 }
 
 #[tauri::command]
-async fn retrieve_audio(app: AppHandle, request: RetrieveRequest) -> Result<RetrieveResult, String> {
+async fn retrieve_audio(
+    app: AppHandle,
+    request: RetrieveRequest,
+) -> Result<RetrieveResult, String> {
     retrieve_queued_media(app, request, "/audio/retrieve", "audio").await
 }
 
@@ -1020,7 +1278,11 @@ async fn retrieve_queued_media(
         "queue_id": request.queue_id,
         "delete_media_on_completion": false,
     });
-    if let Some(model) = request.model.clone().filter(|value| !value.trim().is_empty()) {
+    if let Some(model) = request
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
         body["model"] = json!(model);
     }
     let response = venice_post_json(endpoint, body).await?;
@@ -1055,7 +1317,12 @@ async fn retrieve_queued_media(
         .download_url
         .filter(|value| !value.trim().is_empty())
         .or_else(|| first_string_field(&payload, &["download_url", "url"]).map(ToString::to_string))
-        .or_else(|| payload.get("data").and_then(|data| first_string_field(data, &["download_url", "url"])).map(ToString::to_string));
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| first_string_field(data, &["download_url", "url"]))
+                .map(ToString::to_string)
+        });
 
     if is_done_status(&status) {
         if let Some(url) = download_url {
@@ -1067,7 +1334,14 @@ async fn retrieve_queued_media(
                 .await
                 .map_err(|err| err.to_string())?;
             let response = ensure_success(response).await?;
-            let result = save_binary_response(&app, response, default_kind, prompt, json!({ "raw": payload })).await?;
+            let result = save_binary_response(
+                &app,
+                response,
+                default_kind,
+                prompt,
+                json!({ "raw": payload }),
+            )
+            .await?;
             return Ok(RetrieveResult {
                 status,
                 progress_label: "Completed".to_string(),
@@ -1079,7 +1353,12 @@ async fn retrieve_queued_media(
 
     Ok(RetrieveResult {
         status: status.clone(),
-        progress_label: if is_done_status(&status) { "Completed" } else { "Processing" }.to_string(),
+        progress_label: if is_done_status(&status) {
+            "Completed"
+        } else {
+            "Processing"
+        }
+        .to_string(),
         result: None,
         raw: payload,
     })
@@ -1087,7 +1366,10 @@ async fn retrieve_queued_media(
 
 #[tauri::command]
 async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<MediaResult, String> {
-    let response_format = request.response_format.clone().unwrap_or_else(|| "mp3".to_string());
+    let response_format = request
+        .response_format
+        .clone()
+        .unwrap_or_else(|| "mp3".to_string());
     let mut body = json!({
         "model": request.model.clone(),
         "input": request.input.clone(),
@@ -1103,7 +1385,10 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
     if let Some(value) = request.language.filter(|value| !value.trim().is_empty()) {
         body["language"] = json!(value);
     }
-    if let Some(value) = request.style_prompt.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .style_prompt
+        .filter(|value| !value.trim().is_empty())
+    {
         body["style_prompt"] = json!(value);
     }
     if let Some(value) = request.temperature {
@@ -1126,12 +1411,28 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
         if let Some(encoded) = first_string_field(&payload, &["audio", "base64", "b64_json"]) {
             let mime = format!("audio/{}", response_format.trim().trim_start_matches('.'));
             let bytes = decode_base64_payload(encoded)?;
-            return save_media_bytes(&app, "voice", &request.input, &mime, &bytes, json!({ "raw": payload }));
+            return save_media_bytes(
+                &app,
+                "voice",
+                &request.input,
+                &mime,
+                &bytes,
+                json!({ "raw": payload }),
+            );
         }
-        return Err(format!("Venice speech response did not include audio data: {payload}"));
+        return Err(format!(
+            "Venice speech response did not include audio data: {payload}"
+        ));
     }
 
-    save_binary_response(&app, response, "voice", &request.input, json!({ "request": body })).await
+    save_binary_response(
+        &app,
+        response,
+        "voice",
+        &request.input,
+        json!({ "request": body }),
+    )
+    .await
 }
 
 fn main() {
