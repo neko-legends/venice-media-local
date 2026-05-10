@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+.vite/
+
+# Tauri/Rust generated output
+src-tauri/target/
+src-tauri/gen/
+src-tauri/tauri.version.conf.json
+
+# Local secrets and machine config
+.env
+.env.*
+!.env.example
+settings.json
+venice-models.json
+*.local
+
+# Generated media/output folders if a user points output into the repo
+outputs/
+output/
+generated/
+media/
+
+# Logs and OS/editor noise
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
