@@ -1305,8 +1305,9 @@ fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<St
 
         let path = PathBuf::from(&trimmed);
         if !path.exists() {
-            moved.push(trimmed);
-            continue;
+            return Err(format!(
+                "Generated file no longer exists, so nothing was moved to burn: {trimmed}"
+            ));
         }
         if !path.is_file() {
             return Err(format!("Refusing to move non-file path: {trimmed}"));
@@ -1320,6 +1321,12 @@ fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<St
         let target = unique_burn_path(&burn_dir, file_name, index);
         fs::rename(&path, &target)
             .map_err(|err| format!("Failed to move {trimmed} to burn folder: {err}"))?;
+        if !target.is_file() {
+            return Err(format!(
+                "Move finished but the burn folder file was not found: {}",
+                target.to_string_lossy()
+            ));
+        }
         moved.push(trimmed);
     }
 

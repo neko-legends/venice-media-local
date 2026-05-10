@@ -999,7 +999,10 @@ export function App() {
     if (!moved) return
 
     const movedSet = new Set(moved)
-    setStatus(`Moved ${moved.length.toLocaleString()} file${moved.length === 1 ? '' : 's'} to the burn folder`)
+    const burnStats = await call<BurnFolderStats>('get_burn_folder_stats').catch(() => null)
+    const burnCount = burnStats?.fileCount ?? 0
+    const burnCountLabel = burnStats ? ` Burn folder now has ${burnCount.toLocaleString()} file${burnCount === 1 ? '' : 's'}.` : ''
+    setStatus(`Moved ${moved.length.toLocaleString()} file${moved.length === 1 ? '' : 's'} to the burn folder.${burnCountLabel}`)
     setResultGroups((existing) =>
       existing
         .map((group) => ({
