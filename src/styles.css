@@ -14,6 +14,7 @@
   --accent: #5865f2;
   --accent-2: #00a8fc;
   --danger: #da373c;
+  --warn: #f2a65a;
   --ok: #248046;
   --shadow: 0 18px 60px rgb(0 0 0 / 0.28);
 }
@@ -155,18 +156,37 @@ button {
   overflow-x: hidden;
 }
 
-.rail-build {
+.rail-footer {
   margin-top: auto;
   min-width: 0;
   padding: 8px 12px 12px;
-  overflow: hidden;
   border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  display: grid;
+  gap: 6px;
+}
+
+.diem-status,
+.rail-build {
+  min-width: 0;
+  overflow: hidden;
   color: var(--muted);
   font-size: 11px;
   font-weight: 800;
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.diem-status {
+  color: var(--accent-2);
+}
+
+.diem-status.warning {
+  color: var(--warn);
+}
+
+.diem-status.error {
+  color: var(--danger);
 }
 
 .mode-button,
@@ -1101,7 +1121,7 @@ button {
     overflow-x: hidden;
   }
 
-  .rail-build {
+  .rail-footer {
     margin-top: 0;
     padding-top: 0;
     border-top: 0;

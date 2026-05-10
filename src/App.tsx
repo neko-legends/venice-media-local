@@ -26,6 +26,7 @@ import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEve
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
 type ThemeId = 'eva-dark' | 'pearl-white' | 'abyss-teal' | 'ember' | 'mosswood' | 'rose-noir'
+type DiemDisplayMode = 'percent' | 'actual'
 
 type ModelRecord = {
   id: string
@@ -50,6 +51,8 @@ type ModelCache = {
 type AppSettings = {
   theme: ThemeId
   outputDir: string
+  showDiemBalance: boolean
+  diemDisplayMode: DiemDisplayMode
 }
 
 type AppState = {
@@ -98,6 +101,20 @@ type BurnFolderStats = {
   burnDir: string
 }
 
+type DiemBalanceSnapshot = {
+  success: boolean
+  diemBalance?: number | string | null
+  usdBalance?: number | string | null
+  diemEpochAllocation?: number | string | null
+  percentRemaining?: number | string | null
+  consumptionCurrency?: string | null
+  canConsume?: boolean | null
+  source?: string
+  timestamp?: string
+  warning?: string
+  error?: string
+}
+
 type JobKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
 
 type JobConcurrency = Record<JobKind, number>
@@ -139,6 +156,7 @@ const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
 const STORAGE_RECENT_MODELS = 'veniceMediaLocal:recentModels:v1'
 const EDIT_SOURCE_LIMIT = 3
 const MAX_RECENT_MODELS = 5
+const DIEM_POLL_MS = 3 * 60 * 1000
 const IMAGE_ASPECT_OPTIONS = ['1:1', '4:3', '3:4', '16:9', '9:16']
 const VIDEO_DURATION_OPTIONS = ['5s', '10s']
 const VIDEO_RESOLUTION_OPTIONS = ['480p', '720p', '1080p']
@@ -168,6 +186,7 @@ const JOB_LABELS: Record<JobKind, string> = {
 }
 const ACTIVE_QUEUE_STATUSES = new Set(['queued', 'pending', 'processing', 'running', 'in_progress', 'created', 'submitted'])
 const BURN_SEED_MASK = (1n << 64n) - 1n
+const DIEM_DISPLAY_OPTIONS: DiemDisplayMode[] = ['percent', 'actual']
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
@@ -539,6 +558,76 @@ function formatBuildVersion(version: string): string {
   return commit ? `ver ${builtDate} · ${commit}` : `ver ${builtDate}`
 }
 
+function numberFromValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function normalizeDiemDisplayMode(value: unknown): DiemDisplayMode {
+  return value === 'actual' ? 'actual' : 'percent'
+}
+
+function formatDiemBalance(value: unknown): string {
+  const numericValue = numberFromValue(value)
+  if (numericValue === null) return ''
+  return numericValue.toLocaleString(undefined, {
+    maximumFractionDigits: numericValue >= 10 ? 1 : 3,
+  })
+}
+
+function formatDiemPercent(snapshot: DiemBalanceSnapshot | null): string {
+  if (!snapshot) return ''
+  const reportedPercent = numberFromValue(snapshot.percentRemaining)
+  const balance = numberFromValue(snapshot.diemBalance)
+  const allocation = numberFromValue(snapshot.diemEpochAllocation)
+  const derivedPercent = reportedPercent ?? (
+    balance !== null && allocation !== null && allocation > 0
+      ? (balance / allocation) * 100
+      : null
+  )
+  if (derivedPercent === null || !Number.isFinite(derivedPercent)) return ''
+  const clamped = Math.max(0, Math.min(100, derivedPercent))
+  return `${Math.round(clamped).toLocaleString()}%`
+}
+
+function diemRailLabel(
+  snapshot: DiemBalanceSnapshot | null,
+  displayMode: DiemDisplayMode,
+  refreshing: boolean,
+  keyConfigured: boolean,
+): string {
+  if (!keyConfigured) return 'DIEM key needed'
+  if (!snapshot) return refreshing ? 'DIEM checking...' : 'DIEM --'
+  if (snapshot.error) return 'DIEM ERR'
+  if (displayMode === 'actual') {
+    const balance = formatDiemBalance(snapshot.diemBalance)
+    return balance ? `${balance} DIEM` : 'DIEM --'
+  }
+  const percent = formatDiemPercent(snapshot)
+  if (percent) return `${percent} DIEM left`
+  const balance = formatDiemBalance(snapshot.diemBalance)
+  return balance ? `${balance} DIEM` : 'DIEM --'
+}
+
+function diemRailTitle(
+  snapshot: DiemBalanceSnapshot | null,
+  displayMode: DiemDisplayMode,
+  keyConfigured: boolean,
+): string {
+  if (!keyConfigured) return 'Save a Venice API key to check DIEM left.'
+  if (!snapshot) return 'DIEM left checks every 3 minutes when enabled.'
+  if (snapshot.error) return snapshot.error
+  if (snapshot.warning) return snapshot.warning
+  if (displayMode === 'actual') return 'Actual DIEM balance. Refreshes every 3 minutes.'
+  return snapshot.percentRemaining !== null && snapshot.percentRemaining !== undefined
+    ? 'DIEM percentage left. Refreshes every 3 minutes.'
+    : 'DIEM percentage unavailable; showing balance fallback.'
+}
+
 function mixBurnSeed64(value: bigint): bigint {
   let mixed = value & BURN_SEED_MASK
   mixed = ((mixed ^ (mixed >> 30n)) * 0xbf58476d1ce4e5b9n) & BURN_SEED_MASK
@@ -569,7 +658,7 @@ function formatBurnSeed(seed: bigint): string {
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
-  const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '' })
+  const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '', showDiemBalance: false, diemDisplayMode: 'percent' })
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
   const burnSeedRef = useRef(createBurnSeed())
@@ -588,6 +677,8 @@ export function App() {
   const [concurrency, setConcurrency] = useState<JobConcurrency>(() => readConcurrency())
   const [jobStats, setJobStats] = useState<JobStats>(() => createJobStats())
   const [remoteQueues, setRemoteQueues] = useState<RemoteQueueJob[]>([])
+  const [diemSnapshot, setDiemSnapshot] = useState<DiemBalanceSnapshot | null>(null)
+  const [diemRefreshing, setDiemRefreshing] = useState(false)
   const [jobClock, setJobClock] = useState(0)
   const [resultGroups, setResultGroups] = useState<ResultGroup[]>([])
   const jobQueuesRef = useRef<Record<JobKind, LocalJob[]>>(createJobQueues())
@@ -696,7 +787,11 @@ export function App() {
   useEffect(() => {
     call<AppState>('get_app_state')
       .then((state) => {
-        setSettings(state.settings)
+        setSettings({
+          ...state.settings,
+          showDiemBalance: Boolean(state.settings.showDiemBalance),
+          diemDisplayMode: normalizeDiemDisplayMode(state.settings.diemDisplayMode),
+        })
         setKeyConfigured(state.keyConfigured)
         setModels(state.models)
         setBuildVersion(state.buildVersion)
@@ -726,6 +821,42 @@ export function App() {
   useEffect(() => {
     document.body.className = `theme-${settings.theme}`
   }, [settings.theme])
+
+  useEffect(() => {
+    if (!settings.showDiemBalance || !keyConfigured) {
+      setDiemSnapshot(null)
+      setDiemRefreshing(false)
+      return
+    }
+
+    let cancelled = false
+
+    async function refreshDiemBalance() {
+      setDiemRefreshing(true)
+      try {
+        const snapshot = await call<DiemBalanceSnapshot>('get_diem_balance')
+        if (!cancelled) setDiemSnapshot(snapshot)
+      } catch (err) {
+        if (!cancelled) {
+          setDiemSnapshot((current) => ({
+            ...(current ?? { success: false }),
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          }))
+        }
+      } finally {
+        if (!cancelled) setDiemRefreshing(false)
+      }
+    }
+
+    refreshDiemBalance()
+    const intervalId = window.setInterval(refreshDiemBalance, DIEM_POLL_MS)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
+  }, [keyConfigured, settings.showDiemBalance])
 
   useEffect(() => {
     if (!imageModel && imageModels.length > 0) setImageModel(firstModelId(imageModels))
@@ -779,6 +910,9 @@ export function App() {
   const activeElapsedLabel = actionStartedAt !== null ? formatElapsed(elapsedMs) : ''
   const completedElapsedLabel = actionStartedAt === null && lastActionMs !== null ? `Took ${formatElapsed(lastActionMs)}` : ''
   const jobNow = jobClock || Date.now()
+  const diemDisplayMode = normalizeDiemDisplayMode(settings.diemDisplayMode)
+  const diemLabel = diemRailLabel(diemSnapshot, diemDisplayMode, diemRefreshing, keyConfigured)
+  const diemTitle = diemRailTitle(diemSnapshot, diemDisplayMode, keyConfigured)
 
   useEffect(() => {
     if (runningJobCount === 0 && remoteQueues.length === 0) return
@@ -959,7 +1093,10 @@ export function App() {
 
   async function clearKey() {
     const ok = await runAction('Clearing key', () => call<boolean>('clear_api_key'))
-    if (ok !== null) setKeyConfigured(false)
+    if (ok !== null) {
+      setKeyConfigured(false)
+      setDiemSnapshot(null)
+    }
   }
 
   async function refreshModelCatalog() {
@@ -1342,8 +1479,15 @@ export function App() {
             )
           })}
         </nav>
-        <div className="rail-build" title={formatBuildVersion(buildVersion)}>
-          {formatBuildVersion(buildVersion)}
+        <div className="rail-footer">
+          {settings.showDiemBalance && (
+            <div className={classNames('diem-status', diemSnapshot?.error && 'error', diemSnapshot?.warning && 'warning')} title={diemTitle}>
+              {diemLabel}
+            </div>
+          )}
+          <div className="rail-build" title={formatBuildVersion(buildVersion)}>
+            {formatBuildVersion(buildVersion)}
+          </div>
         </div>
       </aside>
 
@@ -1643,6 +1787,25 @@ export function App() {
                       <FolderOpen size={18} />
                     </button>
                   </div>
+                </div>
+
+                <div className="settings-block">
+                  <h2>DIEM</h2>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.showDiemBalance}
+                      onChange={(event) => persistSettings({ ...settings, showDiemBalance: event.target.checked })}
+                    />
+                    <span>Show DIEM left</span>
+                  </label>
+                  <SelectField
+                    label="Display"
+                    value={diemDisplayMode}
+                    onChange={(value) => persistSettings({ ...settings, diemDisplayMode: normalizeDiemDisplayMode(value) })}
+                    options={DIEM_DISPLAY_OPTIONS}
+                  />
+                  <small className="field-help">Refreshes once every 3 minutes. Percent mode keeps the exact balance off the sidebar when Venice returns an epoch allocation.</small>
                 </div>
 
                 <div className="settings-block">

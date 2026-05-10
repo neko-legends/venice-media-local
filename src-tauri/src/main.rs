@@ -22,6 +22,8 @@ const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 540;
 const FALLBACK_WINDOW_WIDTH: u32 = 1280;
 const FALLBACK_WINDOW_HEIGHT: u32 = 720;
+const DIEM_DISPLAY_PERCENT: &str = "percent";
+const DIEM_DISPLAY_ACTUAL: &str = "actual";
 const EDIT_MODEL_PATTERNS: &[&str] = &[
     "inpaint",
     "image_edit",
@@ -46,6 +48,10 @@ struct AppSettings {
     theme: String,
     output_dir: String,
     #[serde(default)]
+    show_diem_balance: bool,
+    #[serde(default = "default_diem_display_mode")]
+    diem_display_mode: String,
+    #[serde(default)]
     window_width: Option<u32>,
     #[serde(default)]
     window_height: Option<u32>,
@@ -56,16 +62,24 @@ impl Default for AppSettings {
         Self {
             theme: "eva-dark".to_string(),
             output_dir: String::new(),
+            show_diem_balance: false,
+            diem_display_mode: default_diem_display_mode(),
             window_width: None,
             window_height: None,
         }
     }
 }
 
+fn default_diem_display_mode() -> String {
+    DIEM_DISPLAY_PERCENT.to_string()
+}
+
 fn default_settings(app: &AppHandle) -> AppSettings {
     AppSettings {
         theme: "eva-dark".to_string(),
         output_dir: default_output_dir(app).unwrap_or_default(),
+        show_diem_balance: false,
+        diem_display_mode: default_diem_display_mode(),
         window_width: None,
         window_height: None,
     }
@@ -110,6 +124,8 @@ struct AppState {
 struct SaveSettingsRequest {
     theme: Option<String>,
     output_dir: Option<String>,
+    show_diem_balance: Option<bool>,
+    diem_display_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +244,23 @@ struct BurnFolderStats {
     burn_dir: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiemBalanceSnapshot {
+    success: bool,
+    diem_balance: Option<f64>,
+    usd_balance: Option<f64>,
+    diem_epoch_allocation: Option<f64>,
+    percent_remaining: Option<f64>,
+    consumption_currency: Option<String>,
+    can_consume: Option<bool>,
+    source: String,
+    timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+    raw: Value,
+}
+
 fn keyring_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|err| err.to_string())
 }
@@ -298,7 +331,15 @@ fn read_settings(app: &AppHandle) -> AppSettings {
     if settings.output_dir.trim().is_empty() {
         settings.output_dir = fallback.output_dir;
     }
+    settings.diem_display_mode = normalize_diem_display_mode(&settings.diem_display_mode);
     settings
+}
+
+fn normalize_diem_display_mode(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        DIEM_DISPLAY_ACTUAL => DIEM_DISPLAY_ACTUAL.to_string(),
+        _ => DIEM_DISPLAY_PERCENT.to_string(),
+    }
 }
 
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
@@ -691,6 +732,39 @@ fn as_string(value: &Value, key: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+fn number_like(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn bool_like(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::String(text)) => match text.trim().to_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn response_data(payload: &Value) -> &Value {
+    payload
+        .get("data")
+        .filter(|value| value.is_object())
+        .unwrap_or(payload)
+}
+
+fn balance_number(balances: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| number_like(balances.get(*key)))
+        .filter(|value| value.is_finite())
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -1458,6 +1532,100 @@ fn get_burn_folder_stats(app: AppHandle) -> Result<BurnFolderStats, String> {
     burn_folder_stats_for_dir(&dir)
 }
 
+fn diem_percent_remaining(balance: Option<f64>, allocation: Option<f64>) -> Option<f64> {
+    let balance = balance?;
+    let allocation = allocation?;
+    if !balance.is_finite() || !allocation.is_finite() || allocation <= 0.0 {
+        return None;
+    }
+    Some((balance / allocation * 100.0).clamp(0.0, 100.0))
+}
+
+fn diem_snapshot_from_billing(payload: Value) -> Result<DiemBalanceSnapshot, String> {
+    let data = response_data(&payload);
+    let balances = data.get("balances").unwrap_or(&Value::Null);
+    let diem_balance = balance_number(balances, &["diem", "DIEM"]);
+    let usd_balance = balance_number(balances, &["usd", "USD"]);
+    let allocation = number_like(data.get("diemEpochAllocation"));
+
+    if diem_balance.is_none() && allocation.is_none() {
+        return Err(
+            "Venice billing balance response did not include DIEM balance data".to_string(),
+        );
+    }
+
+    Ok(DiemBalanceSnapshot {
+        success: true,
+        diem_balance,
+        usd_balance,
+        diem_epoch_allocation: allocation,
+        percent_remaining: diem_percent_remaining(diem_balance, allocation),
+        consumption_currency: data
+            .get("consumptionCurrency")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        can_consume: bool_like(data.get("canConsume")),
+        source: "billing_balance".to_string(),
+        timestamp: Utc::now().to_rfc3339(),
+        warning: None,
+        raw: payload,
+    })
+}
+
+fn diem_snapshot_from_rate_limits(
+    payload: Value,
+    warning: Option<String>,
+) -> Result<DiemBalanceSnapshot, String> {
+    let data = response_data(&payload);
+    let balances = data.get("balances").unwrap_or(&Value::Null);
+    let diem_balance = balance_number(balances, &["diem", "DIEM"]);
+    let usd_balance = balance_number(balances, &["usd", "USD"]);
+
+    if diem_balance.is_none() {
+        return Err("Venice rate limits response did not include a DIEM balance".to_string());
+    }
+
+    Ok(DiemBalanceSnapshot {
+        success: true,
+        diem_balance,
+        usd_balance,
+        diem_epoch_allocation: None,
+        percent_remaining: None,
+        consumption_currency: Some("DIEM".to_string()),
+        can_consume: bool_like(data.get("accessPermitted")),
+        source: "api_key_rate_limits".to_string(),
+        timestamp: Utc::now().to_rfc3339(),
+        warning,
+        raw: payload,
+    })
+}
+
+async fn fetch_diem_billing_balance() -> Result<DiemBalanceSnapshot, String> {
+    let response = venice_get("/billing/balance").await?;
+    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    diem_snapshot_from_billing(payload)
+}
+
+async fn fetch_diem_rate_limits(warning: Option<String>) -> Result<DiemBalanceSnapshot, String> {
+    let response = venice_get("/api_keys/rate_limits").await?;
+    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    diem_snapshot_from_rate_limits(payload, warning)
+}
+
+#[tauri::command]
+async fn get_diem_balance() -> Result<DiemBalanceSnapshot, String> {
+    match fetch_diem_billing_balance().await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(billing_err) => fetch_diem_rate_limits(Some(billing_err.clone()))
+            .await
+            .map_err(|rate_err| {
+                format!(
+                    "Failed to read DIEM balance. Billing balance: {billing_err}. Rate limits: {rate_err}"
+                )
+            }),
+    }
+}
+
 fn open_folder_path(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = {
@@ -1659,6 +1827,12 @@ fn save_settings(app: AppHandle, request: SaveSettingsRequest) -> Result<AppSett
     }
     if let Some(output_dir) = request.output_dir {
         settings.output_dir = output_dir.trim().to_string();
+    }
+    if let Some(show_diem_balance) = request.show_diem_balance {
+        settings.show_diem_balance = show_diem_balance;
+    }
+    if let Some(diem_display_mode) = request.diem_display_mode {
+        settings.diem_display_mode = normalize_diem_display_mode(&diem_display_mode);
     }
     ensure_output_folders_for_settings(&app, &settings)?;
     save_settings_file(&app, &settings)?;
@@ -2244,6 +2418,7 @@ fn main() {
             get_models,
             move_media_files_to_burn,
             get_burn_folder_stats,
+            get_diem_balance,
             open_output_folder,
             burn_folder,
             refresh_models,
