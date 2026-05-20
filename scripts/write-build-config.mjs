@@ -53,7 +53,7 @@ const patch = Number(`${day}${pad(hour)}${pad(minute)}${pad(second)}`)
 const builtAt = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`
 const git = resolveGitInfo()
 const metadata = git.dirty ? `g${git.commit}.dirty` : `g${git.commit}`
-const version = `${year}.${month}.${patch}+${metadata}`
+const version = '26.5.19'
 
 const config = {
   version,

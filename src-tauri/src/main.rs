@@ -121,6 +121,7 @@ struct SaveSettingsRequest {
 #[serde(rename_all = "camelCase")]
 struct ImageGenerationRequest {
     model: String,
+    title: Option<String>,
     prompt: String,
     negative_prompt: Option<String>,
     aspect_ratio: Option<String>,
@@ -1470,7 +1471,7 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
     Ok(cache)
 }
 
-fn safe_stem(value: &str) -> String {
+fn optional_safe_stem(value: &str) -> Option<String> {
     let mut out = String::new();
     for ch in value.chars().take(80) {
         if ch.is_ascii_alphanumeric() {
@@ -1483,9 +1484,17 @@ fn safe_stem(value: &str) -> String {
     }
     let trimmed = out.trim_matches('-').to_string();
     if trimmed.is_empty() {
-        "venice-media".to_string()
+        None
     } else {
-        trimmed
+        Some(trimmed)
+    }
+}
+
+fn safe_stem(value: &str) -> String {
+    if let Some(stem) = optional_safe_stem(value) {
+        stem
+    } else {
+        "venice-media".to_string()
     }
 }
 
@@ -1554,11 +1563,23 @@ fn metadata_number(metadata: &Value, key: &str) -> Option<u64> {
     })
 }
 
+fn metadata_title_suffix(metadata: &Value) -> String {
+    let Some(title) = metadata.get("title").and_then(Value::as_str) else {
+        return String::new();
+    };
+    if let Some(stem) = optional_safe_stem(title) {
+        format!("_{stem}")
+    } else {
+        String::new()
+    }
+}
+
 fn image_file_stem(metadata: &Value) -> Option<String> {
     let seed = metadata_number(metadata, "seed")?;
     let variant = metadata_number(metadata, "variantIndex").unwrap_or(1);
     let date = Local::now().format("%Y-%m-%d").to_string();
-    Some(format!("{date}_seed-{seed}_v{variant}"))
+    let title_suffix = metadata_title_suffix(metadata);
+    Some(format!("{date}_seed-{seed}_v{variant}{title_suffix}"))
 }
 
 fn unique_file_path(dir: &Path, stem: &str, ext: &str) -> (String, PathBuf) {
@@ -1713,6 +1734,71 @@ fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<St
     }
 
     Ok(moved)
+}
+
+#[tauri::command]
+fn copy_media_file(
+    app: AppHandle,
+    source_path: String,
+    destination_path: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(source_path.trim());
+    let destination = PathBuf::from(destination_path.trim());
+
+    if source.as_os_str().is_empty() {
+        return Err("Source file path is empty".to_string());
+    }
+    if destination.as_os_str().is_empty() {
+        return Err("Save location is empty".to_string());
+    }
+    if !source.exists() {
+        return Err(format!(
+            "Generated file no longer exists: {}",
+            source.to_string_lossy()
+        ));
+    }
+    if !source.is_file() {
+        return Err(format!(
+            "Refusing to copy non-file path: {}",
+            source.to_string_lossy()
+        ));
+    }
+    if destination.exists() && destination.is_dir() {
+        return Err(format!(
+            "Save location is a folder, not a file: {}",
+            destination.to_string_lossy()
+        ));
+    }
+    ensure_under_output(&app, &source)?;
+
+    let source_canonical = source.canonicalize().map_err(|err| err.to_string())?;
+    if destination.exists() {
+        let destination_canonical = destination.canonicalize().map_err(|err| err.to_string())?;
+        if source_canonical == destination_canonical {
+            return Ok(destination.to_string_lossy().to_string());
+        }
+    }
+
+    if let Some(parent) = destination.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create save folder {}: {err}",
+                    parent.to_string_lossy()
+                )
+            })?;
+        }
+    }
+
+    fs::copy(&source, &destination).map_err(|err| {
+        format!(
+            "Failed to save copy from {} to {}: {err}",
+            source.to_string_lossy(),
+            destination.to_string_lossy()
+        )
+    })?;
+
+    Ok(destination.to_string_lossy().to_string())
 }
 
 fn collect_burn_entries(
@@ -2188,6 +2274,11 @@ async fn generate_image(
 ) -> Result<Vec<MediaResult>, String> {
     let variant_count = request.variants.unwrap_or(1).clamp(1, 4);
     let format = normalize_image_format(request.format.as_deref().unwrap_or("webp"));
+    let title = request
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let mut body = json!({
         "model": request.model.clone(),
         "prompt": request.prompt.clone(),
@@ -2263,6 +2354,7 @@ async fn generate_image(
         let bytes = decode_base64_payload(encoded)?;
         let metadata = json!({
             "model": body.get("model"),
+            "title": title,
             "prompt": body.get("prompt"),
             "seed": body.get("seed"),
             "variantIndex": index + 1,
@@ -2299,7 +2391,10 @@ async fn remove_background(
 }
 
 #[tauri::command]
-async fn upscale_image(app: AppHandle, request: ImageUpscaleRequest) -> Result<MediaResult, String> {
+async fn upscale_image(
+    app: AppHandle,
+    request: ImageUpscaleRequest,
+) -> Result<MediaResult, String> {
     let scale = match request.scale {
         2 | 4 => request.scale,
         _ => return Err("Scale must be 2x or 4x".to_string()),
@@ -2819,6 +2914,7 @@ fn main() {
             clear_api_key,
             get_models,
             move_media_files_to_burn,
+            copy_media_file,
             get_burn_folder_stats,
             get_diem_balance,
             open_output_folder,

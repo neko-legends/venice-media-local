@@ -634,14 +634,27 @@ button {
   cursor: pointer;
 }
 
+.source-input.loaded {
+  min-height: 0;
+  padding: 10px;
+}
+
 .edit-source-main .source-input {
   min-height: 280px;
   aspect-ratio: 16 / 10;
 }
 
+.edit-source-main .source-input.loaded {
+  aspect-ratio: auto;
+}
+
 .edit-source-row .source-input {
   min-height: 0;
   aspect-ratio: 1.08;
+}
+
+.edit-source-row .source-input.loaded {
+  aspect-ratio: auto;
 }
 
 .source-input.dragging {
@@ -691,6 +704,17 @@ button {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.source-input.loaded img {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: min(58vh, 520px);
+}
+
+.edit-source-row .source-input.loaded img {
+  max-height: min(32vh, 260px);
 }
 
 .source-clear {

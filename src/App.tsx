@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
   Database,
   Download,
@@ -699,6 +699,7 @@ export function App() {
   const [voiceModel, setVoiceModel] = useState('')
   const [transcribeModel, setTranscribeModel] = useState('')
 
+  const [imageTitle, setImageTitle] = useState('')
   const [prompt, setPrompt] = useState('')
   const [negativePrompt, setNegativePrompt] = useState('')
   const [aspectRatio, setAspectRatio] = useState('1:1')
@@ -1163,6 +1164,7 @@ export function App() {
 
     const request = {
       model: imageModel,
+      title: imageTitle.trim() || null,
       prompt,
       negativePrompt,
       aspectRatio: selectedAspectRatio,
@@ -1176,11 +1178,12 @@ export function App() {
     }
 
     const seedLabel = `seed ${requestSeed}`
-    enqueueJob('image', `Image generation · ${seedLabel}`, async () => {
+    const titleLabel = request.title ? `${request.title} · ` : ''
+    enqueueJob('image', `Image generation · ${titleLabel}${seedLabel}`, async () => {
       const startedAt = Date.now()
       const output = await call<MediaResult[]>('generate_image', { request })
       rememberModelUse('image', request.model)
-      setResultGroups((existing) => [createResultGroup(output, `Images · ${seedLabel} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
+      setResultGroups((existing) => [createResultGroup(output, `Images · ${titleLabel}${seedLabel} · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
     })
   }
 
@@ -1309,6 +1312,31 @@ export function App() {
     const folder = await runAction('Opening output folder', () => call<string>('open_output_folder'))
     if (folder) {
       setStatus(`Opened output folder: ${folder}`)
+    }
+  }
+
+  async function saveResultFile(result: MediaResult) {
+    const selected = await runAction('Choosing save location', () =>
+      saveDialog({
+        defaultPath: result.filePath || result.name,
+        filters: [fileFilterForResult(result)],
+        title: `Save ${result.name}`,
+      }),
+    )
+    if (typeof selected !== 'string' || !selected) {
+      setLastActionMs(null)
+      setStatus('Ready')
+      return
+    }
+
+    const copiedPath = await runAction('Saving copy', () =>
+      call<string>('copy_media_file', {
+        sourcePath: result.filePath,
+        destinationPath: selected,
+      }),
+    )
+    if (copiedPath) {
+      setStatus(`Saved copy: ${copiedPath}`)
     }
   }
 
@@ -1572,6 +1600,7 @@ export function App() {
             {mode === 'image' && (
               <form onSubmit={generateImage} className="tool-form">
                 <ModelSelect label="Model" value={imageModel} onChange={setImageModel} models={imageModels} recentModelIds={recentModels.image} />
+                <TextField label="Title" value={imageTitle} onChange={setImageTitle} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
@@ -1954,6 +1983,7 @@ export function App() {
                       <ResultCard
                         key={`${result.id}-${result.filePath}`}
                         result={result}
+                        onSave={() => saveResultFile(result)}
                         onDelete={() => moveResultFilesToBurn([result.filePath], 'this file')}
                         onEdit={result.mimeType.startsWith('image/') ? () => sendResultToEdit(result) : undefined}
                       />
@@ -1969,7 +1999,19 @@ export function App() {
   )
 }
 
-function ResultCard({ result, onDelete, onEdit }: { result: MediaResult; onDelete: () => void; onEdit?: () => void }) {
+function fileFilterForResult(result: MediaResult) {
+  const extension = result.name.split('.').pop()?.trim().toLowerCase()
+  if (extension && extension !== result.name.toLowerCase()) {
+    return { name: result.mimeType || 'Media', extensions: [extension] }
+  }
+  if (result.mimeType.startsWith('image/')) return { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }
+  if (result.mimeType.startsWith('video/')) return { name: 'Videos', extensions: ['mp4', 'webm', 'mov'] }
+  if (result.mimeType.startsWith('audio/')) return { name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'flac'] }
+  if (result.mimeType.startsWith('text/')) return { name: 'Text', extensions: ['txt'] }
+  return { name: 'Media', extensions: ['bin'] }
+}
+
+function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult; onSave: () => void; onDelete: () => void; onEdit?: () => void }) {
   const modelLabel = resultModelLabel(result)
 
   return (
@@ -1995,10 +2037,10 @@ function ResultCard({ result, onDelete, onEdit }: { result: MediaResult; onDelet
         {modelLabel && <small>Model: {modelLabel}</small>}
         <small>{result.filePath}</small>
         <div className="result-links">
-          <a href={result.dataUrl} download={result.name}>
+          <button className="link-button" type="button" onClick={onSave}>
             <Download size={16} />
             Save
-          </a>
+          </button>
           {onEdit && (
             <button className="link-button" type="button" onClick={onEdit}>
               <Scissors size={14} />
@@ -2291,7 +2333,7 @@ function SourcePicker({
       <div
         role="button"
         tabIndex={0}
-        className={classNames('source-input', dragging && 'dragging')}
+        className={classNames('source-input', source && 'loaded', dragging && 'dragging')}
         onDragEnter={(event) => {
           event.preventDefault()
           setDragging(true)

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default desktop capability for Venice Media Local",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
 }

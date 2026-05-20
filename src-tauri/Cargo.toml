@@ -1,6 +1,6 @@
 [package]
 name = "venice-media-local"
-version = "0.1.0"
+version = "26.5.19"
 description = "Local Venice media generation desktop app"
 authors = ["Venice community"]
 license = "MIT"
