@@ -10,3 +10,19 @@ $env:npm_config_prefix = 'C:\Program Files\nodejs'
 Set-Location -LiteralPath $root
 & $npm run version:build
 & $npm run tauri -- build --config src-tauri/tauri.version.conf.json
+
+$versionConfig = Get-Content -LiteralPath (Join-Path $root 'src-tauri\tauri.version.conf.json') -Raw | ConvertFrom-Json
+$version = [string]$versionConfig.version
+$releaseDir = Join-Path $root 'src-tauri\target\release'
+$bundleDir = Join-Path $releaseDir 'bundle\nsis'
+$portableSource = Join-Path $releaseDir 'venice-media-local.exe'
+$portableName = "Venice Media Local_${version}_x64-portable.exe"
+$portableTarget = Join-Path $bundleDir $portableName
+
+if (-not (Test-Path -LiteralPath $portableSource -PathType Leaf)) {
+  throw "Portable source executable not found: $portableSource"
+}
+
+New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+Copy-Item -LiteralPath $portableSource -Destination $portableTarget -Force
+Write-Host "Portable executable: $portableTarget"

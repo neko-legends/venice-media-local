@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
   Database,
@@ -22,7 +22,7 @@ import {
   Wand2,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEvent, ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
 
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
@@ -187,6 +187,7 @@ const JOB_LABELS: Record<JobKind, string> = {
 }
 const ACTIVE_QUEUE_STATUSES = new Set(['queued', 'pending', 'processing', 'running', 'in_progress', 'created', 'submitted'])
 const BURN_SEED_MASK = (1n << 64n) - 1n
+const BURN_SEED_VISIBLE_REFRESH_MS = 5000
 
 const fallbackModels: ModelCache = {
   lastFetched: '',
@@ -651,6 +652,7 @@ export function App() {
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
   const burnSeedRef = useRef(createBurnSeed())
+  const modeRef = useRef<ModeId>('image')
   const [burnSeed, setBurnSeed] = useState(() => formatBurnSeed(burnSeedRef.current))
   const [apiKey, setApiKey] = useState('')
   const [status, setStatus] = useState('')
@@ -744,10 +746,10 @@ export function App() {
   const [customModelId, setCustomModelId] = useState('')
   const [customModelName, setCustomModelName] = useState('')
 
-  function updateBurnSeed(extra: bigint) {
+  function updateBurnSeed(extra: bigint, publish = modeRef.current === 'settings') {
     const next = mixBurnSeed64(burnSeedRef.current ^ extra ^ BigInt(Date.now()))
     burnSeedRef.current = next
-    setBurnSeed(formatBurnSeed(next))
+    if (publish) setBurnSeed(formatBurnSeed(next))
   }
 
   function rememberModelUse(kind: ModelKind, modelId: string) {
@@ -793,12 +795,19 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    modeRef.current = mode
+  }, [mode])
+
+  useEffect(() => {
+    if (mode !== 'settings') return
+
+    setBurnSeed(formatBurnSeed(burnSeedRef.current))
     const timer = window.setInterval(() => {
-      updateBurnSeed(BigInt(Date.now()))
-    }, 1000)
+      updateBurnSeed(BigInt(Date.now()), true)
+    }, BURN_SEED_VISIBLE_REFRESH_MS)
 
     return () => window.clearInterval(timer)
-  }, [])
+  }, [mode])
 
   useEffect(() => {
     return () => {
@@ -1292,9 +1301,11 @@ export function App() {
       return
     }
 
+    updateBurnSeed(BigInt(Date.now()))
+    const seedForBurn = formatBurnSeed(burnSeedRef.current)
     const sizeLabel = formatByteCount(stats.totalBytes) || '0 KB'
     const confirmed = window.confirm(
-      `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\nBurn seed: ${burnSeed}\n${stats.burnDir}`,
+      `Burn ${stats.fileCount.toLocaleString()} file${stats.fileCount === 1 ? '' : 's'} (${sizeLabel}) from the burn folder?\n\nCorrupts and deletes files from the burn folder, bypassing the Recycle Bin. Successfully overwritten files should be unreadable if recovered.\n\nBurn seed: ${seedForBurn}\n${stats.burnDir}`,
     )
     if (!confirmed) {
       setLastActionMs(null)
@@ -1302,7 +1313,7 @@ export function App() {
       return
     }
 
-    const burned = await runAction('Burning files', () => call<BurnFolderStats>('burn_folder', { seed: burnSeed }))
+    const burned = await runAction('Burning files', () => call<BurnFolderStats>('burn_folder', { seed: seedForBurn }))
     if (burned) {
       setStatus(`Burned ${burned.fileCount.toLocaleString()} file${burned.fileCount === 1 ? '' : 's'}`)
     }
@@ -1910,7 +1921,7 @@ export function App() {
                   <label className="field">
                     <span>Live entropy</span>
                     <input value={burnSeed} readOnly />
-                    <small className="field-help">Updates every second and mixes mouse movement before burning files.</small>
+                    <small className="field-help">Updates every 5 seconds and mixes mouse movement before burning files.</small>
                   </label>
                 </div>
               </div>
@@ -2011,14 +2022,19 @@ function fileFilterForResult(result: MediaResult) {
   return { name: 'Media', extensions: ['bin'] }
 }
 
-function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult; onSave: () => void; onDelete: () => void; onEdit?: () => void }) {
+function mediaSourceForResult(result: MediaResult) {
+  return result.filePath ? convertFileSrc(result.filePath) : result.dataUrl
+}
+
+const ResultCard = memo(function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult; onSave: () => void; onDelete: () => void; onEdit?: () => void }) {
   const modelLabel = resultModelLabel(result)
+  const mediaSource = mediaSourceForResult(result)
 
   return (
     <article className="result-item">
       {result.mimeType.startsWith('image/') && (
         <img
-          src={result.dataUrl}
+          src={mediaSource}
           alt={result.name}
           draggable
           onDragStart={(event) => {
@@ -2029,8 +2045,8 @@ function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult;
           }}
         />
       )}
-      {result.mimeType.startsWith('video/') && <video src={result.dataUrl} controls />}
-      {result.mimeType.startsWith('audio/') && <audio src={result.dataUrl} controls />}
+      {result.mimeType.startsWith('video/') && <video src={mediaSource} controls />}
+      {result.mimeType.startsWith('audio/') && <audio src={mediaSource} controls />}
       {result.mimeType.startsWith('text/') && <pre className="transcript-preview">{result.text}</pre>}
       <div className="result-meta">
         <strong>{result.name}</strong>
@@ -2055,7 +2071,7 @@ function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult;
       </div>
     </article>
   )
-}
+}, (previous, next) => previous.result === next.result && Boolean(previous.onEdit) === Boolean(next.onEdit))
 
 function BlackFlameIcon({ size = 16 }: { size?: number }) {
   return (

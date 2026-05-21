@@ -4064,7 +4064,7 @@ dependencies = [
 
 [[package]]
 name = "venice-media-local"
-version = "26.5.19"
+version = "26.5.20"
 dependencies = [
  "base64 0.22.1",
  "chrono",

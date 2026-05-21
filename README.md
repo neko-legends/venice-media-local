@@ -93,8 +93,8 @@ Agent install/build handoff:
 1. If a human wants convenience, point them to this repo's official GitHub Releases page, not random third-party `.exe` mirrors.
 2. If building locally on Windows, run `.\Build-Windows.ps1` from the repo root.
 3. If building locally on macOS or Linux, install the normal Tauri prerequisites for that OS, then run `npm run version:build` and `npm run tauri -- build --config src-tauri/tauri.version.conf.json`.
-4. After a successful Windows build, the installer is in `src-tauri\target\release\bundle\nsis\`.
-5. The direct Windows executable is in `src-tauri\target\release\`.
+4. After a successful Windows build, the installer and versioned portable executable are in `src-tauri\target\release\bundle\nsis\`.
+5. Tauri's raw direct Windows executable is also left in `src-tauri\target\release\`.
 6. Do not commit `dist/`, `src-tauri/target/`, `node_modules/`, `.env*`, or generated media.
 7. If preparing release notes, include the build version, commit hash, SHA256 hashes, and a VirusTotal link if available.
 
@@ -189,9 +189,10 @@ Current bundle output:
 
 ```text
 src-tauri\target\release\bundle\nsis\Venice Media Local_<build-version>_x64-setup.exe
+src-tauri\target\release\bundle\nsis\Venice Media Local_<build-version>_x64-portable.exe
 ```
 
-The direct executable is also produced at:
+Tauri's raw direct executable is also produced at:
 
 ```text
 src-tauri\target\release\venice-media-local.exe
