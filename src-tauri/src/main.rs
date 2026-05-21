@@ -13,13 +13,14 @@ use std::{
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 use axum::{
     extract::State,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
@@ -125,6 +126,7 @@ struct AppState {
     key_configured: bool,
     models: ModelCache,
     build_version: String,
+    agent_control_address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,7 +241,7 @@ struct TranscriptionRequest {
     language: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaResult {
     id: String,
@@ -334,27 +336,55 @@ fn has_api_key() -> bool {
         .unwrap_or(false)
 }
 
+const AGENT_CONTROL_PORT: u16 = 9876;
+
 fn generate_agent_control_token() -> String {
     // Simple but sufficient token for Tailscale/local use (no extra deps)
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
-    // Mix in some process id and a few bytes
+        .as_nanos() as u64;
     let pid = std::process::id();
-    format!("vl-{}-{:x}-{:x}", ts, pid, ts.wrapping_mul(31) ^ (pid as u64))
+    let mixed = ts.rotate_left(17) ^ (pid as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    format!("vl-{mixed:016x}")
+}
+
+fn tailscale_ipv4_address() -> Option<String> {
+    let output = Command::new("tailscale").args(["ip", "-4"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
+        .map(str::to_string)
+}
+
+fn agent_control_address() -> String {
+    tailscale_ipv4_address()
+        .map(|ip| format!("{ip}:{AGENT_CONTROL_PORT}"))
+        .unwrap_or_else(|| format!("0.0.0.0:{AGENT_CONTROL_PORT}"))
 }
 
 /// Write the control-api.json discovery file so agents / the skill can auto-discover
 /// the address, port and token without manual config.
 fn write_agent_control_discovery(app: &AppHandle, token: &str) -> Result<(), String> {
     let dir = app_data_dir(app)?;
+    let tailscale_ip = tailscale_ipv4_address();
+    let address = tailscale_ip
+        .as_ref()
+        .map(|ip| format!("{ip}:{AGENT_CONTROL_PORT}"))
+        .unwrap_or_else(|| format!("0.0.0.0:{AGENT_CONTROL_PORT}"));
     let discovery = serde_json::json!({
-        "address": "0.0.0.0:9876",
-        "port": 9876,
+        "address": address,
+        "bindAddress": format!("0.0.0.0:{AGENT_CONTROL_PORT}"),
+        "tailscaleIp": tailscale_ip,
+        "port": AGENT_CONTROL_PORT,
         "token": token,
         "version": app.package_info().version.to_string(),
-        "note": "Connect using the Tailscale IP of this Windows machine (e.g. 100.x.x.x:9876) + the token. Same Tailscale network recommended."
+        "note": "Connect using the address and token. Same Tailscale network recommended."
     });
     let path = dir.join("control-api.json");
     std::fs::write(&path, serde_json::to_string_pretty(&discovery).unwrap())
@@ -2340,6 +2370,7 @@ fn get_app_state(app: AppHandle) -> Result<AppState, String> {
         key_configured: has_api_key(),
         models: read_model_cache(&app),
         build_version: app.package_info().version.to_string(),
+        agent_control_address: agent_control_address(),
     })
 }
 
@@ -2368,18 +2399,18 @@ fn save_settings(
             settings.agent_control_token = Some(generate_agent_control_token());
         }
 
-        if let Some(token) = settings.agent_control_token.clone() {
-            if let Err(e) = write_agent_control_discovery(&app, &token) {
-                eprintln!("[agent-control] Could not write discovery on toggle: {}", e);
+        if enable {
+            if let Some(token) = settings.agent_control_token.clone() {
+                if let Err(e) = write_agent_control_discovery(&app, &token) {
+                    eprintln!("[agent-control] Could not write discovery on toggle: {}", e);
+                }
             }
         }
 
         // Live start / stop when the user toggles in Settings (no restart needed)
         if enable && !was_enabled {
             if let Some(token) = settings.agent_control_token.clone() {
-                if let Err(e) = start_agent_control_server(app.clone(), token, &handle) {
-                    eprintln!("[agent-control] Failed to start on toggle: {}", e);
-                }
+                start_agent_control_server(app.clone(), token, &handle)?;
             }
         } else if !enable && was_enabled {
             stop_agent_control_server(&handle);
@@ -3050,42 +3081,103 @@ struct AgentControlState {
     token: String,
 }
 
-async fn check_token(
-    State(state): State<AgentControlState>,
-    headers: axum::http::HeaderMap,
-) -> Result<(), axum::http::StatusCode> {
-    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(value) = auth.to_str() {
-            if value == format!("Bearer {}", state.token) {
-                return Ok(());
-            }
-        }
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentResultGroupPayload {
+    title: String,
+    results: Vec<MediaResult>,
+}
+
+type AgentApiError = (StatusCode, String);
+
+fn check_agent_token(state: &AgentControlState, headers: &HeaderMap) -> Result<(), AgentApiError> {
+    let Some(auth) = headers.get(AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
+        return Err((StatusCode::UNAUTHORIZED, "Missing bearer token".to_string()));
+    };
+    if auth == format!("Bearer {}", state.token) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "Invalid bearer token".to_string()))
     }
-    Err(axum::http::StatusCode::UNAUTHORIZED)
+}
+
+fn agent_error(error: String) -> AgentApiError {
+    (StatusCode::INTERNAL_SERVER_ERROR, error)
+}
+
+fn emit_agent_results(app: &AppHandle, title: &str, results: Vec<MediaResult>) {
+    let payload = AgentResultGroupPayload {
+        title: title.to_string(),
+        results,
+    };
+    if let Err(error) = app.emit("agent:result-group", payload) {
+        eprintln!("[agent-control] Failed to emit result group: {error}");
+    }
 }
 
 async fn agent_get_state(
     State(state): State<AgentControlState>,
-) -> Result<Json<serde_json::Value>, String> {
-    // Reuse the existing logic
-    let app_state = get_app_state(state.app.clone()).map_err(|e| e.to_string())?;
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let app_state = get_app_state(state.app.clone()).map_err(agent_error)?;
     Ok(Json(serde_json::to_value(app_state).unwrap()))
 }
 
 async fn agent_generate_image(
     State(state): State<AgentControlState>,
+    headers: HeaderMap,
     Json(payload): Json<ImageGenerationRequest>,
-) -> Result<Json<Vec<MediaResult>>, String> {
-    // Call the real internal function — this is what makes results appear in the GUI
-    let results = generate_image(state.app.clone(), payload).await?;
+) -> Result<Json<Vec<MediaResult>>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let results = generate_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    emit_agent_results(&state.app, "Images · Remote", results.clone());
     Ok(Json(results))
 }
 
 async fn agent_refresh_models(
     State(state): State<AgentControlState>,
-) -> Result<Json<ModelCache>, String> {
-    let cache = refresh_models(state.app.clone()).await?;
+    headers: HeaderMap,
+) -> Result<Json<ModelCache>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let cache = refresh_models(state.app.clone()).await.map_err(agent_error)?;
+    if let Err(error) = state.app.emit("agent:models", cache.clone()) {
+        eprintln!("[agent-control] Failed to emit model cache: {error}");
+    }
     Ok(Json(cache))
+}
+
+async fn agent_edit_image(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<ImageMultiEditRequest>,
+) -> Result<Json<MediaResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let result = multi_edit_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    emit_agent_results(&state.app, "Edit / Combine · Remote", vec![result.clone()]);
+    Ok(Json(result))
+}
+
+async fn agent_remove_background(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<BackgroundRemoveRequest>,
+) -> Result<Json<MediaResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let result = remove_background(state.app.clone(), payload).await.map_err(agent_error)?;
+    emit_agent_results(&state.app, "Background Removed · Remote", vec![result.clone()]);
+    Ok(Json(result))
+}
+
+async fn agent_upscale_image(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<ImageUpscaleRequest>,
+) -> Result<Json<MediaResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let result = upscale_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    emit_agent_results(&state.app, "Upscaled Image · Remote", vec![result.clone()]);
+    Ok(Json(result))
 }
 
 fn start_agent_control_server(
@@ -3110,6 +3202,15 @@ fn start_agent_control_server(
         eprintln!("[agent-control] Could not write discovery file: {}", e);
     }
 
+    let addr: SocketAddr = format!("0.0.0.0:{AGENT_CONTROL_PORT}")
+        .parse()
+        .map_err(|error| format!("Invalid agent control bind address: {error}"))?;
+    let std_listener = StdTcpListener::bind(addr)
+        .map_err(|error| format!("Failed to bind agent control server on {addr}: {error}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Failed to configure agent control listener: {error}"))?;
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     // Store the sender so we can shut down later when the toggle is turned off
@@ -3123,7 +3224,7 @@ fn start_agent_control_server(
         token,
     };
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -3132,16 +3233,19 @@ fn start_agent_control_server(
         let router = Router::new()
             .route("/api/v1/state", get(agent_get_state))
             .route("/api/v1/generate-image", post(agent_generate_image))
+            .route("/api/v1/edit-image", post(agent_edit_image))
+            .route("/api/v1/remove-background", post(agent_remove_background))
+            .route("/api/v1/upscale-image", post(agent_upscale_image))
+            .route("/api/v1/refresh-models", post(agent_refresh_models))
             .layer(cors)
             .with_state(state);
 
-        let addr: SocketAddr = "0.0.0.0:9876".parse().unwrap();
         println!("[agent-control] Starting HTTP server on {} (for AI agents over Tailscale)", addr);
 
-        let listener = match TcpListener::bind(addr).await {
+        let listener = match TcpListener::from_std(std_listener) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[agent-control] Failed to bind: {}", e);
+                eprintln!("[agent-control] Failed to create async listener: {}", e);
                 return;
             }
         };

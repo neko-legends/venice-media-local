@@ -24,5 +24,18 @@ if (-not (Test-Path -LiteralPath $portableSource -PathType Leaf)) {
 }
 
 New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
-Copy-Item -LiteralPath $portableSource -Destination $portableTarget -Force
+for ($attempt = 1; $attempt -le 5; $attempt++) {
+  try {
+    Copy-Item -LiteralPath $portableSource -Destination $portableTarget -Force
+    break
+  } catch {
+    if ($attempt -eq 5) {
+      $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+      $portableTarget = Join-Path $bundleDir "Venice Media Local_${version}_${stamp}_x64-portable.exe"
+      Copy-Item -LiteralPath $portableSource -Destination $portableTarget -Force
+      break
+    }
+    Start-Sleep -Milliseconds 700
+  }
+}
 Write-Host "Portable executable: $portableTarget"

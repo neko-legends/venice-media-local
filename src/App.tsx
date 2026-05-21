@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
   Database,
@@ -62,6 +63,7 @@ type AppState = {
   keyConfigured: boolean
   models: ModelCache
   buildVersion: string
+  agentControlAddress: string
 }
 
 type MediaResult = {
@@ -78,6 +80,11 @@ type MediaResult = {
 type ResultGroup = {
   id: string
   kind: string
+  title: string
+  results: MediaResult[]
+}
+
+type AgentResultGroupPayload = {
   title: string
   results: MediaResult[]
 }
@@ -703,6 +710,7 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlToken: undefined })
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
+  const [agentControlAddress, setAgentControlAddress] = useState('')
   const burnSeedRef = useRef(createBurnSeed())
   const modeRef = useRef<ModeId>('image')
   const [burnSeed, setBurnSeed] = useState(() => formatBurnSeed(burnSeedRef.current))
@@ -841,11 +849,44 @@ export function App() {
         setKeyConfigured(state.keyConfigured)
         setModels(state.models)
         setBuildVersion(state.buildVersion)
+        setAgentControlAddress(state.agentControlAddress)
       })
       .catch(() => {
         setLastActionMs(null)
         setStatus('Preview mode')
       })
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    let cleanupResults: (() => void) | null = null
+    let cleanupModels: (() => void) | null = null
+
+    listen<AgentResultGroupPayload>('agent:result-group', (event) => {
+      const results = event.payload.results ?? []
+      if (results.length === 0) return
+      setResultGroups((existing) => [createResultGroup(results, event.payload.title || 'Remote Result'), ...existing])
+      setStatus('Remote result completed')
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupResults = unlisten
+    }).catch(() => undefined)
+
+    listen<ModelCache>('agent:models', (event) => {
+      setModels(event.payload)
+      setStatus('Remote model refresh completed')
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupModels = unlisten
+    }).catch(() => undefined)
+
+    return () => {
+      disposed = true
+      cleanupResults?.()
+      cleanupModels?.()
+    }
   }, [])
 
   useEffect(() => {
@@ -1169,8 +1210,33 @@ export function App() {
   }
 
   async function persistSettings(next: AppSettings) {
+    const previous = settings
     setSettings(next)
-    await call<AppSettings>('save_settings', { request: next }).catch(() => undefined)
+    const saved = await call<AppSettings>('save_settings', { request: next }).catch((err) => {
+      setSettings(previous)
+      setError(err instanceof Error ? err.message : String(err))
+      setStatus('Needs attention')
+      setLastActionMs(null)
+      return null
+    })
+    if (saved) {
+      setSettings({
+        ...saved,
+        showDiemBalance: Boolean(saved.showDiemBalance),
+        enableAgentControl: Boolean(saved.enableAgentControl),
+      })
+      if (saved.enableAgentControl) {
+        call<AppState>('get_app_state')
+          .then((state) => setAgentControlAddress(state.agentControlAddress))
+          .catch(() => setAgentControlAddress('0.0.0.0:9876'))
+      }
+    }
+  }
+
+  function copyAgentControlValue(value: string, label: string) {
+    navigator.clipboard.writeText(value)
+    setStatus(`${label} copied to clipboard`)
+    setTimeout(() => setStatus(''), 2000)
   }
 
   async function chooseOutputFolder() {
@@ -2058,33 +2124,45 @@ export function App() {
                     Starts a local HTTP API on port 9876. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window. A discovery file is written automatically.
                   </small>
                   {settings.enableAgentControl && settings.agentControlToken && (
-                    <div style={{ marginTop: "8px" }}>
+                    <div className="agent-control-details">
                       <label className="field">
-                        <span>Control Token (for agents / curl)</span>
-                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                          <input 
-                            value={settings.agentControlToken} 
-                            readOnly 
-                            style={{ flex: 1, fontFamily: "monospace", fontSize: "12px" }} 
+                        <span>Control Token</span>
+                        <div className="agent-value-row">
+                          <input
+                            className="agent-value-input"
+                            value={settings.agentControlToken}
+                            readOnly
                           />
-                          <button 
-                            type="button" 
-                            className="icon-button compact" 
-                            onClick={() => {
-                              if (settings.agentControlToken) {
-                                navigator.clipboard.writeText(settings.agentControlToken);
-                                setStatus("Token copied to clipboard");
-                                setTimeout(() => setStatus(""), 2000);
-                              }
-                            }}
+                          <button
+                            type="button"
+                            className="agent-copy-button"
+                            onClick={() => copyAgentControlValue(settings.agentControlToken || '', 'Token')}
                             title="Copy token"
                           >
                             Copy
                           </button>
                         </div>
                       </label>
+                      <label className="field">
+                        <span>Tailscale Address</span>
+                        <div className="agent-value-row">
+                          <input
+                            className="agent-value-input"
+                            value={agentControlAddress || '0.0.0.0:9876'}
+                            readOnly
+                          />
+                          <button
+                            type="button"
+                            className="agent-copy-button"
+                            onClick={() => copyAgentControlValue(agentControlAddress || '0.0.0.0:9876', 'Tailscale address')}
+                            title="Copy Tailscale address"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </label>
                       <small className="field-help">
-                        Server running on 0.0.0.0:9876. Use your Windows machine's Tailscale IP (e.g. 100.x.x.x:9876) from the agent. The discovery file is also written automatically.
+                        The server binds locally on 0.0.0.0:9876. Give the agent the Tailscale address and control token above.
                       </small>
                     </div>
                   )}
