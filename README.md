@@ -106,6 +106,57 @@ Credential store service/account:
 venice-media-local / venice-api-key
 ```
 
+### Theater Mode Remote Control
+
+Venice Media Local can expose a local HTTP control API for trusted agents on the same Tailscale network. The human must open the app, go to Settings, and manually enable **AI Agent Remote Control** each session. It is always off when the app starts.
+
+Agents should start by reading the discovery file on the Windows machine:
+
+```text
+%APPDATA%\com.neko-legends.venice-media-local\control-api.json
+```
+
+That file includes the Tailscale `address`, `port`, `token`, app `version`, and bind address. Use the token as a Bearer token:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://<address>/api/v1/state
+```
+
+If the connection times out, check Tailscale Access Controls. Add a rule where the remote agent machine is the source, the Windows machine running Venice Media Local is the destination, and the port/protocol is:
+
+```text
+tcp:9876
+```
+
+In plain English: allow the remote agent source to control this local Windows destination on `tcp:9876`.
+
+Useful Theater Mode endpoints:
+
+```text
+GET  /api/v1/state
+POST /api/v1/navigate
+POST /api/v1/generate-image
+POST /api/v1/edit-image
+POST /api/v1/remove-background
+POST /api/v1/upscale-image
+POST /api/v1/queue-video
+POST /api/v1/retrieve-video
+POST /api/v1/queue-music
+POST /api/v1/queue-sfx
+POST /api/v1/retrieve-audio
+POST /api/v1/generate-speech
+POST /api/v1/transcribe-audio
+POST /api/v1/refresh-models
+POST /api/v1/open-output-folder
+POST /api/v1/open-burn-folder
+POST /api/v1/clear-results
+POST /api/v1/move-to-burn
+GET  /api/v1/burn-folder-stats
+POST /api/v1/burn-folder
+```
+
+Remote media actions update the already-open Windows GUI live. Navigation, queues, generated results, result clearing, and burn-folder moves should appear in the app as if the human had clicked through the workflow.
+
 ## Prerequisites
 
 - Node.js 20+.
