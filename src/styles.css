@@ -1083,6 +1083,10 @@ button {
   min-width: 0;
 }
 
+.agent-control-details .field:first-child .agent-value-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
 .agent-value-input {
   overflow: hidden;
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
@@ -1105,6 +1109,10 @@ button {
 .agent-copy-button:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   color: var(--accent);
+}
+
+.agent-rotate-button {
+  min-width: 68px;
 }
 
 .theme-grid {

@@ -1318,6 +1318,27 @@ export function App() {
     setTimeout(() => setStatus(''), 2000)
   }
 
+  async function rotateAgentControlToken() {
+    const confirmed = window.confirm('Rotate the Agent Control token? Any remote agents using the old token will need the new one.')
+    if (!confirmed) return
+
+    const saved = await runAction('Rotating token', () => call<AppSettings>('rotate_agent_control_token'))
+    if (saved) {
+      setSettings({
+        ...saved,
+        showDiemBalance: Boolean(saved.showDiemBalance),
+        enableAgentControl: Boolean(saved.enableAgentControl),
+      })
+      if (saved.enableAgentControl) {
+        call<AppState>('get_app_state')
+          .then((state) => setAgentControlAddress(state.agentControlAddress))
+          .catch(() => setAgentControlAddress('0.0.0.0:9876'))
+      }
+      setStatus('Agent Control token rotated')
+      setLastActionMs(null)
+    }
+  }
+
   async function chooseOutputFolder() {
     const selected = await runAction('Choosing output folder', () =>
       open({
@@ -2219,6 +2240,14 @@ export function App() {
                             title="Copy token"
                           >
                             Copy
+                          </button>
+                          <button
+                            type="button"
+                            className="agent-copy-button agent-rotate-button"
+                            onClick={rotateAgentControlToken}
+                            title="Rotate token"
+                          >
+                            Rotate
                           </button>
                         </div>
                       </label>

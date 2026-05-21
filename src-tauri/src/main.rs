@@ -2442,6 +2442,27 @@ fn save_settings(
 }
 
 #[tauri::command]
+fn rotate_agent_control_token(
+    app: AppHandle,
+    handle: tauri::State<AgentControlHandle>,
+) -> Result<AppSettings, String> {
+    let mut settings = read_settings(&app);
+    settings.agent_control_token = Some(generate_agent_control_token());
+
+    if settings.enable_agent_control {
+        stop_agent_control_server(&handle);
+        if let Some(token) = settings.agent_control_token.clone() {
+            write_agent_control_discovery(&app, &token)?;
+            start_agent_control_server(app.clone(), token, &handle)?;
+        }
+    }
+
+    ensure_output_folders_for_settings(&app, &settings)?;
+    save_settings_file(&app, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
 fn save_api_key(api_key: String) -> Result<bool, String> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
@@ -3652,6 +3673,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             save_settings,
+            rotate_agent_control_token,
             save_api_key,
             clear_api_key,
             get_models,
