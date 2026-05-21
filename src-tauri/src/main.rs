@@ -154,6 +154,7 @@ struct ImageMultiEditRequest {
     model: String,
     prompt: String,
     images: Vec<String>,
+    aspect_ratio: Option<String>,
     resolution: Option<String>,
     safe_mode: Option<bool>,
 }
@@ -1265,6 +1266,11 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 image_resolution_options(&id, &name, &constraints, &capabilities);
             let controls = if is_edit {
                 let mut controls = edit_controls_for_model(&id, &name);
+                controls["aspectRatioOptions"] = json!(if size_options.is_empty() {
+                    vec!["1:1".to_string(), "4:3".to_string(), "3:4".to_string(), "16:9".to_string(), "9:16".to_string()]
+                } else {
+                    size_options
+                });
                 if !resolution_options.is_empty() {
                     controls["resolutionOptions"] = json!(resolution_options);
                 }
@@ -2449,6 +2455,9 @@ async fn multi_edit_image(
 
     if let Some(value) = request.resolution.filter(|value| !value.trim().is_empty()) {
         body["resolution"] = json!(value);
+    }
+    if let Some(value) = request.aspect_ratio.filter(|value| !value.trim().is_empty()) {
+        body["aspect_ratio"] = json!(value);
     }
     if let Some(value) = request.safe_mode {
         body["safe_mode"] = json!(value);

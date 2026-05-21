@@ -717,6 +717,7 @@ export function App() {
 
   const [sourceImage, setSourceImage] = useState('')
   const [editSourceImages, setEditSourceImages] = useState<string[]>(() => Array(EDIT_SOURCE_LIMIT).fill(''))
+  const [editAspectRatio, setEditAspectRatio] = useState('1:1')
   const [editResolution, setEditResolution] = useState('')
   const [upscaleScale, setUpscaleScale] = useState<UpscaleScale>(2)
   const [videoDuration, setVideoDuration] = useState('5s')
@@ -893,9 +894,11 @@ export function App() {
   const currentTranscribeModel = transcribeModels.find((model) => model.id === transcribeModel)
   const imageRatios = controlArray(currentImageModel, 'sizeOptions', IMAGE_ASPECT_OPTIONS)
   const imageResolutions = controlArray(currentImageModel, 'resolutionOptions', EMPTY_OPTIONS)
+  const editRatios = controlArray(currentEditModel, 'aspectRatioOptions', IMAGE_ASPECT_OPTIONS)
   const editResolutions = controlArray(currentEditModel, 'resolutionOptions', EMPTY_OPTIONS)
   const selectedAspectRatio = imageRatios.includes(aspectRatio) ? aspectRatio : imageRatios[0] ?? '1:1'
   const selectedImageResolution = imageResolutions.includes(imageResolution) ? imageResolution : ''
+  const selectedEditAspectRatio = editRatios.includes(editAspectRatio) ? editAspectRatio : editRatios[0] ?? '1:1'
   const selectedEditResolution = editResolutions.includes(editResolution) ? editResolution : editResolutions[0] ?? ''
   const videoDurations = controlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
   const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
@@ -1215,6 +1218,7 @@ export function App() {
       model: editModel,
       prompt,
       images,
+      aspectRatio: selectedEditAspectRatio,
       resolution: selectedEditResolution || null,
     }
 
@@ -1690,6 +1694,7 @@ export function App() {
                 </div>
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
+                  <SelectField label="Aspect Ratio" value={selectedEditAspectRatio} onChange={setEditAspectRatio} options={editRatios} />
                   {editResolutions.length > 0 && (
                     <SelectField label="Resolution" value={selectedEditResolution} onChange={setEditResolution} options={editResolutions} />
                   )}
