@@ -20,4 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["full"] }
+
+# For the AI Agent Remote Control HTTP API (gated behind the setting)
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }

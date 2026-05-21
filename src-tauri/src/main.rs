@@ -14,6 +14,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tower_http::cors::{Any, CorsLayer};
 
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 const KEYRING_SERVICE: &str = "venice-media-local";
@@ -51,6 +60,11 @@ struct AppSettings {
     window_width: Option<u32>,
     #[serde(default)]
     window_height: Option<u32>,
+    // AI Agent Remote Control (HTTP API for Hermes-style agents over Tailscale)
+    #[serde(default)]
+    enable_agent_control: bool,
+    #[serde(default)]
+    agent_control_token: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -61,6 +75,8 @@ impl Default for AppSettings {
             show_diem_balance: false,
             window_width: None,
             window_height: None,
+            enable_agent_control: false,
+            agent_control_token: None,
         }
     }
 }
@@ -72,6 +88,8 @@ fn default_settings(app: &AppHandle) -> AppSettings {
         show_diem_balance: false,
         window_width: None,
         window_height: None,
+        enable_agent_control: false,
+        agent_control_token: None,
     }
 }
 
@@ -115,6 +133,8 @@ struct SaveSettingsRequest {
     theme: Option<String>,
     output_dir: Option<String>,
     show_diem_balance: Option<bool>,
+    enable_agent_control: Option<bool>,
+    // We do not allow the frontend to set the token directly for security
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +297,21 @@ struct DiemBalanceSnapshot {
     raw: Value,
 }
 
+
+// Handle for dynamically starting/stopping the agent control HTTP server
+// when the user toggles the setting in the UI (no app restart needed).
+struct AgentControlHandle {
+    shutdown_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Default for AgentControlHandle {
+    fn default() -> Self {
+        Self {
+            shutdown_tx: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 fn keyring_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(|err| err.to_string())
 }
@@ -297,6 +332,35 @@ fn has_api_key() -> bool {
     read_api_key()
         .map(|key| !key.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn generate_agent_control_token() -> String {
+    // Simple but sufficient token for Tailscale/local use (no extra deps)
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Mix in some process id and a few bytes
+    let pid = std::process::id();
+    format!("vl-{}-{:x}-{:x}", ts, pid, ts.wrapping_mul(31) ^ (pid as u64))
+}
+
+/// Write the control-api.json discovery file so agents / the skill can auto-discover
+/// the address, port and token without manual config.
+fn write_agent_control_discovery(app: &AppHandle, token: &str) -> Result<(), String> {
+    let dir = app_data_dir(app)?;
+    let discovery = serde_json::json!({
+        "address": "0.0.0.0:9876",
+        "port": 9876,
+        "token": token,
+        "version": app.package_info().version.to_string(),
+        "note": "Connect using the Tailscale IP of this Windows machine (e.g. 100.x.x.x:9876) + the token. Same Tailscale network recommended."
+    });
+    let path = dir.join("control-api.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&discovery).unwrap())
+        .map_err(|e| e.to_string())?;
+    println!("[agent-control] Wrote discovery file: {:?}", path);
+    Ok(())
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2280,7 +2344,11 @@ fn get_app_state(app: AppHandle) -> Result<AppState, String> {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, request: SaveSettingsRequest) -> Result<AppSettings, String> {
+fn save_settings(
+    app: AppHandle,
+    request: SaveSettingsRequest,
+    handle: tauri::State<AgentControlHandle>,
+) -> Result<AppSettings, String> {
     let mut settings = read_settings(&app);
     if let Some(theme) = request.theme {
         settings.theme = theme;
@@ -2291,6 +2359,33 @@ fn save_settings(app: AppHandle, request: SaveSettingsRequest) -> Result<AppSett
     if let Some(show_diem_balance) = request.show_diem_balance {
         settings.show_diem_balance = show_diem_balance;
     }
+    let was_enabled = settings.enable_agent_control;
+
+    if let Some(enable) = request.enable_agent_control {
+        settings.enable_agent_control = enable;
+        // Generate a token the first time the user enables the feature
+        if enable && settings.agent_control_token.is_none() {
+            settings.agent_control_token = Some(generate_agent_control_token());
+        }
+
+        if let Some(token) = settings.agent_control_token.clone() {
+            if let Err(e) = write_agent_control_discovery(&app, &token) {
+                eprintln!("[agent-control] Could not write discovery on toggle: {}", e);
+            }
+        }
+
+        // Live start / stop when the user toggles in Settings (no restart needed)
+        if enable && !was_enabled {
+            if let Some(token) = settings.agent_control_token.clone() {
+                if let Err(e) = start_agent_control_server(app.clone(), token, &handle) {
+                    eprintln!("[agent-control] Failed to start on toggle: {}", e);
+                }
+            }
+        } else if !enable && was_enabled {
+            stop_agent_control_server(&handle);
+        }
+    }
+
     ensure_output_folders_for_settings(&app, &settings)?;
     save_settings_file(&app, &settings)?;
     Ok(settings)
@@ -2943,9 +3038,142 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
     .await
 }
 
+
+// === AI Agent Remote Control HTTP Server ===
+// Supports live toggle: when the user turns "AI Agent Control" on in Settings,
+// the server starts immediately. When turned off, it shuts down gracefully.
+// Off by default.
+
+#[derive(Clone)]
+struct AgentControlState {
+    app: AppHandle,
+    token: String,
+}
+
+async fn check_token(
+    State(state): State<AgentControlState>,
+    headers: axum::http::HeaderMap,
+) -> Result<(), axum::http::StatusCode> {
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(value) = auth.to_str() {
+            if value == format!("Bearer {}", state.token) {
+                return Ok(());
+            }
+        }
+    }
+    Err(axum::http::StatusCode::UNAUTHORIZED)
+}
+
+async fn agent_get_state(
+    State(state): State<AgentControlState>,
+) -> Result<Json<serde_json::Value>, String> {
+    // Reuse the existing logic
+    let app_state = get_app_state(state.app.clone()).map_err(|e| e.to_string())?;
+    Ok(Json(serde_json::to_value(app_state).unwrap()))
+}
+
+async fn agent_generate_image(
+    State(state): State<AgentControlState>,
+    Json(payload): Json<ImageGenerationRequest>,
+) -> Result<Json<Vec<MediaResult>>, String> {
+    // Call the real internal function — this is what makes results appear in the GUI
+    let results = generate_image(state.app.clone(), payload).await?;
+    Ok(Json(results))
+}
+
+async fn agent_refresh_models(
+    State(state): State<AgentControlState>,
+) -> Result<Json<ModelCache>, String> {
+    let cache = refresh_models(state.app.clone()).await?;
+    Ok(Json(cache))
+}
+
+fn start_agent_control_server(
+    app: AppHandle,
+    token: String,
+    handle: &AgentControlHandle,
+) -> Result<(), String> {
+    if token.is_empty() {
+        return Err("No token configured".to_string());
+    }
+
+    // If already running, do nothing
+    {
+        let guard = handle.shutdown_tx.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+    }
+
+    // Write discovery file so the skill / other agents can find us automatically
+    if let Err(e) = write_agent_control_discovery(&app, &token) {
+        eprintln!("[agent-control] Could not write discovery file: {}", e);
+    }
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    // Store the sender so we can shut down later when the toggle is turned off
+    {
+        let mut guard = handle.shutdown_tx.lock().unwrap();
+        *guard = Some(shutdown_tx);
+    }
+
+    let state = AgentControlState {
+        app: app.clone(),
+        token,
+    };
+
+    tokio::spawn(async move {
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
+        let router = Router::new()
+            .route("/api/v1/state", get(agent_get_state))
+            .route("/api/v1/generate-image", post(agent_generate_image))
+            .layer(cors)
+            .with_state(state);
+
+        let addr: SocketAddr = "0.0.0.0:9876".parse().unwrap();
+        println!("[agent-control] Starting HTTP server on {} (for AI agents over Tailscale)", addr);
+
+        let listener = match TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[agent-control] Failed to bind: {}", e);
+                return;
+            }
+        };
+
+        // Graceful shutdown when the user turns the toggle off
+        let server = axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+                println!("[agent-control] Shutdown signal received, stopping HTTP server");
+            });
+
+        if let Err(e) = server.await {
+            eprintln!("[agent-control] Server error: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
+fn stop_agent_control_server(handle: &AgentControlHandle) {
+    let mut guard = handle.shutdown_tx.lock().unwrap();
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(());
+        println!("[agent-control] Shutdown requested for agent control server");
+    }
+}
+
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(AgentControlHandle::default())
         .setup(|app| {
             if let Err(err) = ensure_output_folders(app.handle()) {
                 eprintln!("Failed to initialize output folders: {err}");
@@ -2965,6 +3193,19 @@ fn main() {
                         }
                     }
                 });
+            }
+
+            // === Start AI Agent Control HTTP server if it was enabled at launch ===
+            let settings = read_settings(&app_handle);
+            if settings.enable_agent_control {
+                if let Some(token) = settings.agent_control_token.clone() {
+                    let handle = app_handle.state::<AgentControlHandle>();
+                    if let Err(e) = start_agent_control_server(app_handle.clone(), token, &handle) {
+                        eprintln!("[agent-control] Failed to start at launch: {}", e);
+                    }
+                } else {
+                    eprintln!("[agent-control] Feature enabled but no token found — toggle off/on to generate one.");
+                }
             }
 
             Ok(())

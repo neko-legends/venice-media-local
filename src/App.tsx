@@ -53,6 +53,8 @@ type AppSettings = {
   theme: ThemeId
   outputDir: string
   showDiemBalance: boolean
+  enableAgentControl: boolean
+  agentControlToken?: string
 }
 
 type AppState = {
@@ -698,7 +700,7 @@ function formatBurnSeed(seed: bigint): string {
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
-  const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '', showDiemBalance: false })
+  const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlToken: undefined })
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
   const burnSeedRef = useRef(createBurnSeed())
@@ -834,6 +836,7 @@ export function App() {
         setSettings({
           ...state.settings,
           showDiemBalance: Boolean(state.settings.showDiemBalance),
+          enableAgentControl: Boolean(state.settings.enableAgentControl || false),
         })
         setKeyConfigured(state.keyConfigured)
         setModels(state.models)
@@ -2039,6 +2042,52 @@ export function App() {
                     <span>Show DIEM left</span>
                   </label>
                   <small className="field-help">Refreshes once every 3 minutes. Shows percent left when Venice returns an epoch allocation, otherwise falls back to the DIEM balance.</small>
+                </div>
+
+                <div className="settings-block">
+                  <h2>AI Agent Control</h2>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.enableAgentControl}
+                      onChange={(event) => persistSettings({ ...settings, enableAgentControl: event.target.checked })}
+                    />
+                    <span>Enable AI Agent Remote Control</span>
+                  </label>
+                  <small className="field-help">
+                    Starts a local HTTP API on port 9876. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window. A discovery file is written automatically.
+                  </small>
+                  {settings.enableAgentControl && settings.agentControlToken && (
+                    <div style={{ marginTop: "8px" }}>
+                      <label className="field">
+                        <span>Control Token (for agents / curl)</span>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                          <input 
+                            value={settings.agentControlToken} 
+                            readOnly 
+                            style={{ flex: 1, fontFamily: "monospace", fontSize: "12px" }} 
+                          />
+                          <button 
+                            type="button" 
+                            className="icon-button compact" 
+                            onClick={() => {
+                              if (settings.agentControlToken) {
+                                navigator.clipboard.writeText(settings.agentControlToken);
+                                setStatus("Token copied to clipboard");
+                                setTimeout(() => setStatus(""), 2000);
+                              }
+                            }}
+                            title="Copy token"
+                          >
+                            Copy
+                          </button>
+                        </div>
+                      </label>
+                      <small className="field-help">
+                        Server running on 0.0.0.0:9876. Use your Windows machine's Tailscale IP (e.g. 100.x.x.x:9876) from the agent. The discovery file is also written automatically.
+                      </small>
+                    </div>
+                  )}
                 </div>
 
                 <div className="settings-block">
