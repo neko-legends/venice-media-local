@@ -255,7 +255,7 @@ struct MediaResult {
     text: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueResult {
     queue_id: String,
@@ -265,7 +265,7 @@ struct QueueResult {
     raw: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RetrieveResult {
     status: String,
@@ -447,6 +447,18 @@ fn read_settings(app: &AppHandle) -> AppSettings {
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_path(app)?;
     write_json_file(&path, settings)
+}
+
+fn force_agent_control_off_on_launch(app: &AppHandle) {
+    let mut settings = read_settings(app);
+    if !settings.enable_agent_control {
+        return;
+    }
+
+    settings.enable_agent_control = false;
+    if let Err(err) = save_settings_file(app, &settings) {
+        eprintln!("[agent-control] Failed to reset launch state: {err}");
+    }
 }
 
 fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
@@ -2197,6 +2209,13 @@ fn open_output_folder(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn open_burn_folder(app: AppHandle) -> Result<String, String> {
+    let dir = ensure_burn_dir(&app)?;
+    open_folder_path(&dir)?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn open_file_folder(path: String) -> Result<String, String> {
     let file_path = PathBuf::from(path.trim());
     let folder = file_path
@@ -3088,6 +3107,55 @@ struct AgentResultGroupPayload {
     results: Vec<MediaResult>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRequest<T> {
+    #[serde(flatten)]
+    request: T,
+    navigate: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentNavigateRequest {
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMoveToBurnRequest {
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBurnFolderRequest {
+    seed: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentNavigatePayload {
+    mode: String,
+    status: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentQueuePayload {
+    kind: String,
+    queue_id: String,
+    status: String,
+    progress_label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRemoveResultPathsPayload {
+    paths: Vec<String>,
+    status: String,
+}
+
 type AgentApiError = (StatusCode, String);
 
 fn check_agent_token(state: &AgentControlState, headers: &HeaderMap) -> Result<(), AgentApiError> {
@@ -3105,6 +3173,27 @@ fn agent_error(error: String) -> AgentApiError {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
+fn validate_agent_mode(mode: &str) -> Result<String, AgentApiError> {
+    match mode {
+        "image" | "edit" | "video" | "music" | "sfx" | "voice" | "transcribe" | "models"
+        | "settings" => Ok(mode.to_string()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid mode '{mode}'. Expected image, edit, video, music, sfx, voice, transcribe, models, or settings."),
+        )),
+    }
+}
+
+fn emit_agent_navigate(app: &AppHandle, mode: &str, status: &str) {
+    let payload = AgentNavigatePayload {
+        mode: mode.to_string(),
+        status: status.to_string(),
+    };
+    if let Err(error) = app.emit("agent:navigate", payload) {
+        eprintln!("[agent-control] Failed to emit navigation: {error}");
+    }
+}
+
 fn emit_agent_results(app: &AppHandle, title: &str, results: Vec<MediaResult>) {
     let payload = AgentResultGroupPayload {
         title: title.to_string(),
@@ -3113,6 +3202,29 @@ fn emit_agent_results(app: &AppHandle, title: &str, results: Vec<MediaResult>) {
     if let Err(error) = app.emit("agent:result-group", payload) {
         eprintln!("[agent-control] Failed to emit result group: {error}");
     }
+}
+
+fn emit_agent_queue(app: &AppHandle, kind: &str, queue: &QueueResult) {
+    let payload = AgentQueuePayload {
+        kind: kind.to_string(),
+        queue_id: queue.queue_id.clone(),
+        status: queue.status.clone(),
+        progress_label: queue.progress_label.clone(),
+    };
+    if let Err(error) = app.emit("agent:queue", payload) {
+        eprintln!("[agent-control] Failed to emit queue: {error}");
+    }
+}
+
+fn emit_agent_remove_result_paths(app: &AppHandle, paths: Vec<String>, status: String) {
+    let payload = AgentRemoveResultPathsPayload { paths, status };
+    if let Err(error) = app.emit("agent:remove-result-paths", payload) {
+        eprintln!("[agent-control] Failed to emit result removal: {error}");
+    }
+}
+
+fn should_agent_navigate<T>(request: &AgentRequest<T>) -> bool {
+    request.navigate.unwrap_or(true)
 }
 
 async fn agent_get_state(
@@ -3124,13 +3236,29 @@ async fn agent_get_state(
     Ok(Json(serde_json::to_value(app_state).unwrap()))
 }
 
+async fn agent_navigate(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentNavigateRequest>,
+) -> Result<Json<serde_json::Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let mode = validate_agent_mode(payload.mode.trim())?;
+    emit_agent_navigate(&state.app, &mode, &format!("Remote opened {mode}"));
+    Ok(Json(json!({ "ok": true, "mode": mode })))
+}
+
 async fn agent_generate_image(
     State(state): State<AgentControlState>,
     headers: HeaderMap,
-    Json(payload): Json<ImageGenerationRequest>,
+    Json(payload): Json<AgentRequest<ImageGenerationRequest>>,
 ) -> Result<Json<Vec<MediaResult>>, AgentApiError> {
     check_agent_token(&state, &headers)?;
-    let results = generate_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "image", "Remote image generation started");
+    }
+    let results = generate_image(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
     emit_agent_results(&state.app, "Images · Remote", results.clone());
     Ok(Json(results))
 }
@@ -3150,10 +3278,15 @@ async fn agent_refresh_models(
 async fn agent_edit_image(
     State(state): State<AgentControlState>,
     headers: HeaderMap,
-    Json(payload): Json<ImageMultiEditRequest>,
+    Json(payload): Json<AgentRequest<ImageMultiEditRequest>>,
 ) -> Result<Json<MediaResult>, AgentApiError> {
     check_agent_token(&state, &headers)?;
-    let result = multi_edit_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "edit", "Remote image edit started");
+    }
+    let result = multi_edit_image(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
     emit_agent_results(&state.app, "Edit / Combine · Remote", vec![result.clone()]);
     Ok(Json(result))
 }
@@ -3161,10 +3294,15 @@ async fn agent_edit_image(
 async fn agent_remove_background(
     State(state): State<AgentControlState>,
     headers: HeaderMap,
-    Json(payload): Json<BackgroundRemoveRequest>,
+    Json(payload): Json<AgentRequest<BackgroundRemoveRequest>>,
 ) -> Result<Json<MediaResult>, AgentApiError> {
     check_agent_token(&state, &headers)?;
-    let result = remove_background(state.app.clone(), payload).await.map_err(agent_error)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "edit", "Remote background removal started");
+    }
+    let result = remove_background(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
     emit_agent_results(&state.app, "Background Removed · Remote", vec![result.clone()]);
     Ok(Json(result))
 }
@@ -3172,12 +3310,205 @@ async fn agent_remove_background(
 async fn agent_upscale_image(
     State(state): State<AgentControlState>,
     headers: HeaderMap,
-    Json(payload): Json<ImageUpscaleRequest>,
+    Json(payload): Json<AgentRequest<ImageUpscaleRequest>>,
 ) -> Result<Json<MediaResult>, AgentApiError> {
     check_agent_token(&state, &headers)?;
-    let result = upscale_image(state.app.clone(), payload).await.map_err(agent_error)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "edit", "Remote image upscale started");
+    }
+    let result = upscale_image(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
     emit_agent_results(&state.app, "Upscaled Image · Remote", vec![result.clone()]);
     Ok(Json(result))
+}
+
+async fn agent_queue_video(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<QueueMediaRequest>>,
+) -> Result<Json<QueueResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "video", "Remote video queue started");
+    }
+    let queue = queue_video(payload.request).await.map_err(agent_error)?;
+    emit_agent_queue(&state.app, "video", &queue);
+    Ok(Json(queue))
+}
+
+async fn agent_retrieve_video(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<RetrieveRequest>>,
+) -> Result<Json<RetrieveResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "video", "Remote video retrieval started");
+    }
+    let output = retrieve_video(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    if let Some(result) = output.result.clone() {
+        emit_agent_results(&state.app, "Video · Remote", vec![result]);
+    }
+    Ok(Json(output))
+}
+
+async fn agent_queue_music(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<QueueMediaRequest>>,
+) -> Result<Json<QueueResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "music", "Remote music queue started");
+    }
+    let queue = queue_audio(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    emit_agent_queue(&state.app, "music", &queue);
+    Ok(Json(queue))
+}
+
+async fn agent_queue_sfx(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<QueueMediaRequest>>,
+) -> Result<Json<QueueResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "sfx", "Remote SFX queue started");
+    }
+    let queue = queue_audio(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    emit_agent_queue(&state.app, "sfx", &queue);
+    Ok(Json(queue))
+}
+
+async fn agent_retrieve_audio(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<RetrieveRequest>>,
+) -> Result<Json<RetrieveResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let mode = payload
+        .request
+        .kind
+        .as_deref()
+        .filter(|kind| *kind == "sfx")
+        .unwrap_or("music");
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, mode, "Remote audio retrieval started");
+    }
+    let title = if mode == "sfx" { "SFX · Remote" } else { "Music · Remote" };
+    let output = retrieve_audio(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    if let Some(result) = output.result.clone() {
+        emit_agent_results(&state.app, title, vec![result]);
+    }
+    Ok(Json(output))
+}
+
+async fn agent_generate_speech(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<SpeechRequest>>,
+) -> Result<Json<MediaResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "voice", "Remote voice generation started");
+    }
+    let result = generate_speech(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    emit_agent_results(&state.app, "Voice · Remote", vec![result.clone()]);
+    Ok(Json(result))
+}
+
+async fn agent_transcribe_audio(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentRequest<TranscriptionRequest>>,
+) -> Result<Json<MediaResult>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if should_agent_navigate(&payload) {
+        emit_agent_navigate(&state.app, "transcribe", "Remote transcription started");
+    }
+    let result = transcribe_audio(state.app.clone(), payload.request)
+        .await
+        .map_err(agent_error)?;
+    emit_agent_results(&state.app, "Speech -> Text · Remote", vec![result.clone()]);
+    Ok(Json(result))
+}
+
+async fn agent_open_output_folder(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let path = open_output_folder(state.app.clone()).map_err(agent_error)?;
+    Ok(Json(json!({ "path": path })))
+}
+
+async fn agent_open_burn_folder(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let path = open_burn_folder(state.app.clone()).map_err(agent_error)?;
+    Ok(Json(json!({ "path": path })))
+}
+
+async fn agent_clear_results(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    if let Err(error) = state.app.emit("agent:clear-results", json!({ "status": "Remote cleared results" })) {
+        eprintln!("[agent-control] Failed to emit clear results: {error}");
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn agent_move_to_burn(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentMoveToBurnRequest>,
+) -> Result<Json<Vec<String>>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let moved = move_media_files_to_burn(state.app.clone(), payload.paths).map_err(agent_error)?;
+    emit_agent_remove_result_paths(
+        &state.app,
+        moved.clone(),
+        format!(
+            "Remote moved {} file{} to the burn folder",
+            moved.len(),
+            if moved.len() == 1 { "" } else { "s" }
+        ),
+    );
+    Ok(Json(moved))
+}
+
+async fn agent_get_burn_folder_stats(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<BurnFolderStats>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let stats = get_burn_folder_stats(state.app.clone()).map_err(agent_error)?;
+    Ok(Json(stats))
+}
+
+async fn agent_burn_folder(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+    Json(payload): Json<AgentBurnFolderRequest>,
+) -> Result<Json<BurnFolderStats>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let stats = burn_folder(state.app.clone(), payload.seed).map_err(agent_error)?;
+    Ok(Json(stats))
 }
 
 fn start_agent_control_server(
@@ -3232,11 +3563,25 @@ fn start_agent_control_server(
 
         let router = Router::new()
             .route("/api/v1/state", get(agent_get_state))
+            .route("/api/v1/navigate", post(agent_navigate))
             .route("/api/v1/generate-image", post(agent_generate_image))
             .route("/api/v1/edit-image", post(agent_edit_image))
             .route("/api/v1/remove-background", post(agent_remove_background))
             .route("/api/v1/upscale-image", post(agent_upscale_image))
+            .route("/api/v1/queue-video", post(agent_queue_video))
+            .route("/api/v1/retrieve-video", post(agent_retrieve_video))
+            .route("/api/v1/queue-music", post(agent_queue_music))
+            .route("/api/v1/queue-sfx", post(agent_queue_sfx))
+            .route("/api/v1/retrieve-audio", post(agent_retrieve_audio))
+            .route("/api/v1/generate-speech", post(agent_generate_speech))
+            .route("/api/v1/transcribe-audio", post(agent_transcribe_audio))
             .route("/api/v1/refresh-models", post(agent_refresh_models))
+            .route("/api/v1/open-output-folder", post(agent_open_output_folder))
+            .route("/api/v1/open-burn-folder", post(agent_open_burn_folder))
+            .route("/api/v1/clear-results", post(agent_clear_results))
+            .route("/api/v1/move-to-burn", post(agent_move_to_burn))
+            .route("/api/v1/burn-folder-stats", get(agent_get_burn_folder_stats))
+            .route("/api/v1/burn-folder", post(agent_burn_folder))
             .layer(cors)
             .with_state(state);
 
@@ -3284,6 +3629,8 @@ fn main() {
             }
 
             let app_handle = app.handle().clone();
+            force_agent_control_off_on_launch(&app_handle);
+
             if let Some(window) = app.get_webview_window("main") {
                 if let Err(err) = apply_initial_window_size(&app_handle, &window) {
                     eprintln!("Failed to initialize window size: {err}");
@@ -3297,19 +3644,6 @@ fn main() {
                         }
                     }
                 });
-            }
-
-            // === Start AI Agent Control HTTP server if it was enabled at launch ===
-            let settings = read_settings(&app_handle);
-            if settings.enable_agent_control {
-                if let Some(token) = settings.agent_control_token.clone() {
-                    let handle = app_handle.state::<AgentControlHandle>();
-                    if let Err(e) = start_agent_control_server(app_handle.clone(), token, &handle) {
-                        eprintln!("[agent-control] Failed to start at launch: {}", e);
-                    }
-                } else {
-                    eprintln!("[agent-control] Feature enabled but no token found — toggle off/on to generate one.");
-                }
             }
 
             Ok(())
@@ -3326,6 +3660,7 @@ fn main() {
             get_burn_folder_stats,
             get_diem_balance,
             open_output_folder,
+            open_burn_folder,
             open_file_folder,
             burn_folder,
             refresh_models,

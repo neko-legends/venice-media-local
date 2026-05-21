@@ -89,6 +89,23 @@ type AgentResultGroupPayload = {
   results: MediaResult[]
 }
 
+type AgentNavigatePayload = {
+  mode: ModeId
+  status?: string
+}
+
+type AgentQueuePayload = {
+  kind: 'video' | 'music' | 'sfx'
+  queueId: string
+  status: string
+  progressLabel: string
+}
+
+type AgentRemoveResultPathsPayload = {
+  paths: string[]
+  status?: string
+}
+
 type QueueResult = {
   queueId: string
   status: string
@@ -861,6 +878,12 @@ export function App() {
     let disposed = false
     let cleanupResults: (() => void) | null = null
     let cleanupModels: (() => void) | null = null
+    let cleanupNavigation: (() => void) | null = null
+    let cleanupQueue: (() => void) | null = null
+    let cleanupClearResults: (() => void) | null = null
+    let cleanupRemoveResultPaths: (() => void) | null = null
+
+    const modeIds = new Set<ModeId>(modes.map((item) => item.id))
 
     listen<AgentResultGroupPayload>('agent:result-group', (event) => {
       const results = event.payload.results ?? []
@@ -882,10 +905,66 @@ export function App() {
       else cleanupModels = unlisten
     }).catch(() => undefined)
 
+    listen<AgentNavigatePayload>('agent:navigate', (event) => {
+      if (!modeIds.has(event.payload.mode)) return
+      setMode(event.payload.mode)
+      setStatus(event.payload.status || `Remote opened ${event.payload.mode}`)
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupNavigation = unlisten
+    }).catch(() => undefined)
+
+    listen<AgentQueuePayload>('agent:queue', (event) => {
+      const payload = event.payload
+      const id = remoteQueueId(payload.kind, payload.queueId)
+      setRemoteQueues((existing) => [
+        { id, kind: payload.kind, queueId: payload.queueId, status: payload.status, progressLabel: payload.progressLabel, startedAt: Date.now() },
+        ...existing.filter((entry) => entry.id !== id),
+      ])
+      setStatus(`Remote ${JOB_LABELS[payload.kind]} queued`)
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupQueue = unlisten
+    }).catch(() => undefined)
+
+    listen<{ status?: string }>('agent:clear-results', (event) => {
+      setResultGroups([])
+      setStatus(event.payload.status || 'Remote cleared results')
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupClearResults = unlisten
+    }).catch(() => undefined)
+
+    listen<AgentRemoveResultPathsPayload>('agent:remove-result-paths', (event) => {
+      const removed = new Set(event.payload.paths ?? [])
+      if (removed.size > 0) {
+        setResultGroups((existing) =>
+          existing
+            .map((group) => ({
+              ...group,
+              results: group.results.filter((result) => !removed.has(result.filePath)),
+            }))
+            .filter((group) => group.results.length > 0),
+        )
+      }
+      setStatus(event.payload.status || 'Remote updated results')
+      setLastActionMs(null)
+    }).then((unlisten) => {
+      if (disposed) unlisten()
+      else cleanupRemoveResultPaths = unlisten
+    }).catch(() => undefined)
+
     return () => {
       disposed = true
       cleanupResults?.()
       cleanupModels?.()
+      cleanupNavigation?.()
+      cleanupQueue?.()
+      cleanupClearResults?.()
+      cleanupRemoveResultPaths?.()
     }
   }, [])
 
@@ -2121,7 +2200,7 @@ export function App() {
                     <span>Enable AI Agent Remote Control</span>
                   </label>
                   <small className="field-help">
-                    Starts a local HTTP API on port 9876. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window. A discovery file is written automatically.
+                    Starts a local HTTP API on port 9876. This is always off when the app launches and must be enabled manually. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window.
                   </small>
                   {settings.enableAgentControl && settings.agentControlToken && (
                     <div className="agent-control-details">
@@ -2162,7 +2241,7 @@ export function App() {
                         </div>
                       </label>
                       <small className="field-help">
-                        The server binds locally on 0.0.0.0:9876. Give the agent the Tailscale address and control token above.
+                        The server binds locally on 0.0.0.0:9876. Give the agent the Tailscale address and control token above. If the agent times out, open Tailscale Access controls and add a rule allowing the remote agent source to reach this local machine destination on tcp:9876.
                       </small>
                     </div>
                   )}
