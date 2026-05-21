@@ -2029,14 +2029,19 @@ function mediaSourceForResult(result: MediaResult) {
 const ResultCard = memo(function ResultCard({ result, onSave, onDelete, onEdit }: { result: MediaResult; onSave: () => void; onDelete: () => void; onEdit?: () => void }) {
   const modelLabel = resultModelLabel(result)
   const mediaSource = mediaSourceForResult(result)
+  const [useDataUrlPreview, setUseDataUrlPreview] = useState(false)
+  const imageSource = useDataUrlPreview ? result.dataUrl : mediaSource
 
   return (
     <article className="result-item">
       {result.mimeType.startsWith('image/') && (
         <img
-          src={mediaSource}
+          src={imageSource}
           alt={result.name}
           draggable
+          onError={() => {
+            if (!useDataUrlPreview && result.dataUrl) setUseDataUrlPreview(true)
+          }}
           onDragStart={(event) => {
             event.dataTransfer.setData('application/x-venice-image', result.dataUrl)
             event.dataTransfer.setData('text/plain', result.dataUrl)
