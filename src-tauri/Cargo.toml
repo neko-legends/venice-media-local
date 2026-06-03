@@ -1,12 +1,12 @@
 [package]
 name = "venice-media-local"
-version = "26.5.21"
+version = "26.6.3"
 description = "Local Venice media generation desktop app"
 authors = ["Neko Legends"]
 license = "MIT"
 repository = ""
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.77.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2.4.2"
 tokio = { version = "1", features = ["full"] }
 
 # For the AI Agent Remote Control HTTP API (gated behind the setting)

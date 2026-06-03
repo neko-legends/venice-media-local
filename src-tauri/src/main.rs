@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -2418,14 +2418,6 @@ fn save_settings(
             settings.agent_control_token = Some(generate_agent_control_token());
         }
 
-        if enable {
-            if let Some(token) = settings.agent_control_token.clone() {
-                if let Err(e) = write_agent_control_discovery(&app, &token) {
-                    eprintln!("[agent-control] Could not write discovery on toggle: {}", e);
-                }
-            }
-        }
-
         // Live start / stop when the user toggles in Settings (no restart needed)
         if enable && !was_enabled {
             if let Some(token) = settings.agent_control_token.clone() {
@@ -2452,7 +2444,6 @@ fn rotate_agent_control_token(
     if settings.enable_agent_control {
         stop_agent_control_server(&handle);
         if let Some(token) = settings.agent_control_token.clone() {
-            write_agent_control_discovery(&app, &token)?;
             start_agent_control_server(app.clone(), token, &handle)?;
         }
     }
@@ -3549,19 +3540,26 @@ fn start_agent_control_server(
         }
     }
 
-    // Write discovery file so the skill / other agents can find us automatically
-    if let Err(e) = write_agent_control_discovery(&app, &token) {
-        eprintln!("[agent-control] Could not write discovery file: {}", e);
-    }
-
     let addr: SocketAddr = format!("0.0.0.0:{AGENT_CONTROL_PORT}")
         .parse()
         .map_err(|error| format!("Invalid agent control bind address: {error}"))?;
-    let std_listener = StdTcpListener::bind(addr)
-        .map_err(|error| format!("Failed to bind agent control server on {addr}: {error}"))?;
+    let std_listener = StdTcpListener::bind(addr).map_err(|error| {
+        if error.kind() == ErrorKind::AddrInUse {
+            format!(
+                "AI Agent Remote Control is already running on {addr}. Close the other Venice Media Local window or disable AI Agent Control there, then try again."
+            )
+        } else {
+            format!("Failed to bind agent control server on {addr}: {error}")
+        }
+    })?;
     std_listener
         .set_nonblocking(true)
         .map_err(|error| format!("Failed to configure agent control listener: {error}"))?;
+
+    // Write discovery only after bind succeeds, so agents never pick up a dead token.
+    if let Err(e) = write_agent_control_discovery(&app, &token) {
+        eprintln!("[agent-control] Could not write discovery file: {}", e);
+    }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -3643,6 +3641,13 @@ fn stop_agent_control_server(handle: &AgentControlHandle) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AgentControlHandle::default())
         .setup(|app| {

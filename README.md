@@ -4,7 +4,9 @@ Venice Media Local is a fan-made desktop app for the Venice community. It lets y
 
 The purpose is simple: keep your API key and generated files on your machine, make heavy media sessions easier than a browser tab, and give users a privacy-minded cleanup path. Normal file deletion can leave recoverable traces for forensic tools, so this app has a burn folder workflow that overwrites/corrupts files before deleting them.
 
-This project is not affiliated with, endorsed by, or maintained by Venice. It is an independent community app built around Venice's API and aligned with the idea that users should control their own keys, files, and local workflow.
+This project is independent from Venice and is not affiliated with, endorsed by, or maintained by Venice. It is built around Venice's API for people who want direct control over their own keys, generated files, and local creative workflow.
+
+When enabled from Settings, **AI Agent Remote Control** lets trusted tools such as Codex, Claude Code, or other agents connect to Venice Media Local from the same machine or a trusted remote machine, inspect the app state, and drive media workflows on the user's behalf.
 
 ## Demo
 
@@ -23,6 +25,8 @@ Official GitHub releases may include an unsigned Windows installer and/or direct
 Platform note:
 
 This is a Tauri desktop app, so it is not Windows-only. Windows, macOS, and Linux users can build it from source. This repo may only provide Windows `.exe` builds in releases because that is the machine used to package and test official binaries right now. macOS and Linux users should ask their AI coding agent, or a developer friend, to install the local prerequisites and build the app on their own machine.
+
+Installed and portable Windows builds share the same app identity, settings, and local control API. Venice Media Local runs as a single instance, so launching the portable app while the installed app is already open brings the existing window forward instead of starting a second copy.
 
 Plain-English release path:
 
@@ -113,7 +117,7 @@ Venice Media Local can expose a local HTTP control API for trusted agents on the
 Agents should start by reading the discovery file on the Windows machine:
 
 ```text
-%APPDATA%\com.neko-legends.venice-media-local\control-api.json
+%APPDATA%\community.venice.media.local\control-api.json
 ```
 
 That file includes the Tailscale `address`, `port`, `token`, app `version`, and bind address. Use the token as a Bearer token:
