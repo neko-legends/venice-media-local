@@ -294,9 +294,9 @@ const fallbackModels: ModelCache = {
     baseModel('qwen-image-2-edit', 'Qwen Image 2 Edit', 'edit'),
   ],
   videoModels: [
-    baseModel('seedance-2-0-image-to-video', 'Seedance 2.0', 'video'),
-    baseModel('seedance-2-0-text-to-video', 'Seedance 2.0 Text', 'video'),
-    baseModel('wan-2-7-image-to-video', 'Wan 2.7', 'video'),
+    baseModel('seedance-2-0-image-to-video', 'Seedance 2.0 (I2V)', 'video'),
+    baseModel('seedance-2-0-text-to-video', 'Seedance 2.0 (T2V)', 'video'),
+    baseModel('wan-2-7-image-to-video', 'Wan 2.7 (I2V)', 'video'),
   ],
   musicModels: [
     baseModel('elevenlabs-music', 'ElevenLabs Music', 'music'),
@@ -626,6 +626,29 @@ function formatDate(value: string): string {
   return parsed.toLocaleString()
 }
 
+function videoModeSuffix(model: ModelRecord): string {
+  if (model.kind !== 'video') return ''
+  const controls = model.controls ?? {}
+  const haystack = [
+    model.id,
+    typeof controls.modelType === 'string' ? controls.modelType : '',
+  ].join(' ').toLowerCase()
+  if (haystack.includes('video-to-video')) return 'V2V'
+  if (haystack.includes('image-to-video')) return 'I2V'
+  if (haystack.includes('text-to-video')) return 'T2V'
+  if (controls.supportsSourceVideo === true) return 'V2V'
+  if (controls.supportsSourceImage === true) return 'I2V'
+  if (controls.supportsTextToVideo === true) return 'T2V'
+  return ''
+}
+
+function modelDisplayName(model: ModelRecord): string {
+  const name = (model.name || model.id).trim()
+  const suffix = videoModeSuffix(model)
+  if (!suffix || new RegExp(`\\(${suffix}\\)`, 'i').test(name)) return name
+  return `${name} (${suffix})`
+}
+
 function modelList(cache: ModelCache, overrides: Overrides, kind: ModelKind): ModelRecord[] {
   const hidden = new Set(overrides.hidden[kind] ?? [])
   const stock = cache[kindToCacheKey[kind]] ?? []
@@ -634,7 +657,7 @@ function modelList(cache: ModelCache, overrides: Overrides, kind: ModelKind): Mo
   for (const model of [...stock, ...custom]) {
     if (!hidden.has(model.id)) byId.set(model.id, model)
   }
-  return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name))
+  return Array.from(byId.values()).sort((a, b) => modelDisplayName(a).localeCompare(modelDisplayName(b)))
 }
 
 function sortModelsByRecent(models: ModelRecord[], recentIds: string[] = []): ModelRecord[] {
@@ -717,6 +740,13 @@ function controlArray(model: ModelRecord | undefined, key: string, fallback: str
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string') && value.length > 0
     ? value
     : fallback
+}
+
+function supportedControlArray(model: ModelRecord | undefined, key: string, fallback: string[]): string[] {
+  if (!model) return fallback
+  if (!Object.prototype.hasOwnProperty.call(model.controls ?? {}, key)) return fallback
+  const value = model.controls?.[key]
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : []
 }
 
 function controlBool(model: ModelRecord | undefined, key: string, fallback: boolean): boolean {
@@ -1449,9 +1479,12 @@ export function App() {
   const selectedImageResolution = imageResolutions.includes(imageResolution) ? imageResolution : ''
   const selectedEditAspectRatio = editRatios.includes(editAspectRatio) ? editAspectRatio : editRatios[0] ?? '1:1'
   const selectedEditResolution = editResolutions.includes(editResolution) ? editResolution : editResolutions[0] ?? ''
-  const videoDurations = controlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
-  const videoResolutions = controlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
-  const videoRatios = controlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
+  const videoDurations = supportedControlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
+  const videoResolutions = supportedControlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
+  const videoRatios = supportedControlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
+  const selectedVideoDuration = videoDurations.includes(videoDuration) ? videoDuration : videoDurations[0] ?? ''
+  const selectedVideoResolution = videoResolutions.includes(videoResolution) ? videoResolution : videoResolutions[0] ?? ''
+  const selectedVideoAspectRatio = videoRatios.includes(videoAspectRatio) ? videoAspectRatio : videoRatios[0] ?? ''
   const supportsMusicDuration = controlBool(currentMusicModel, 'supportsDurationSeconds', true)
   const supportsMusicLyrics = controlBool(currentMusicModel, 'supportsLyrics', true)
   const supportsMusicInstrumental = controlBool(currentMusicModel, 'supportsInstrumental', true)
@@ -2226,9 +2259,9 @@ export function App() {
       prompt,
       negativePrompt,
       sourceImage,
-      duration: videoDuration,
-      resolution: videoResolution,
-      aspectRatio: videoAspectRatio,
+      duration: selectedVideoDuration || undefined,
+      resolution: selectedVideoResolution || undefined,
+      aspectRatio: selectedVideoAspectRatio || undefined,
     }
 
     enqueueJob('video', 'Video generation', async () => {
@@ -2571,9 +2604,9 @@ export function App() {
                 <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
-                  <SelectField label="Duration" value={videoDuration} onChange={setVideoDuration} options={videoDurations} />
-                  <SelectField label="Resolution" value={videoResolution} onChange={setVideoResolution} options={videoResolutions} />
-                  <SelectField label="Aspect" value={videoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />
+                  {videoDurations.length > 0 && <SelectField label="Duration" value={selectedVideoDuration} onChange={setVideoDuration} options={videoDurations} />}
+                  {videoResolutions.length > 0 && <SelectField label="Resolution" value={selectedVideoResolution} onChange={setVideoResolution} options={videoResolutions} />}
+                  {videoRatios.length > 0 && <SelectField label="Aspect" value={selectedVideoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />}
                   <NumberField label="Concurrent" value={concurrency.video} min={1} max={12} step={1} onChange={(value) => updateConcurrency('video', value)} />
                 </div>
                 <QueueSummary label="Video queue" stats={jobStats.video} limit={concurrency.video} now={jobNow} />
@@ -3180,7 +3213,7 @@ function ModelSelect({
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {models.map((model) => (
           <option key={model.id} value={model.id}>
-            {model.name || model.id}{recentSet.has(model.id) ? ' (Recently Used)' : ''}
+            {modelDisplayName(model)}{recentSet.has(model.id) ? ' (Recently Used)' : ''}
           </option>
         ))}
       </select>
@@ -3517,7 +3550,7 @@ function ModelTable({
       {models.map((model) => (
         <div className="model-row" key={model.id}>
           <div>
-            <strong>{model.name}</strong>
+            <strong>{modelDisplayName(model)}</strong>
             <small>{model.id}</small>
           </div>
           <button className="icon-button danger" type="button" onClick={() => onHide(kind, model.id)} title="Remove model">

@@ -752,21 +752,21 @@ fn fallback_model_cache() -> ModelCache {
         video_models: vec![
             model(
                 "seedance-2-0-image-to-video",
-                "Seedance 2.0",
+                "Seedance 2.0 (I2V)",
                 "video",
                 "generate-video",
                 video_controls(),
             ),
             model(
                 "seedance-2-0-text-to-video",
-                "Seedance 2.0 Text",
+                "Seedance 2.0 (T2V)",
                 "video",
                 "generate-video",
                 video_controls(),
             ),
             model(
                 "wan-2-7-image-to-video",
-                "Wan 2.7",
+                "Wan 2.7 (I2V)",
                 "video",
                 "generate-video",
                 video_controls(),
@@ -1620,6 +1620,32 @@ fn normalized_model_id(entry: &Value) -> String {
     as_string(entry, "id")
 }
 
+fn video_mode_suffix(id: &str, name: &str, constraints: &Value) -> &'static str {
+    let model_type = as_string(constraints, "model_type");
+    let haystack = format!("{id} {name} {model_type}").to_lowercase();
+    if haystack.contains("video-to-video") {
+        "V2V"
+    } else if haystack.contains("image-to-video") {
+        "I2V"
+    } else if haystack.contains("text-to-video") {
+        "T2V"
+    } else {
+        ""
+    }
+}
+
+fn append_mode_suffix(name: &str, suffix: &str) -> String {
+    if suffix.is_empty()
+        || name
+            .to_lowercase()
+            .contains(&format!("({})", suffix.to_lowercase()))
+    {
+        name.to_string()
+    } else {
+        format!("{name} ({suffix})")
+    }
+}
+
 fn is_deprecated_or_offline(entry: &Value) -> bool {
     let spec = entry.get("model_spec").unwrap_or(&Value::Null);
     if spec
@@ -1716,23 +1742,29 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 raw: entry,
             })
         }
-        "video" => Some(ModelRecord {
-            id,
-            name,
-            kind: "video".to_string(),
-            modes: vec!["generate-video".to_string()],
-            controls: json!({
-                "durationOptions": string_array(constraints.get("durations")),
-                "resolutionOptions": string_array(constraints.get("resolutions")),
-                "aspectRatioOptions": string_array(constraints.get("aspect_ratios")),
-                "modelType": as_string(&constraints, "model_type"),
-                "supportsSourceImage": haystack.contains("image-to-video") || as_string(&constraints, "model_type") == "image-to-video",
-                "supportsTextToVideo": haystack.contains("text-to-video") || as_string(&constraints, "model_type") == "text-to-video",
-                "rawConstraints": constraints,
-                "rawCapabilities": capabilities
-            }),
-            raw: entry,
-        }),
+        "video" => {
+            let model_type = as_string(&constraints, "model_type");
+            let model_type_lower = model_type.to_lowercase();
+            let suffix = video_mode_suffix(&id, &name, &constraints);
+            Some(ModelRecord {
+                id,
+                name: append_mode_suffix(&name, suffix),
+                kind: "video".to_string(),
+                modes: vec!["generate-video".to_string()],
+                controls: json!({
+                    "durationOptions": string_array(constraints.get("durations")),
+                    "resolutionOptions": string_array(constraints.get("resolutions")),
+                    "aspectRatioOptions": string_array(constraints.get("aspect_ratios")),
+                    "modelType": model_type,
+                    "supportsSourceImage": haystack.contains("image-to-video") || model_type_lower == "image-to-video",
+                    "supportsSourceVideo": haystack.contains("video-to-video") || model_type_lower == "video-to-video",
+                    "supportsTextToVideo": haystack.contains("text-to-video") || model_type_lower == "text-to-video",
+                    "rawConstraints": constraints,
+                    "rawCapabilities": capabilities
+                }),
+                raw: entry,
+            })
+        }
         "music" => {
             let is_sfx = haystack.contains("sound effect")
                 || haystack.contains("sound-effects")
@@ -3244,10 +3276,31 @@ async fn multi_edit_image(
     .await
 }
 
+fn video_control_option_supported(controls: Option<&Value>, key: &str, value: &str) -> bool {
+    let Some(options) = controls.and_then(|controls| controls.get(key)) else {
+        return true;
+    };
+    let Some(items) = options.as_array() else {
+        return true;
+    };
+
+    items.iter().filter_map(Value::as_str).any(|option| option == value)
+}
+
 #[tauri::command]
-async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> {
+async fn queue_video(app: AppHandle, request: QueueMediaRequest) -> Result<QueueResult, String> {
+    queue_video_inner(&app, request).await
+}
+
+async fn queue_video_inner(app: &AppHandle, request: QueueMediaRequest) -> Result<QueueResult, String> {
+    let cached_controls = read_model_cache(app)
+        .video_models
+        .into_iter()
+        .find(|model| model.id == request.model)
+        .map(|model| model.controls);
+
     let mut body = json!({
-        "model": request.model,
+        "model": request.model.clone(),
         "prompt": request.prompt,
     });
     if let Some(value) = request
@@ -3260,23 +3313,38 @@ async fn queue_video(request: QueueMediaRequest) -> Result<QueueResult, String> 
         .source_image
         .filter(|value| !value.trim().is_empty())
     {
-        body["image"] = json!(value);
+        body["image_url"] = json!(value);
     }
     if let Some(value) = request
         .source_video
         .filter(|value| !value.trim().is_empty())
     {
-        body["video"] = json!(value);
+        body["video_url"] = json!(value);
     }
-    if let Some(value) = request.duration.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .duration
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| {
+            video_control_option_supported(cached_controls.as_ref(), "durationOptions", value)
+        })
+    {
         body["duration"] = json!(value);
     }
-    if let Some(value) = request.resolution.filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = request
+        .resolution
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| {
+            video_control_option_supported(cached_controls.as_ref(), "resolutionOptions", value)
+        })
+    {
         body["resolution"] = json!(value);
     }
     if let Some(value) = request
         .aspect_ratio
         .filter(|value| !value.trim().is_empty())
+        .filter(|value| {
+            video_control_option_supported(cached_controls.as_ref(), "aspectRatioOptions", value)
+        })
     {
         body["aspect_ratio"] = json!(value);
     }
@@ -3945,7 +4013,9 @@ async fn agent_queue_video(
     if should_agent_navigate(&payload) {
         emit_agent_navigate(&state.app, "video", "Remote video queue started");
     }
-    let queue = queue_video(payload.request).await.map_err(agent_error)?;
+    let queue = queue_video_inner(&state.app, payload.request)
+        .await
+        .map_err(agent_error)?;
     emit_agent_queue(&state.app, "video", &queue);
     Ok(Json(queue))
 }
