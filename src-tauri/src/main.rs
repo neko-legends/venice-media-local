@@ -982,7 +982,7 @@ fn audio_controls_with_support(
     supports_duration_seconds: bool,
 ) -> Value {
     let duration_max = if kind == "sfx" { 22 } else { 180 };
-    let duration_default = if kind == "sfx" { 7 } else { 30 };
+    let duration_default = if kind == "sfx" { 2 } else { 30 };
     json!({
         "audioKind": kind,
         "durationSeconds": { "min": 1, "max": duration_max, "default": duration_default },

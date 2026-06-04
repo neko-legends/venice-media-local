@@ -235,6 +235,8 @@ const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
 const STORAGE_RECENT_MODELS = 'veniceMediaLocal:recentModels:v1'
 const STORAGE_LAST_SAVE_DIR = 'veniceMediaLocal:lastSaveDir:v1'
 const STORAGE_THEME = 'veniceMediaLocal:theme:v1'
+const STORAGE_MUSIC_DURATION = 'veniceMediaLocal:musicDurationSeconds:v1'
+const STORAGE_SFX_DURATION = 'veniceMediaLocal:sfxDurationSeconds:v1'
 const EDIT_SOURCE_LIMIT = 3
 const MAX_RECENT_MODELS = 5
 const DIEM_POLL_MS = 3 * 60 * 1000
@@ -244,6 +246,8 @@ const VIDEO_RESOLUTION_OPTIONS = ['480p', '720p', '1080p']
 const VIDEO_ASPECT_OPTIONS = ['16:9', '9:16', '1:1']
 const VOICE_OPTIONS = ['am_eric', 'af_bella', 'af_nova']
 const EMPTY_OPTIONS: string[] = []
+const DEFAULT_MUSIC_DURATION_SECONDS = 30
+const DEFAULT_SFX_DURATION_SECONDS = 2
 const MAX_IMAGE_SEED = 999_999_999
 const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg,.mpg'
 const TRANSCRIBE_FILE_EXTENSION = /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg|mpg)$/i
@@ -518,6 +522,23 @@ function readLastSaveDir(): string {
 
 function writeLastSaveDir(value: string) {
   localStorage.setItem(STORAGE_LAST_SAVE_DIR, value)
+}
+
+function readStoredDuration(key: string, fallback: number): string {
+  try {
+    const value = localStorage.getItem(key)?.trim() ?? ''
+    return value && Number.isFinite(Number(value)) ? value : String(fallback)
+  } catch {
+    return String(fallback)
+  }
+}
+
+function writeStoredDuration(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // Local storage can be unavailable in preview or restricted environments.
+  }
 }
 
 function pathFileName(path: string): string {
@@ -1083,7 +1104,8 @@ export function App() {
   const [videoAspectRatio, setVideoAspectRatio] = useState('16:9')
 
   const [lyrics, setLyrics] = useState('')
-  const [audioDuration, setAudioDuration] = useState('30')
+  const [musicDuration, setMusicDuration] = useState(() => readStoredDuration(STORAGE_MUSIC_DURATION, DEFAULT_MUSIC_DURATION_SECONDS))
+  const [sfxDuration, setSfxDuration] = useState(() => readStoredDuration(STORAGE_SFX_DURATION, DEFAULT_SFX_DURATION_SECONDS))
   const [instrumental, setInstrumental] = useState(false)
   const [lyricsOptimizer, setLyricsOptimizer] = useState(false)
 
@@ -1409,8 +1431,8 @@ export function App() {
   const supportsMusicInstrumental = controlBool(currentMusicModel, 'supportsInstrumental', true)
   const supportsMusicLyricsOptimizer = controlBool(currentMusicModel, 'supportsLyricsOptimizer', true)
   const supportsSfxDuration = controlBool(currentSfxModel, 'supportsDurationSeconds', true)
-  const musicDurationBounds = durationBounds(currentMusicModel, { min: 1, max: 180, defaultValue: 30 })
-  const sfxDurationBounds = durationBounds(currentSfxModel, { min: 1, max: 22, defaultValue: 7 })
+  const musicDurationBounds = durationBounds(currentMusicModel, { min: 1, max: 180, defaultValue: DEFAULT_MUSIC_DURATION_SECONDS })
+  const sfxDurationBounds = durationBounds(currentSfxModel, { min: 1, max: 22, defaultValue: DEFAULT_SFX_DURATION_SECONDS })
   const voiceOptions = controlArray(currentVoiceModel, 'voices', VOICE_OPTIONS)
   const transcribeResponseFormats = controlArray(currentTranscribeModel, 'responseFormats', ['json', 'text'])
   const supportsTranscribeLanguage = controlBool(currentTranscribeModel, 'supportsLanguage', true)
@@ -1429,17 +1451,24 @@ export function App() {
   const diemTitle = diemRailTitle(diemSnapshot, keyConfigured)
 
   useEffect(() => {
-    if (mode !== 'music' && mode !== 'sfx') return
-    const bounds = mode === 'sfx' ? sfxDurationBounds : musicDurationBounds
-    setAudioDuration((existing) => {
-      const normalized = normalizeDurationInput(existing, bounds)
+    setMusicDuration((existing) => {
+      const normalized = normalizeDurationInput(existing, musicDurationBounds)
+      if (normalized !== existing) writeStoredDuration(STORAGE_MUSIC_DURATION, normalized)
       return normalized === existing ? existing : normalized
     })
   }, [
-    mode,
     musicDurationBounds.defaultValue,
     musicDurationBounds.max,
     musicDurationBounds.min,
+  ])
+
+  useEffect(() => {
+    setSfxDuration((existing) => {
+      const normalized = normalizeDurationInput(existing, sfxDurationBounds)
+      if (normalized !== existing) writeStoredDuration(STORAGE_SFX_DURATION, normalized)
+      return normalized === existing ? existing : normalized
+    })
+  }, [
     sfxDurationBounds.defaultValue,
     sfxDurationBounds.max,
     sfxDurationBounds.min,
@@ -2161,21 +2190,33 @@ export function App() {
     })
   }
 
+  function updateMusicDuration(value: string) {
+    setMusicDuration(value)
+    writeStoredDuration(STORAGE_MUSIC_DURATION, value)
+  }
+
+  function updateSfxDuration(value: string) {
+    setSfxDuration(value)
+    writeStoredDuration(STORAGE_SFX_DURATION, value)
+  }
+
   function queueAudio(event: FormEvent, kind: 'music' | 'sfx') {
     event.preventDefault()
     const model = kind === 'music' ? musicModel : sfxModel
     const supportsDuration = kind === 'music' ? supportsMusicDuration : supportsSfxDuration
     const durationLimits = kind === 'music' ? musicDurationBounds : sfxDurationBounds
+    const duration = kind === 'music' ? musicDuration : sfxDuration
     const useLyricsOptimizer = kind === 'music' && supportsMusicLyricsOptimizer && lyricsOptimizer
     const request: Record<string, string | boolean> = {
       model,
       prompt,
     }
-    if (supportsDuration && audioDuration.trim()) {
+    if (supportsDuration && duration.trim()) {
       try {
-        const durationSeconds = validateDurationInput(audioDuration, durationLimits, model)
+        const durationSeconds = validateDurationInput(duration, durationLimits, model)
         request.durationSeconds = durationSeconds
-        setAudioDuration(durationSeconds)
+        if (kind === 'music') updateMusicDuration(durationSeconds)
+        else updateSfxDuration(durationSeconds)
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
         setStatus('Needs attention')
@@ -2500,8 +2541,8 @@ export function App() {
                   {supportsMusicDuration && (
                     <TextField
                       label="Duration seconds"
-                      value={audioDuration}
-                      onChange={setAudioDuration}
+                      value={musicDuration}
+                      onChange={updateMusicDuration}
                       type="number"
                       min={musicDurationBounds.min}
                       max={musicDurationBounds.max}
@@ -2535,8 +2576,8 @@ export function App() {
                   {supportsSfxDuration && (
                     <TextField
                       label="Duration seconds"
-                      value={audioDuration}
-                      onChange={setAudioDuration}
+                      value={sfxDuration}
+                      onChange={updateSfxDuration}
                       type="number"
                       min={sfxDurationBounds.min}
                       max={sfxDurationBounds.max}
