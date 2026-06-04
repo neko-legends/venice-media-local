@@ -4526,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "venice-media-local"
-version = "2026.6.4"
+version = "26.6.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
