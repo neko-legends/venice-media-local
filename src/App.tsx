@@ -257,6 +257,7 @@ const EMPTY_OPTIONS: string[] = []
 const DEFAULT_MUSIC_DURATION_SECONDS = 30
 const DEFAULT_SFX_DURATION_SECONDS = 2
 const MAX_IMAGE_SEED = 999_999_999
+const MAX_VIDEO_VARIANTS = 8
 const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg,.mpg'
 const TRANSCRIBE_FILE_EXTENSION = /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg|mpg)$/i
 const JOB_KINDS: JobKind[] = ['image', 'edit', 'video', 'music', 'sfx', 'voice', 'transcribe']
@@ -463,6 +464,11 @@ function writeOverrides(value: Overrides) {
 function clampConcurrency(value: number): number {
   if (!Number.isFinite(value)) return 1
   return Math.min(12, Math.max(1, Math.trunc(value)))
+}
+
+function clampVariantCount(value: number, max: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.min(max, Math.max(1, Math.trunc(value)))
 }
 
 function readConcurrency(): JobConcurrency {
@@ -931,6 +937,27 @@ function createResultGroup(results: MediaResult[], title: string): ResultGroup {
   }
 }
 
+function mediaResultWithMetadata(result: MediaResult, metadata: Record<string, unknown>): MediaResult {
+  const existingMetadata = result.metadata && typeof result.metadata === 'object' && !Array.isArray(result.metadata)
+    ? result.metadata as Record<string, unknown>
+    : {}
+  return {
+    ...result,
+    metadata: {
+      ...existingMetadata,
+      ...metadata,
+    },
+  }
+}
+
+function resultVariantIndex(result: MediaResult): number {
+  const metadata = result.metadata && typeof result.metadata === 'object' && !Array.isArray(result.metadata)
+    ? result.metadata as Record<string, unknown>
+    : {}
+  const value = metadata.variantIndex
+  return typeof value === 'number' && Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER
+}
+
 function formatBuildVersion(version: string): string {
   const trimmed = version.trim()
   const match = trimmed.match(/^(\d{4})\.(\d{1,2})\.(\d{7,8})(?:\+(g[0-9a-f]+(?:\.dirty)?))?$/i)
@@ -1145,6 +1172,7 @@ export function App() {
   const [videoDuration, setVideoDuration] = useState('5s')
   const [videoResolution, setVideoResolution] = useState('720p')
   const [videoAspectRatio, setVideoAspectRatio] = useState('16:9')
+  const [videoVariants, setVideoVariants] = useState(1)
 
   const [lyrics, setLyrics] = useState('')
   const [musicDuration, setMusicDuration] = useState(() => readStoredDuration(STORAGE_MUSIC_DURATION, DEFAULT_MUSIC_DURATION_SECONDS))
@@ -2262,6 +2290,9 @@ export function App() {
 
   function queueVideo(event: FormEvent) {
     event.preventDefault()
+    const variantCount = clampVariantCount(videoVariants, MAX_VIDEO_VARIANTS)
+    const batchId = `video-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const batchTitle = variantCount > 1 ? `Videos · ${variantCount} variants` : 'Video'
     const request = {
       model: videoModel,
       prompt,
@@ -2272,13 +2303,30 @@ export function App() {
       aspectRatio: selectedVideoAspectRatio || undefined,
     }
 
-    enqueueJob('video', 'Video generation', async () => {
-      const startedAt = Date.now()
-      const queued = await call<QueueResult>('queue_video', { request })
-      rememberModelUse('video', request.model)
-      const result = await waitForQueuedMedia('video', queued, request.model)
-      setResultGroups((existing) => [createResultGroup([result], `Video · ${formatElapsed(Date.now() - startedAt)}`), ...existing])
-    })
+    for (let variantIndex = 1; variantIndex <= variantCount; variantIndex += 1) {
+      const label = variantCount > 1 ? `Video generation v${variantIndex}/${variantCount}` : 'Video generation'
+      enqueueJob('video', label, async () => {
+        const startedAt = Date.now()
+        const queued = await call<QueueResult>('queue_video', { request })
+        rememberModelUse('video', request.model)
+        const result = mediaResultWithMetadata(await waitForQueuedMedia('video', queued, request.model), {
+          variantIndex,
+          variantCount,
+        })
+        setResultGroups((existing) => {
+          const groupIndex = existing.findIndex((group) => group.id === batchId)
+          const title = `${batchTitle} · ${formatElapsed(Date.now() - startedAt)}`
+          if (groupIndex === -1) {
+            return [{ id: batchId, kind: result.kind, title, results: [result] }, ...existing]
+          }
+          return existing.map((group, index) => (
+            index === groupIndex
+              ? { ...group, title, results: [...group.results, result].sort((a, b) => resultVariantIndex(a) - resultVariantIndex(b)) }
+              : group
+          ))
+        })
+      })
+    }
   }
 
   function updateMusicDuration(value: string) {
@@ -2615,6 +2663,7 @@ export function App() {
                   {videoDurations.length > 0 && <SelectField label="Duration" value={selectedVideoDuration} onChange={setVideoDuration} options={videoDurations} />}
                   {videoResolutions.length > 0 && <SelectField label="Resolution" value={selectedVideoResolution} onChange={setVideoResolution} options={videoResolutions} />}
                   {videoRatios.length > 0 && <SelectField label="Aspect" value={selectedVideoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />}
+                  <NumberField label="Variants" value={videoVariants} min={1} max={MAX_VIDEO_VARIANTS} step={1} onChange={setVideoVariants} />
                   <NumberField label="Concurrent" value={concurrency.video} min={1} max={12} step={1} onChange={(value) => updateConcurrency('video', value)} />
                 </div>
                 <QueueSummary label="Video queue" stats={jobStats.video} limit={concurrency.video} now={jobNow} />
@@ -3129,13 +3178,13 @@ const ResultCard = memo(function ResultCard({
   const modelLabel = resultModelLabel(result)
   const mediaSource = mediaSourceForResult(result)
   const [useDataUrlPreview, setUseDataUrlPreview] = useState(false)
-  const imageSource = useDataUrlPreview ? result.dataUrl : mediaSource
+  const previewSource = useDataUrlPreview && result.dataUrl ? result.dataUrl : mediaSource
 
   return (
     <article className="result-item">
       {result.mimeType.startsWith('image/') && (
         <img
-          src={imageSource}
+          src={previewSource}
           alt={result.name}
           draggable
           onError={() => {
@@ -3149,7 +3198,16 @@ const ResultCard = memo(function ResultCard({
           }}
         />
       )}
-      {result.mimeType.startsWith('video/') && <video src={mediaSource} controls />}
+      {result.mimeType.startsWith('video/') && (
+        <video
+          src={previewSource}
+          controls
+          preload="metadata"
+          onError={() => {
+            if (!useDataUrlPreview && result.dataUrl) setUseDataUrlPreview(true)
+          }}
+        />
+      )}
       {result.mimeType.startsWith('audio/') && <audio src={mediaSource} controls />}
       {result.mimeType.startsWith('text/') && <pre className="transcript-preview">{result.text}</pre>}
       <div className="result-meta">

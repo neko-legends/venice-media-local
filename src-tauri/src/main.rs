@@ -1965,6 +1965,37 @@ fn extension_for_mime(mime: &str) -> &'static str {
     }
 }
 
+fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("video/webm");
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    None
+}
+
+fn effective_mime_type<'a>(declared: &'a str, bytes: &'a [u8]) -> &'a str {
+    let normalized = declared.trim();
+    if normalized.is_empty() || normalized == "application/octet-stream" || normalized == "binary/octet-stream" {
+        sniff_media_mime(bytes).unwrap_or("application/octet-stream")
+    } else {
+        normalized
+    }
+}
+
 fn mime_for_image_format(format: &str) -> &'static str {
     match format.trim().to_lowercase().as_str() {
         "png" => "image/png",
@@ -2053,6 +2084,7 @@ fn save_media_bytes(
     metadata: Value,
 ) -> Result<MediaResult, String> {
     let settings = read_settings(app);
+    let mime_type = effective_mime_type(mime_type, bytes);
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let stem = safe_stem(prompt);
     let ext = extension_for_mime(mime_type);
