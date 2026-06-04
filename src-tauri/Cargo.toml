@@ -1,6 +1,6 @@
 [package]
 name = "venice-media-local"
-version = "26.6.3"
+version = "2026.6.4"
 description = "Local Venice media generation desktop app"
 authors = ["Neko Legends"]
 license = "MIT"

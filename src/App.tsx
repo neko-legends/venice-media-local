@@ -2,6 +2,8 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
+  ChevronDown,
+  ChevronRight,
   Database,
   Download,
   Eraser,
@@ -14,6 +16,7 @@ import {
   Maximize2,
   Mic2,
   Music,
+  Play,
   Plus,
   RefreshCw,
   Scissors,
@@ -26,6 +29,10 @@ import {
 import type { LucideIcon } from 'lucide-react'
 import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEvent, ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
 
+const APP_ICON_URL = '/app-icon.png'
+const APP_BOOT_STARTED_AT = typeof performance !== 'undefined' ? performance.now() : 0
+const MIN_STARTUP_SPLASH_MS = 700
+
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
 type ThemeId = 'eva-dark' | 'pearl-white' | 'abyss-teal' | 'ember' | 'mosswood' | 'rose-noir'
@@ -37,6 +44,12 @@ type ModelRecord = {
   modes: string[]
   controls: Record<string, unknown>
   raw?: unknown
+}
+
+type DurationBounds = {
+  min: number
+  max: number
+  defaultValue: number
 }
 
 type ModelCache = {
@@ -64,6 +77,45 @@ type AppState = {
   models: ModelCache
   buildVersion: string
   agentControlAddress: string
+  startupTimings?: BackendStartupTimings
+}
+
+type StartupTimingEntry = {
+  name: string
+  ms: number
+}
+
+type BackendStartupTimings = {
+  setupSections: StartupTimingEntry[]
+  appStateSections: StartupTimingEntry[]
+  appStateTotalMs: number
+}
+
+type StartupTimingSummary = {
+  frontendTotalMs: number
+  appStateRequestMs: number
+  backend?: BackendStartupTimings
+}
+
+type UpdateAsset = {
+  name: string
+  url: string
+  size?: number
+}
+
+type UpdateTarget = 'windowsSetup' | 'windowsPortable' | 'releasePage'
+
+type UpdateCheckResult = {
+  checkedAt: string
+  currentVersion: string
+  latestVersion: string
+  updateAvailable: boolean
+  releaseName: string
+  releaseUrl: string
+  setupAsset?: UpdateAsset
+  portableAsset?: UpdateAsset
+  recommendedAsset?: UpdateAsset
+  updateTarget: UpdateTarget
 }
 
 type MediaResult = {
@@ -182,6 +234,7 @@ const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
 const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
 const STORAGE_RECENT_MODELS = 'veniceMediaLocal:recentModels:v1'
 const STORAGE_LAST_SAVE_DIR = 'veniceMediaLocal:lastSaveDir:v1'
+const STORAGE_THEME = 'veniceMediaLocal:theme:v1'
 const EDIT_SOURCE_LIMIT = 3
 const MAX_RECENT_MODELS = 5
 const DIEM_POLL_MS = 3 * 60 * 1000
@@ -285,6 +338,79 @@ const themes: Array<{ id: ThemeId; name: string; colors: string[] }> = [
   { id: 'mosswood', name: 'Mosswood', colors: ['#233028', '#18201b', '#4cc38a'] },
   { id: 'rose-noir', name: 'Rose Noir', colors: ['#322629', '#21191b', '#e07383'] },
 ]
+
+const themeIds = themes.map((theme) => theme.id)
+
+function isThemeId(value: unknown): value is ThemeId {
+  return typeof value === 'string' && themeIds.includes(value as ThemeId)
+}
+
+function readStoredTheme(): ThemeId {
+  try {
+    const value = localStorage.getItem(STORAGE_THEME)
+    return isThemeId(value) ? value : 'eva-dark'
+  } catch {
+    return 'eva-dark'
+  }
+}
+
+function writeStoredTheme(theme: ThemeId) {
+  localStorage.setItem(STORAGE_THEME, theme)
+}
+
+function applyTheme(theme: ThemeId) {
+  const classes = themeIds.map((id) => `theme-${id}`)
+  document.documentElement.classList.remove(...classes)
+  document.documentElement.classList.add(`theme-${theme}`)
+  if (document.body) {
+    document.body.classList.remove(...classes)
+    document.body.classList.add(`theme-${theme}`)
+  }
+}
+
+function roundMs(value: number): number {
+  return Math.max(0, Math.round(value))
+}
+
+function slowestStartupSection(summary: StartupTimingSummary): StartupTimingEntry | null {
+  const sections = [
+    ...(summary.backend?.setupSections ?? []).map((entry) => ({ ...entry, name: `setup:${entry.name}` })),
+    ...(summary.backend?.appStateSections ?? []).map((entry) => ({ ...entry, name: `state:${entry.name}` })),
+    { name: 'frontend:get_app_state request', ms: summary.appStateRequestMs },
+  ]
+  return sections.reduce<StartupTimingEntry | null>((slowest, entry) => (
+    !slowest || entry.ms > slowest.ms ? entry : slowest
+  ), null)
+}
+
+function formatStartupTimingStatus(summary: StartupTimingSummary): string {
+  const slowest = slowestStartupSection(summary)
+  const backendMs = summary.backend?.appStateTotalMs ?? 0
+  const slowestLabel = slowest ? ` · slowest ${slowest.name} ${roundMs(slowest.ms)}ms` : ''
+  return `Ready · startup ${roundMs(summary.frontendTotalMs)}ms · backend ${roundMs(backendMs)}ms${slowestLabel}`
+}
+
+function logStartupTimings(summary: StartupTimingSummary) {
+  const rows = [
+    { section: 'frontend:total until UI ready', ms: roundMs(summary.frontendTotalMs) },
+    { section: 'frontend:get_app_state request', ms: roundMs(summary.appStateRequestMs) },
+    ...(summary.backend?.setupSections ?? []).map((entry) => ({ section: `setup:${entry.name}`, ms: roundMs(entry.ms) })),
+    ...(summary.backend?.appStateSections ?? []).map((entry) => ({ section: `state:${entry.name}`, ms: roundMs(entry.ms) })),
+    { section: 'state:backend total', ms: roundMs(summary.backend?.appStateTotalMs ?? 0) },
+  ]
+  console.table(rows)
+}
+
+function startupTimingRows(summary: StartupTimingSummary | null): Array<{ section: string; ms: number }> {
+  if (!summary) return []
+  return [
+    { section: 'Total until UI ready', ms: roundMs(summary.frontendTotalMs) },
+    { section: 'Frontend app-state request', ms: roundMs(summary.appStateRequestMs) },
+    ...(summary.backend?.setupSections ?? []).map((entry) => ({ section: `Setup: ${entry.name}`, ms: roundMs(entry.ms) })),
+    ...(summary.backend?.appStateSections ?? []).map((entry) => ({ section: `State: ${entry.name}`, ms: roundMs(entry.ms) })),
+    { section: 'Backend app-state total', ms: roundMs(summary.backend?.appStateTotalMs ?? 0) },
+  ]
+}
 
 type ModelCacheListKey = Exclude<keyof ModelCache, 'lastFetched'>
 
@@ -460,6 +586,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
+function waitForNextFrame(): Promise<void> {
+  return new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())))
+}
+
 function formatDate(value: string): string {
   if (!value) return 'Never'
   const parsed = new Date(value)
@@ -565,6 +695,45 @@ function controlBool(model: ModelRecord | undefined, key: string, fallback: bool
   return typeof value === 'boolean' ? value : fallback
 }
 
+function durationControlNumber(model: ModelRecord | undefined, key: string, fallback: number): number {
+  const duration = model?.controls?.durationSeconds
+  const value = duration && typeof duration === 'object'
+    ? numberFromValue((duration as Record<string, unknown>)[key])
+    : null
+  return value === null ? fallback : value
+}
+
+function durationBounds(model: ModelRecord | undefined, fallback: DurationBounds): DurationBounds {
+  const min = durationControlNumber(model, 'min', fallback.min)
+  const max = durationControlNumber(model, 'max', fallback.max)
+  const defaultValue = durationControlNumber(model, 'default', fallback.defaultValue)
+  return {
+    min,
+    max: Math.max(min, max),
+    defaultValue: Math.min(Math.max(defaultValue, min), Math.max(min, max)),
+  }
+}
+
+function formatDurationInput(value: number): string {
+  return String(value)
+}
+
+function normalizeDurationInput(value: string, bounds: DurationBounds): string {
+  const parsed = Number(value)
+  const candidate = Number.isFinite(parsed) ? parsed : bounds.defaultValue
+  return formatDurationInput(Math.min(bounds.max, Math.max(bounds.min, candidate)))
+}
+
+function validateDurationInput(value: string, bounds: DurationBounds, model: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  const parsed = Number(trimmed)
+  if (!Number.isFinite(parsed)) throw new Error('Duration seconds must be a number')
+  if (parsed < bounds.min) throw new Error(`Duration seconds must be at least ${formatDurationInput(bounds.min)} for ${model}`)
+  if (parsed > bounds.max) throw new Error(`Duration seconds must be ${formatDurationInput(bounds.max)} or less for ${model}`)
+  return formatDurationInput(parsed)
+}
+
 function formatFileSize(bytes: number): string {
   return formatByteCount(bytes)
 }
@@ -573,6 +742,32 @@ function formatByteCount(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return ''
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function updateTargetLabel(target?: UpdateTarget): string {
+  switch (target) {
+    case 'windowsSetup':
+      return 'Installed Windows app'
+    case 'windowsPortable':
+      return 'Portable Windows app'
+    case 'releasePage':
+      return 'GitHub release page'
+    default:
+      return 'Update source'
+  }
+}
+
+function updateDownloadLabel(result: UpdateCheckResult): string {
+  if (!result.recommendedAsset) return 'Release'
+  if (result.updateTarget === 'windowsSetup') return 'Download setup'
+  if (result.updateTarget === 'windowsPortable') return 'Download portable'
+  return 'Download'
+}
+
+function updateRunLabel(result: UpdateCheckResult): string {
+  if (result.updateTarget === 'windowsSetup') return 'Run setup'
+  if (result.updateTarget === 'windowsPortable') return 'Open portable'
+  return 'Open update'
 }
 
 function formatElapsed(ms: number): string {
@@ -770,10 +965,45 @@ function formatBurnSeed(seed: bigint): string {
   return `0x${(seed & BURN_SEED_MASK).toString(16).padStart(16, '0')}`
 }
 
+function StartupSplash() {
+  return (
+    <div className="startup-splash" role="status" aria-live="polite">
+      <div className="startup-splash-inner">
+        <img src={APP_ICON_URL} alt="" decoding="sync" loading="eager" />
+        <strong>Venice Media Local</strong>
+        <span>
+          <Loader2 className="spin" size={14} />
+          Loading...
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function AgentControlBusyModal({ message }: { message: string }) {
+  return (
+    <div className="busy-modal-backdrop" role="status" aria-live="polite" aria-label={message}>
+      <div className="busy-modal">
+        <Loader2 className="spin" size={28} />
+        <strong>{message}</strong>
+        <span>This can take a moment.</span>
+      </div>
+    </div>
+  )
+}
+
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
-  const [settings, setSettings] = useState<AppSettings>({ theme: 'eva-dark', outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlToken: undefined })
+  const [settings, setSettings] = useState<AppSettings>({ theme: readStoredTheme(), outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlToken: undefined })
+  const [startupReady, setStartupReady] = useState(false)
+  const [startupTimingSummary, setStartupTimingSummary] = useState<StartupTimingSummary | null>(null)
+  const [showStartupTimingDetails, setShowStartupTimingDetails] = useState(false)
+  const updateCheckStartedRef = useRef(false)
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(null)
+  const [updateChecking, setUpdateChecking] = useState(false)
+  const [updateError, setUpdateError] = useState('')
+  const [downloadedInstallerPath, setDownloadedInstallerPath] = useState('')
   const [keyConfigured, setKeyConfigured] = useState(false)
   const [buildVersion, setBuildVersion] = useState('')
   const [agentControlAddress, setAgentControlAddress] = useState('')
@@ -785,6 +1015,7 @@ export function App() {
   const [error, setError] = useState('')
   const [tooltip, setTooltip] = useState('')
   const [loading, setLoading] = useState(false)
+  const [agentControlBusyMessage, setAgentControlBusyMessage] = useState('')
   const [actionStartedAt, setActionStartedAt] = useState<number | null>(null)
   const [elapsedMs, setElapsedMs] = useState(0)
   const [lastActionMs, setLastActionMs] = useState<number | null>(null)
@@ -906,22 +1137,64 @@ export function App() {
   }
 
   useEffect(() => {
+    let disposed = false
+    let readyTimer: number | null = null
+    function finishStartup(endedAt: number) {
+      const remainingMs = Math.max(0, MIN_STARTUP_SPLASH_MS - (endedAt - APP_BOOT_STARTED_AT))
+      if (remainingMs > 0) {
+        readyTimer = window.setTimeout(() => {
+          if (!disposed) setStartupReady(true)
+        }, remainingMs)
+      } else {
+        setStartupReady(true)
+      }
+    }
+
+    const appStateRequestStartedAt = performance.now()
     call<AppState>('get_app_state')
       .then((state) => {
+        if (disposed) return
+        const appStateRequestEndedAt = performance.now()
+        const theme = isThemeId(state.settings.theme) ? state.settings.theme : 'eva-dark'
+        const summary: StartupTimingSummary = {
+          frontendTotalMs: appStateRequestEndedAt - APP_BOOT_STARTED_AT,
+          appStateRequestMs: appStateRequestEndedAt - appStateRequestStartedAt,
+          backend: state.startupTimings,
+        }
         setSettings({
           ...state.settings,
+          theme,
           showDiemBalance: Boolean(state.settings.showDiemBalance),
           enableAgentControl: Boolean(state.settings.enableAgentControl || false),
         })
-        setKeyConfigured(state.keyConfigured)
+        applyTheme(theme)
+        writeStoredTheme(theme)
         setModels(state.models)
         setBuildVersion(state.buildVersion)
         setAgentControlAddress(state.agentControlAddress)
+        setStartupTimingSummary(summary)
+        setStatus(formatStartupTimingStatus(summary))
+        logStartupTimings(summary)
+        finishStartup(appStateRequestEndedAt)
       })
       .catch(() => {
+        if (disposed) return
+        const appStateRequestEndedAt = performance.now()
+        const summary: StartupTimingSummary = {
+          frontendTotalMs: appStateRequestEndedAt - APP_BOOT_STARTED_AT,
+          appStateRequestMs: appStateRequestEndedAt - appStateRequestStartedAt,
+        }
         setLastActionMs(null)
         setStatus('Preview mode')
+        setStartupTimingSummary(summary)
+        logStartupTimings(summary)
+        finishStartup(appStateRequestEndedAt)
       })
+
+    return () => {
+      disposed = true
+      if (readyTimer !== null) window.clearTimeout(readyTimer)
+    }
   }, [])
 
   useEffect(() => {
@@ -1019,6 +1292,15 @@ export function App() {
   }, [])
 
   useEffect(() => {
+    if (!startupReady || updateCheckStartedRef.current) return
+    updateCheckStartedRef.current = true
+    call<boolean>('get_key_configured')
+      .then(setKeyConfigured)
+      .catch(() => setKeyConfigured(false))
+    void checkForUpdates(false)
+  }, [startupReady])
+
+  useEffect(() => {
     modeRef.current = mode
   }, [mode])
 
@@ -1040,10 +1322,6 @@ export function App() {
       }
     }
   }, [])
-
-  useEffect(() => {
-    document.body.className = `theme-${settings.theme}`
-  }, [settings.theme])
 
   useEffect(() => {
     if (!settings.showDiemBalance || !keyConfigured) {
@@ -1131,6 +1409,8 @@ export function App() {
   const supportsMusicInstrumental = controlBool(currentMusicModel, 'supportsInstrumental', true)
   const supportsMusicLyricsOptimizer = controlBool(currentMusicModel, 'supportsLyricsOptimizer', true)
   const supportsSfxDuration = controlBool(currentSfxModel, 'supportsDurationSeconds', true)
+  const musicDurationBounds = durationBounds(currentMusicModel, { min: 1, max: 180, defaultValue: 30 })
+  const sfxDurationBounds = durationBounds(currentSfxModel, { min: 1, max: 22, defaultValue: 7 })
   const voiceOptions = controlArray(currentVoiceModel, 'voices', VOICE_OPTIONS)
   const transcribeResponseFormats = controlArray(currentTranscribeModel, 'responseFormats', ['json', 'text'])
   const supportsTranscribeLanguage = controlBool(currentTranscribeModel, 'supportsLanguage', true)
@@ -1147,6 +1427,23 @@ export function App() {
   const jobNow = jobClock || Date.now()
   const diemLabel = diemRailLabel(diemSnapshot, diemRefreshing, keyConfigured)
   const diemTitle = diemRailTitle(diemSnapshot, keyConfigured)
+
+  useEffect(() => {
+    if (mode !== 'music' && mode !== 'sfx') return
+    const bounds = mode === 'sfx' ? sfxDurationBounds : musicDurationBounds
+    setAudioDuration((existing) => {
+      const normalized = normalizeDurationInput(existing, bounds)
+      return normalized === existing ? existing : normalized
+    })
+  }, [
+    mode,
+    musicDurationBounds.defaultValue,
+    musicDurationBounds.max,
+    musicDurationBounds.min,
+    sfxDurationBounds.defaultValue,
+    sfxDurationBounds.max,
+    sfxDurationBounds.min,
+  ])
 
   useEffect(() => {
     if (runningJobCount === 0 && remoteQueues.length === 0) return
@@ -1338,8 +1635,69 @@ export function App() {
     if (cache) setModels(cache)
   }
 
-  async function persistSettings(next: AppSettings) {
+  async function checkForUpdates(manual = false) {
+    setUpdateChecking(true)
+    setUpdateError('')
+    try {
+      const result = await call<UpdateCheckResult>('check_for_update')
+      setUpdateCheck(result)
+      setDownloadedInstallerPath('')
+      if (result.updateAvailable) {
+        setStatus(`Update ${result.latestVersion} available`)
+      } else if (manual) {
+        setStatus('Already up to date')
+        setLastActionMs(null)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setUpdateError(message)
+      if (manual) {
+        setError(message)
+        setStatus('Needs attention')
+        setLastActionMs(null)
+      }
+    } finally {
+      setUpdateChecking(false)
+    }
+  }
+
+  async function openUpdateRelease() {
+    if (!updateCheck?.releaseUrl) return
+    await runAction('Opening release', () => call<boolean>('open_update_release', { url: updateCheck.releaseUrl }))
+  }
+
+  async function downloadUpdateInstaller() {
+    const asset = updateCheck?.recommendedAsset ?? updateCheck?.setupAsset ?? updateCheck?.portableAsset
+    if (!asset) return
+    const path = await runAction('Downloading update', () => call<string>('download_update_installer', { asset }))
+    if (path) {
+      setDownloadedInstallerPath(path)
+      setStatus('Update downloaded')
+      setLastActionMs(null)
+    }
+  }
+
+  async function runDownloadedInstaller() {
+    if (!downloadedInstallerPath) return
+    await runAction('Starting installer', () => call<boolean>('run_update_installer', { path: downloadedInstallerPath }))
+  }
+
+  async function refreshAgentControlAddress() {
+    try {
+      const address = await call<string>('get_agent_control_address')
+      setAgentControlAddress(address)
+    } catch {
+      setAgentControlAddress('0.0.0.0:9876')
+    }
+  }
+
+  async function persistSettings(next: AppSettings): Promise<AppSettings | null> {
     const previous = settings
+    const isAgentControlToggle = next.enableAgentControl !== previous.enableAgentControl
+    if (isAgentControlToggle) {
+      setAgentControlBusyMessage(next.enableAgentControl ? 'Enabling Agent Control...' : 'Disabling Agent Control...')
+      await waitForNextFrame()
+    }
     setSettings(next)
     const saved = await call<AppSettings>('save_settings', { request: next }).catch((err) => {
       setSettings(previous)
@@ -1355,10 +1713,23 @@ export function App() {
         enableAgentControl: Boolean(saved.enableAgentControl),
       })
       if (saved.enableAgentControl) {
-        call<AppState>('get_app_state')
-          .then((state) => setAgentControlAddress(state.agentControlAddress))
-          .catch(() => setAgentControlAddress('0.0.0.0:9876'))
+        await refreshAgentControlAddress()
       }
+    }
+    if (isAgentControlToggle) {
+      setAgentControlBusyMessage('')
+    }
+    return saved
+  }
+
+  async function chooseTheme(theme: ThemeId) {
+    const previousTheme = settings.theme
+    applyTheme(theme)
+    writeStoredTheme(theme)
+    const saved = await persistSettings({ ...settings, theme })
+    if (!saved && isThemeId(previousTheme)) {
+      applyTheme(previousTheme)
+      writeStoredTheme(previousTheme)
     }
   }
 
@@ -1372,20 +1743,24 @@ export function App() {
     const confirmed = window.confirm('Rotate the Agent Control token? Any remote agents using the old token will need the new one.')
     if (!confirmed) return
 
-    const saved = await runAction('Rotating token', () => call<AppSettings>('rotate_agent_control_token'))
-    if (saved) {
-      setSettings({
-        ...saved,
-        showDiemBalance: Boolean(saved.showDiemBalance),
-        enableAgentControl: Boolean(saved.enableAgentControl),
-      })
-      if (saved.enableAgentControl) {
-        call<AppState>('get_app_state')
-          .then((state) => setAgentControlAddress(state.agentControlAddress))
-          .catch(() => setAgentControlAddress('0.0.0.0:9876'))
+    setAgentControlBusyMessage('Rotating Agent Control token...')
+    await waitForNextFrame()
+    try {
+      const saved = await runAction('Rotating token', () => call<AppSettings>('rotate_agent_control_token'))
+      if (saved) {
+        setSettings({
+          ...saved,
+          showDiemBalance: Boolean(saved.showDiemBalance),
+          enableAgentControl: Boolean(saved.enableAgentControl),
+        })
+        if (saved.enableAgentControl) {
+          await refreshAgentControlAddress()
+        }
+        setStatus('Agent Control token rotated')
+        setLastActionMs(null)
       }
-      setStatus('Agent Control token rotated')
-      setLastActionMs(null)
+    } finally {
+      setAgentControlBusyMessage('')
     }
   }
 
@@ -1790,12 +2165,24 @@ export function App() {
     event.preventDefault()
     const model = kind === 'music' ? musicModel : sfxModel
     const supportsDuration = kind === 'music' ? supportsMusicDuration : supportsSfxDuration
+    const durationLimits = kind === 'music' ? musicDurationBounds : sfxDurationBounds
     const useLyricsOptimizer = kind === 'music' && supportsMusicLyricsOptimizer && lyricsOptimizer
     const request: Record<string, string | boolean> = {
       model,
       prompt,
     }
-    if (supportsDuration && audioDuration.trim()) request.durationSeconds = audioDuration.trim()
+    if (supportsDuration && audioDuration.trim()) {
+      try {
+        const durationSeconds = validateDurationInput(audioDuration, durationLimits, model)
+        request.durationSeconds = durationSeconds
+        setAudioDuration(durationSeconds)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        setStatus('Needs attention')
+        setLastActionMs(null)
+        return
+      }
+    }
     if (kind === 'music' && supportsMusicLyrics && lyrics.trim() && !useLyricsOptimizer) request.lyricsPrompt = lyrics.trim()
     if (kind === 'music' && supportsMusicInstrumental && instrumental) request.forceInstrumental = true
     if (useLyricsOptimizer) request.lyricsOptimizer = true
@@ -1892,6 +2279,10 @@ export function App() {
     }
     setOverrides(next)
     writeOverrides(next)
+  }
+
+  if (!startupReady) {
+    return <StartupSplash />
   }
 
   return (
@@ -2106,7 +2497,17 @@ export function App() {
                 {supportsMusicLyrics && !supportsMusicLyricsOptimizer && <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />}
                 {supportsMusicLyrics && supportsMusicLyricsOptimizer && !lyricsOptimizer && <PromptArea label="Lyrics" value={lyrics} onChange={setLyrics} rows={4} />}
                 <div className="control-grid">
-                  {supportsMusicDuration && <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />}
+                  {supportsMusicDuration && (
+                    <TextField
+                      label="Duration seconds"
+                      value={audioDuration}
+                      onChange={setAudioDuration}
+                      type="number"
+                      min={musicDurationBounds.min}
+                      max={musicDurationBounds.max}
+                      step={1}
+                    />
+                  )}
                   <NumberField label="Concurrent" value={concurrency.music} min={1} max={12} step={1} onChange={(value) => updateConcurrency('music', value)} />
                 </div>
                 {supportsMusicInstrumental && (
@@ -2131,7 +2532,17 @@ export function App() {
                 <ModelSelect label="Model" value={sfxModel} onChange={setSfxModel} models={sfxModels} recentModelIds={recentModels.sfx} />
                 <PromptArea value={prompt} onChange={setPrompt} />
                 <div className="control-grid">
-                  {supportsSfxDuration && <TextField label="Duration seconds" value={audioDuration} onChange={setAudioDuration} />}
+                  {supportsSfxDuration && (
+                    <TextField
+                      label="Duration seconds"
+                      value={audioDuration}
+                      onChange={setAudioDuration}
+                      type="number"
+                      min={sfxDurationBounds.min}
+                      max={sfxDurationBounds.max}
+                      step={1}
+                    />
+                  )}
                   <NumberField label="Concurrent" value={concurrency.sfx} min={1} max={12} step={1} onChange={(value) => updateConcurrency('sfx', value)} />
                 </div>
                 <QueueSummary label="SFX queue" stats={jobStats.sfx} limit={concurrency.sfx} now={jobNow} />
@@ -2233,7 +2644,7 @@ export function App() {
                         type="button"
                         key={theme.id}
                         className={classNames('theme-button', settings.theme === theme.id && 'active')}
-                        onClick={() => persistSettings({ ...settings, theme: theme.id })}
+                        onClick={() => chooseTheme(theme.id)}
                       >
                         <span className="swatches">
                           {theme.colors.map((color) => <span key={color} style={{ background: color }} />)}
@@ -2243,6 +2654,106 @@ export function App() {
                     ))}
                   </div>
                 </div>
+
+                <div className="settings-block">
+                  <div className="inline-header">
+                    <h2>Updates</h2>
+                    <button className="secondary-action" type="button" onClick={() => checkForUpdates(true)} disabled={updateChecking}>
+                      <RefreshCw className={classNames(updateChecking && 'spin')} size={16} />
+                      Check
+                    </button>
+                  </div>
+                  <div className="update-panel">
+                    <div>
+                      <strong>
+                        {updateCheck
+                          ? updateCheck.updateAvailable
+                            ? `Version ${updateCheck.latestVersion} available`
+                            : 'Up to date'
+                          : updateChecking
+                            ? 'Checking for updates'
+                            : 'Not checked yet'}
+                      </strong>
+                      <small>
+                        Current {buildVersion || 'unknown'}
+                        {updateCheck?.checkedAt ? ` · Checked ${formatDate(updateCheck.checkedAt)}` : ''}
+                      </small>
+                      {updateCheck && (
+                        <small>
+                          {updateTargetLabel(updateCheck.updateTarget)}
+                          {updateCheck.recommendedAsset ? ` · ${updateCheck.recommendedAsset.name}` : ' · opens the GitHub release page'}
+                        </small>
+                      )}
+                      {updateError && <small className="error-text">{updateError}</small>}
+                    </div>
+                    {updateCheck?.updateAvailable && (
+                      <div className="update-actions">
+                        {updateCheck.recommendedAsset ? (
+                          <button className="secondary-action" type="button" onClick={downloadUpdateInstaller} disabled={loading}>
+                            <Download size={16} />
+                            {updateDownloadLabel(updateCheck)}
+                          </button>
+                        ) : (
+                          <button className="secondary-action" type="button" onClick={openUpdateRelease}>
+                            <Maximize2 size={16} />
+                            Release
+                          </button>
+                        )}
+                        {updateCheck.recommendedAsset && (
+                          <button className="secondary-action" type="button" onClick={openUpdateRelease}>
+                            <Maximize2 size={16} />
+                            Release
+                          </button>
+                        )}
+                        {downloadedInstallerPath && (
+                          <button className="secondary-action" type="button" onClick={runDownloadedInstaller}>
+                            <Play size={16} />
+                            {updateRunLabel(updateCheck)}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {updateCheck?.recommendedAsset && (
+                      <small className="field-help">
+                        Selected: {updateCheck.recommendedAsset.name}
+                        {updateCheck.recommendedAsset.size ? ` · ${formatByteCount(updateCheck.recommendedAsset.size)}` : ''}
+                      </small>
+                    )}
+                  </div>
+                </div>
+
+                {startupTimingSummary && (
+                  <div className="settings-block">
+                    <div className="inline-header">
+                      <div className="startup-summary">
+                        <h2>Startup</h2>
+                        <small>
+                          Ready in {roundMs(startupTimingSummary.frontendTotalMs).toLocaleString()} ms
+                          {startupTimingSummary.backend ? ` · backend ${roundMs(startupTimingSummary.backend.appStateTotalMs).toLocaleString()} ms` : ''}
+                        </small>
+                      </div>
+                      <button
+                        className="icon-button"
+                        type="button"
+                        title={showStartupTimingDetails ? 'Hide startup details' : 'Show startup details'}
+                        aria-expanded={showStartupTimingDetails}
+                        onClick={() => setShowStartupTimingDetails((value) => !value)}
+                      >
+                        {showStartupTimingDetails ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+                      </button>
+                    </div>
+                    {showStartupTimingDetails && (
+                      <div className="startup-timings">
+                        {startupTimingRows(startupTimingSummary).map((entry) => (
+                          <div key={entry.section}>
+                            <span>{entry.section}</span>
+                            <strong>{entry.ms.toLocaleString()} ms</strong>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div className="settings-block">
                   <h2>Output</h2>
@@ -2277,6 +2788,7 @@ export function App() {
                     <input
                       type="checkbox"
                       checked={settings.enableAgentControl}
+                      disabled={Boolean(agentControlBusyMessage)}
                       onChange={(event) => persistSettings({ ...settings, enableAgentControl: event.target.checked })}
                     />
                     <span>Enable AI Agent Remote Control</span>
@@ -2306,6 +2818,7 @@ export function App() {
                             type="button"
                             className="agent-copy-button agent-rotate-button"
                             onClick={rotateAgentControlToken}
+                            disabled={Boolean(agentControlBusyMessage)}
                             title="Rotate token"
                           >
                             Rotate
@@ -2428,6 +2941,8 @@ export function App() {
           </aside>
         </section>
       </main>
+
+      {agentControlBusyMessage && <AgentControlBusyModal message={agentControlBusyMessage} />}
     </div>
   )
 }
@@ -2638,15 +3153,23 @@ function TextField({
   label,
   value,
   onChange,
+  type = 'text',
+  min,
+  max,
+  step,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
+  type?: 'text' | 'number'
+  min?: number
+  max?: number
+  step?: number
 }) {
   return (
     <label className="field compact">
       <span>{label}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} />
+      <input type={type} value={value} min={min} max={max} step={step} onChange={(event) => onChange(event.target.value)} />
     </label>
   )
 }

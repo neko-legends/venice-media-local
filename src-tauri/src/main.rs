@@ -6,12 +6,13 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    cmp::Ordering,
     collections::HashSet,
     fs::{self, OpenOptions},
     io::{ErrorKind, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 use axum::{
@@ -26,6 +27,8 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
+const GITHUB_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/neko-legends/VeniceMediaLocal/releases/latest";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
 const MIN_WINDOW_WIDTH: u32 = 960;
@@ -127,6 +130,22 @@ struct AppState {
     models: ModelCache,
     build_version: String,
     agent_control_address: String,
+    startup_timings: StartupTimings,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupTimingEntry {
+    name: String,
+    ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupTimings {
+    setup_sections: Vec<StartupTimingEntry>,
+    app_state_sections: Vec<StartupTimingEntry>,
+    app_state_total_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +318,54 @@ struct DiemBalanceSnapshot {
     raw: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAsset {
+    name: String,
+    url: String,
+    size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[serde(rename_all = "camelCase")]
+enum UpdateTarget {
+    WindowsSetup,
+    WindowsPortable,
+    ReleasePage,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    checked_at: String,
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    release_name: String,
+    release_url: String,
+    setup_asset: Option<UpdateAsset>,
+    portable_asset: Option<UpdateAsset>,
+    recommended_asset: Option<UpdateAsset>,
+    update_target: UpdateTarget,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    name: Option<String>,
+    html_url: String,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: Option<u64>,
+}
+
 
 // Handle for dynamically starting/stopping the agent control HTTP server
 // when the user toggles the setting in the UI (no app restart needed).
@@ -312,6 +379,33 @@ impl Default for AgentControlHandle {
             shutdown_tx: std::sync::Mutex::new(None),
         }
     }
+}
+
+#[derive(Default)]
+struct StartupMetricsHandle {
+    setup_sections: std::sync::Mutex<Vec<StartupTimingEntry>>,
+}
+
+impl StartupMetricsHandle {
+    fn push(&self, name: &str, started_at: Instant) {
+        if let Ok(mut sections) = self.setup_sections.lock() {
+            sections.push(StartupTimingEntry {
+                name: name.to_string(),
+                ms: elapsed_ms(started_at),
+            });
+        }
+    }
+
+    fn sections(&self) -> Vec<StartupTimingEntry> {
+        self.setup_sections
+            .lock()
+            .map(|sections| sections.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn keyring_entry() -> Result<keyring::Entry, String> {
@@ -887,9 +981,11 @@ fn audio_controls_with_support(
     supports_lyrics_optimizer: bool,
     supports_duration_seconds: bool,
 ) -> Value {
+    let duration_max = if kind == "sfx" { 22 } else { 180 };
+    let duration_default = if kind == "sfx" { 7 } else { 30 };
     json!({
         "audioKind": kind,
-        "durationSeconds": { "min": 1, "max": 180 },
+        "durationSeconds": { "min": 1, "max": duration_max, "default": duration_default },
         "supportsDurationSeconds": supports_duration_seconds,
         "supportsLyrics": supports_lyrics,
         "supportsInstrumental": supports_instrumental,
@@ -974,6 +1070,114 @@ fn trim_error_text(text: &str) -> String {
     }
 }
 
+fn version_parts(value: &str) -> Vec<u64> {
+    value
+        .trim()
+        .trim_start_matches('v')
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn compare_versions(current: &str, latest: &str) -> Ordering {
+    let current = version_parts(current);
+    let latest = version_parts(latest);
+    let len = current.len().max(latest.len()).max(1);
+    for index in 0..len {
+        let current_part = *current.get(index).unwrap_or(&0);
+        let latest_part = *latest.get(index).unwrap_or(&0);
+        match current_part.cmp(&latest_part) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
+}
+
+fn clean_release_version(value: &str) -> String {
+    value.trim().trim_start_matches('v').trim().to_string()
+}
+
+fn update_asset_from_github(asset: &GithubReleaseAsset) -> UpdateAsset {
+    UpdateAsset {
+        name: asset.name.clone(),
+        url: asset.browser_download_url.clone(),
+        size: asset.size,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn has_sibling_uninstaller(exe_path: &Path) -> bool {
+    exe_path
+        .parent()
+        .and_then(|parent| fs::read_dir(parent).ok())
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                name.ends_with(".exe") && name.contains("uninstall")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn is_running_portable_windows() -> bool {
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return true,
+    };
+    let file_name = exe_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if file_name.contains("portable") {
+        return true;
+    }
+    if has_sibling_uninstaller(&exe_path) {
+        return false;
+    }
+
+    let normalized_path = exe_path.to_string_lossy().replace('/', "\\").to_lowercase();
+    if normalized_path.contains("\\target\\release\\")
+        || normalized_path.contains("\\bundle\\nsis\\")
+    {
+        return true;
+    }
+    if normalized_path.contains("\\program files\\")
+        || normalized_path.contains("\\program files (x86)\\")
+        || normalized_path.contains("\\appdata\\local\\programs\\")
+    {
+        return false;
+    }
+
+    true
+}
+
+fn current_update_target() -> UpdateTarget {
+    #[cfg(target_os = "windows")]
+    {
+        if is_running_portable_windows() {
+            UpdateTarget::WindowsPortable
+        } else {
+            UpdateTarget::WindowsSetup
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        UpdateTarget::ReleasePage
+    }
+}
+
+fn format_number_for_message(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        value.to_string()
+    }
+}
+
 fn as_string(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -1019,6 +1223,22 @@ fn model_bool_field(
         .find_map(|value| bool_field(value, keys))
 }
 
+fn number_field(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| number_like(value.get(*key)))
+}
+
+fn model_number_field(
+    entry: &Value,
+    spec: &Value,
+    constraints: &Value,
+    capabilities: &Value,
+    keys: &[&str],
+) -> Option<f64> {
+    [entry, spec, constraints, capabilities]
+        .into_iter()
+        .find_map(|value| number_field(value, keys))
+}
+
 fn has_duration_metadata(value: &Value) -> bool {
     number_like(value.get("default_duration")).is_some()
         || number_like(value.get("min_duration")).is_some()
@@ -1050,6 +1270,50 @@ fn model_supports_duration_seconds(
             .into_iter()
             .any(has_duration_metadata)
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DurationControls {
+    min: Option<f64>,
+    max: Option<f64>,
+    default: Option<f64>,
+}
+
+fn audio_duration_controls_from_raw(raw: &Value) -> DurationControls {
+    if raw.is_null() {
+        return DurationControls {
+            min: None,
+            max: None,
+            default: None,
+        };
+    }
+
+    let spec = raw.get("model_spec").unwrap_or(&Value::Null);
+    let constraints = spec.get("constraints").unwrap_or(&Value::Null);
+    let capabilities = spec.get("capabilities").unwrap_or(&Value::Null);
+    DurationControls {
+        min: model_number_field(
+            raw,
+            spec,
+            constraints,
+            capabilities,
+            &["min_duration", "min_duration_seconds", "minimum_duration_seconds"],
+        ),
+        max: model_number_field(
+            raw,
+            spec,
+            constraints,
+            capabilities,
+            &["max_duration", "max_duration_seconds", "maximum_duration_seconds"],
+        ),
+        default: model_number_field(
+            raw,
+            spec,
+            constraints,
+            capabilities,
+            &["default_duration", "default_duration_seconds"],
+        ),
+    }
 }
 
 fn audio_support_controls_from_raw(
@@ -1118,6 +1382,7 @@ fn apply_audio_support_controls(model: &mut ModelRecord) {
 
     let (supports_lyrics, supports_instrumental, supports_lyrics_optimizer, supports_duration) =
         audio_support_controls_from_raw(&model.kind, &model.id, &model.name, &model.raw);
+    let duration_controls = audio_duration_controls_from_raw(&model.raw);
 
     if !model.controls.is_object() {
         model.controls = json!({});
@@ -1137,6 +1402,22 @@ fn apply_audio_support_controls(model: &mut ModelRecord) {
             "supportsDurationSeconds".to_string(),
             json!(supports_duration),
         );
+        if supports_duration {
+            let duration = controls
+                .entry("durationSeconds".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(duration) = duration.as_object_mut() {
+                if let Some(min) = duration_controls.min {
+                    duration.insert("min".to_string(), json!(min));
+                }
+                if let Some(max) = duration_controls.max {
+                    duration.insert("max".to_string(), json!(max));
+                }
+                if let Some(default) = duration_controls.default {
+                    duration.insert("default".to_string(), json!(default));
+                }
+            }
+        }
     }
 }
 
@@ -1147,6 +1428,12 @@ fn audio_model_controls<'a>(cache: &'a ModelCache, model_id: &str) -> Option<&'a
         .chain(cache.sfx_models.iter())
         .find(|model| model.id == model_id)
         .map(|model| &model.controls)
+}
+
+fn controls_duration_number(controls: &Value, key: &str) -> Option<f64> {
+    controls
+        .get("durationSeconds")
+        .and_then(|duration| number_like(duration.get(key)))
 }
 
 fn audio_model_parameter_support(app: &AppHandle, model_id: &str) -> (bool, bool, bool, bool) {
@@ -1161,6 +1448,18 @@ fn audio_model_parameter_support(app: &AppHandle, model_id: &str) -> (bool, bool
             )
         })
         .unwrap_or((true, true, true, true))
+}
+
+fn audio_model_duration_limits(app: &AppHandle, model_id: &str) -> (Option<f64>, Option<f64>) {
+    let cache = read_model_cache(app);
+    audio_model_controls(&cache, model_id)
+        .map(|controls| {
+            (
+                controls_duration_number(controls, "min"),
+                controls_duration_number(controls, "max"),
+            )
+        })
+        .unwrap_or((None, None))
 }
 
 fn response_data(payload: &Value) -> &Value {
@@ -2201,6 +2500,50 @@ fn open_folder_path(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
 }
 
+fn open_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("Only http/https URLs can be opened".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", trimmed]);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(trimmed);
+        command
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(trimmed);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to open update URL: {err}"))
+}
+
+fn run_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("Update installer was not found: {}", path.to_string_lossy()));
+    }
+
+    Command::new(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to run {}: {err}", path.to_string_lossy()))
+}
+
 #[tauri::command]
 fn open_output_folder(app: AppHandle) -> Result<String, String> {
     let root = ensure_output_folders(&app)?;
@@ -2347,6 +2690,11 @@ fn first_string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 
 fn json_status_label(value: &Value) -> String {
     first_string_field(value, &["status", "state"])
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| first_string_field(data, &["status", "state"]))
+        })
         .unwrap_or("queued")
         .to_string()
 }
@@ -2379,18 +2727,73 @@ async fn save_binary_response(
     save_media_bytes(app, kind, prompt, &mime, &bytes, metadata)
 }
 
-#[tauri::command]
-fn get_app_state(app: AppHandle) -> Result<AppState, String> {
+fn collect_app_state(
+    app: AppHandle,
+    setup_sections: Vec<StartupTimingEntry>,
+) -> Result<AppState, String> {
+    let total_started_at = Instant::now();
+    let mut sections = Vec::new();
+
+    let started_at = Instant::now();
     let settings = read_settings(&app);
+    sections.push(StartupTimingEntry {
+        name: "read settings".to_string(),
+        ms: elapsed_ms(started_at),
+    });
+
+    let started_at = Instant::now();
     ensure_output_folders_for_settings(&app, &settings)?;
+    sections.push(StartupTimingEntry {
+        name: "ensure output folders".to_string(),
+        ms: elapsed_ms(started_at),
+    });
+
+    let started_at = Instant::now();
+    let models = read_model_cache(&app);
+    sections.push(StartupTimingEntry {
+        name: "read model cache".to_string(),
+        ms: elapsed_ms(started_at),
+    });
+
+    let started_at = Instant::now();
+    let build_version = app.package_info().version.to_string();
+    sections.push(StartupTimingEntry {
+        name: "read build version".to_string(),
+        ms: elapsed_ms(started_at),
+    });
+
+    let app_state_total_ms = elapsed_ms(total_started_at);
 
     Ok(AppState {
         settings,
-        key_configured: has_api_key(),
-        models: read_model_cache(&app),
-        build_version: app.package_info().version.to_string(),
-        agent_control_address: agent_control_address(),
+        key_configured: false,
+        models,
+        build_version,
+        agent_control_address: format!("0.0.0.0:{AGENT_CONTROL_PORT}"),
+        startup_timings: StartupTimings {
+            setup_sections,
+            app_state_sections: sections,
+            app_state_total_ms,
+        },
     })
+}
+
+#[tauri::command]
+fn get_app_state(
+    app: AppHandle,
+    metrics: tauri::State<StartupMetricsHandle>,
+) -> Result<AppState, String> {
+    collect_app_state(app, metrics.sections())
+}
+
+#[tauri::command]
+fn get_key_configured() -> Result<bool, String> {
+    Ok(has_api_key())
+}
+
+#[tauri::command]
+fn get_agent_control_address() -> Result<String, String> {
+    Ok(agent_control_address())
 }
 
 #[tauri::command]
@@ -2481,6 +2884,159 @@ async fn refresh_models(app: AppHandle) -> Result<ModelCache, String> {
 #[tauri::command]
 fn get_models(app: AppHandle) -> Result<ModelCache, String> {
     Ok(read_model_cache(&app))
+}
+
+fn preferred_update_assets(assets: &[GithubReleaseAsset]) -> (Option<UpdateAsset>, Option<UpdateAsset>) {
+    let setup = assets
+        .iter()
+        .find(|asset| {
+            let name = asset.name.to_lowercase();
+            name.ends_with(".exe") && name.contains("setup") && name.contains("x64")
+        })
+        .or_else(|| {
+            assets.iter().find(|asset| {
+                let name = asset.name.to_lowercase();
+                name.ends_with(".exe") && name.contains("setup")
+            })
+        })
+        .map(update_asset_from_github);
+
+    let portable = assets
+        .iter()
+        .find(|asset| {
+            let name = asset.name.to_lowercase();
+            name.ends_with(".exe") && name.contains("portable") && name.contains("x64")
+        })
+        .or_else(|| {
+            assets.iter().find(|asset| {
+                let name = asset.name.to_lowercase();
+                name.ends_with(".exe") && name.contains("portable")
+            })
+        })
+        .map(update_asset_from_github);
+
+    (setup, portable)
+}
+
+fn recommended_update_asset(
+    target: UpdateTarget,
+    setup_asset: &Option<UpdateAsset>,
+    portable_asset: &Option<UpdateAsset>,
+) -> Option<UpdateAsset> {
+    match target {
+        UpdateTarget::WindowsSetup => setup_asset.clone().or_else(|| portable_asset.clone()),
+        UpdateTarget::WindowsPortable => portable_asset.clone().or_else(|| setup_asset.clone()),
+        UpdateTarget::ReleasePage => None,
+    }
+}
+
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
+    let response = client()
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let response = ensure_success(response).await?;
+    let release: GithubRelease = response.json().await.map_err(|err| err.to_string())?;
+    let current_version = app.package_info().version.to_string();
+    let latest_version = clean_release_version(&release.tag_name);
+    let (setup_asset, portable_asset) = preferred_update_assets(&release.assets);
+    let update_target = current_update_target();
+    let recommended_asset = recommended_update_asset(update_target, &setup_asset, &portable_asset);
+
+    Ok(UpdateCheckResult {
+        checked_at: Utc::now().to_rfc3339(),
+        current_version: current_version.clone(),
+        latest_version: latest_version.clone(),
+        update_available: compare_versions(&current_version, &latest_version) == Ordering::Less,
+        release_name: release.name.unwrap_or_else(|| release.tag_name.clone()),
+        release_url: release.html_url,
+        setup_asset,
+        portable_asset,
+        recommended_asset,
+        update_target,
+    })
+}
+
+#[tauri::command]
+fn open_update_release(url: String) -> Result<bool, String> {
+    open_url(&url)?;
+    Ok(true)
+}
+
+fn safe_download_name(name: &str) -> String {
+    let clean = name
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            _ => ch,
+        })
+        .collect::<String>();
+    if clean.trim().is_empty() {
+        "VeniceMediaLocal-update.exe".to_string()
+    } else {
+        clean
+    }
+}
+
+fn update_download_dirs(app: &AppHandle, asset: &UpdateAsset) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        let name = asset.name.to_lowercase();
+        if current_update_target() == UpdateTarget::WindowsPortable && name.contains("portable") {
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(parent) = exe_path.parent() {
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    dirs.push(app_data_dir(app)?.join("updates"));
+    Ok(dirs)
+}
+
+#[tauri::command]
+async fn download_update_installer(app: AppHandle, asset: UpdateAsset) -> Result<String, String> {
+    if !asset.url.starts_with("https://github.com/") {
+        return Err("Update asset URL did not come from GitHub releases".to_string());
+    }
+
+    let response = client()
+        .get(&asset.url)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let response = ensure_success(response).await?;
+    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+    let name = safe_download_name(&asset.name);
+    let mut last_error = None;
+
+    for dir in update_download_dirs(&app, &asset)? {
+        if let Err(err) = fs::create_dir_all(&dir) {
+            last_error = Some(err.to_string());
+            continue;
+        }
+        let path = dir.join(&name);
+        match fs::write(&path, &bytes) {
+            Ok(_) => return Ok(path.to_string_lossy().to_string()),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+
+    Err(format!(
+        "Failed to save update: {}",
+        last_error.unwrap_or_else(|| "no writable update folder".to_string())
+    ))
+}
+
+#[tauri::command]
+fn run_update_installer(path: String) -> Result<bool, String> {
+    run_file(Path::new(path.trim()))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2777,6 +3333,8 @@ async fn queue_audio(app: AppHandle, request: QueueMediaRequest) -> Result<Queue
         supports_instrumental,
         supports_lyrics_optimizer,
     ) = audio_model_parameter_support(&app, &request.model);
+    let (min_duration_seconds, max_duration_seconds) =
+        audio_model_duration_limits(&app, &request.model);
     let mut body = json!({
         "model": request.model,
         "prompt": request.prompt,
@@ -2787,7 +3345,32 @@ async fn queue_audio(app: AppHandle, request: QueueMediaRequest) -> Result<Queue
             .or(request.duration)
             .filter(|value| !value.trim().is_empty())
         {
-            body["duration_seconds"] = json!(value);
+            let duration_seconds = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| "Duration seconds must be a number".to_string())?;
+            if duration_seconds <= 0.0 {
+                return Err("Duration seconds must be greater than 0".to_string());
+            }
+            if let Some(min) = min_duration_seconds {
+                if duration_seconds < min {
+                    return Err(format!(
+                        "Duration seconds must be at least {} for {}",
+                        format_number_for_message(min),
+                        request.model
+                    ));
+                }
+            }
+            if let Some(max) = max_duration_seconds {
+                if duration_seconds > max {
+                    return Err(format!(
+                        "Duration seconds must be {} or less for {}",
+                        format_number_for_message(max),
+                        request.model
+                    ));
+                }
+            }
+            body["duration_seconds"] = json!(duration_seconds);
         }
     }
     if supports_instrumental && request.force_instrumental.unwrap_or(false) {
@@ -3249,7 +3832,8 @@ async fn agent_get_state(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AgentApiError> {
     check_agent_token(&state, &headers)?;
-    let app_state = get_app_state(state.app.clone()).map_err(agent_error)?;
+    let setup_sections = state.app.state::<StartupMetricsHandle>().sections();
+    let app_state = collect_app_state(state.app.clone(), setup_sections).map_err(agent_error)?;
     Ok(Json(serde_json::to_value(app_state).unwrap()))
 }
 
@@ -3655,14 +4239,21 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AgentControlHandle::default())
+        .manage(StartupMetricsHandle::default())
         .setup(|app| {
+            let metrics = app.state::<StartupMetricsHandle>();
+            let started_at = Instant::now();
             if let Err(err) = ensure_output_folders(app.handle()) {
                 eprintln!("Failed to initialize output folders: {err}");
             }
+            metrics.push("ensure output folders", started_at);
 
             let app_handle = app.handle().clone();
+            let started_at = Instant::now();
             force_agent_control_off_on_launch(&app_handle);
+            metrics.push("reset agent control launch state", started_at);
 
+            let started_at = Instant::now();
             if let Some(window) = app.get_webview_window("main") {
                 if let Err(err) = apply_initial_window_size(&app_handle, &window) {
                     eprintln!("Failed to initialize window size: {err}");
@@ -3677,11 +4268,14 @@ fn main() {
                     }
                 });
             }
+            metrics.push("apply window size and hooks", started_at);
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
+            get_key_configured,
+            get_agent_control_address,
             save_settings,
             rotate_agent_control_token,
             save_api_key,
@@ -3697,6 +4291,10 @@ fn main() {
             open_file_folder,
             burn_folder,
             refresh_models,
+            check_for_update,
+            open_update_release,
+            download_update_installer,
+            run_update_installer,
             generate_image,
             remove_background,
             upscale_image,

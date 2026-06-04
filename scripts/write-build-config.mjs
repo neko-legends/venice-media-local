@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -53,7 +53,8 @@ const patch = Number(`${day}${pad(hour)}${pad(minute)}${pad(second)}`)
 const builtAt = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`
 const git = resolveGitInfo()
 const metadata = git.dirty ? `g${git.commit}.dirty` : `g${git.commit}`
-const version = '26.6.3'
+const packageInfo = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'))
+const version = packageInfo.version
 
 const config = {
   version,
