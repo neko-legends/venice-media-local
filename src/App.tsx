@@ -2962,6 +2962,7 @@ function fileFilterForResult(result: MediaResult) {
 type ImageSaveFormat = 'png' | 'webp'
 
 function mediaSourceForResult(result: MediaResult) {
+  if (result.mimeType.startsWith('audio/') && result.dataUrl) return result.dataUrl
   return result.filePath ? convertFileSrc(result.filePath) : result.dataUrl
 }
 
