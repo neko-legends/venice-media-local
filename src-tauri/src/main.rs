@@ -67,6 +67,8 @@ struct AppSettings {
     // AI Agent Remote Control (HTTP API for Hermes-style agents over Tailscale)
     #[serde(default)]
     enable_agent_control: bool,
+    #[serde(default = "default_agent_control_port")]
+    agent_control_port: u16,
     #[serde(default)]
     agent_control_token: Option<String>,
 }
@@ -80,6 +82,7 @@ impl Default for AppSettings {
             window_width: None,
             window_height: None,
             enable_agent_control: false,
+            agent_control_port: default_agent_control_port(),
             agent_control_token: None,
         }
     }
@@ -93,6 +96,7 @@ fn default_settings(app: &AppHandle) -> AppSettings {
         window_width: None,
         window_height: None,
         enable_agent_control: false,
+        agent_control_port: default_agent_control_port(),
         agent_control_token: None,
     }
 }
@@ -155,6 +159,7 @@ struct SaveSettingsRequest {
     output_dir: Option<String>,
     show_diem_balance: Option<bool>,
     enable_agent_control: Option<bool>,
+    agent_control_port: Option<u16>,
     // We do not allow the frontend to set the token directly for security
 }
 
@@ -430,7 +435,18 @@ fn has_api_key() -> bool {
         .unwrap_or(false)
 }
 
-const AGENT_CONTROL_PORT: u16 = 9876;
+const DEFAULT_AGENT_CONTROL_PORT: u16 = 9876;
+
+fn default_agent_control_port() -> u16 {
+    DEFAULT_AGENT_CONTROL_PORT
+}
+
+fn validate_agent_control_port(port: u16) -> Result<u16, String> {
+    if port == 0 {
+        return Err("Agent Control port must be between 1 and 65535.".to_string());
+    }
+    Ok(port)
+}
 
 fn generate_agent_control_token() -> String {
     // Simple but sufficient token for Tailscale/local use (no extra deps)
@@ -456,26 +472,26 @@ fn tailscale_ipv4_address() -> Option<String> {
         .map(str::to_string)
 }
 
-fn agent_control_address() -> String {
+fn agent_control_address(port: u16) -> String {
     tailscale_ipv4_address()
-        .map(|ip| format!("{ip}:{AGENT_CONTROL_PORT}"))
-        .unwrap_or_else(|| format!("0.0.0.0:{AGENT_CONTROL_PORT}"))
+        .map(|ip| format!("{ip}:{port}"))
+        .unwrap_or_else(|| format!("0.0.0.0:{port}"))
 }
 
 /// Write the control-api.json discovery file so agents / the skill can auto-discover
 /// the address, port and token without manual config.
-fn write_agent_control_discovery(app: &AppHandle, token: &str) -> Result<(), String> {
+fn write_agent_control_discovery(app: &AppHandle, token: &str, port: u16) -> Result<(), String> {
     let dir = app_data_dir(app)?;
     let tailscale_ip = tailscale_ipv4_address();
     let address = tailscale_ip
         .as_ref()
-        .map(|ip| format!("{ip}:{AGENT_CONTROL_PORT}"))
-        .unwrap_or_else(|| format!("0.0.0.0:{AGENT_CONTROL_PORT}"));
+        .map(|ip| format!("{ip}:{port}"))
+        .unwrap_or_else(|| format!("0.0.0.0:{port}"));
     let discovery = serde_json::json!({
         "address": address,
-        "bindAddress": format!("0.0.0.0:{AGENT_CONTROL_PORT}"),
+        "bindAddress": format!("0.0.0.0:{port}"),
         "tailscaleIp": tailscale_ip,
-        "port": AGENT_CONTROL_PORT,
+        "port": port,
         "token": token,
         "version": app.package_info().version.to_string(),
         "note": "Connect using the address and token. Same Tailscale network recommended."
@@ -534,6 +550,9 @@ fn read_settings(app: &AppHandle) -> AppSettings {
         .unwrap_or_else(|_| fallback.clone());
     if settings.output_dir.trim().is_empty() {
         settings.output_dir = fallback.output_dir;
+    }
+    if settings.agent_control_port == 0 {
+        settings.agent_control_port = default_agent_control_port();
     }
     settings
 }
@@ -2833,7 +2852,7 @@ fn collect_app_state(
         key_configured: false,
         models,
         build_version,
-        agent_control_address: format!("0.0.0.0:{AGENT_CONTROL_PORT}"),
+        agent_control_address: format!("0.0.0.0:{}", settings.agent_control_port),
         startup_timings: StartupTimings {
             setup_sections,
             app_state_sections: sections,
@@ -2856,8 +2875,9 @@ fn get_key_configured() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn get_agent_control_address() -> Result<String, String> {
-    Ok(agent_control_address())
+fn get_agent_control_address(app: AppHandle) -> Result<String, String> {
+    let settings = read_settings(&app);
+    Ok(agent_control_address(settings.agent_control_port))
 }
 
 #[tauri::command]
@@ -2877,6 +2897,11 @@ fn save_settings(
         settings.show_diem_balance = show_diem_balance;
     }
     let was_enabled = settings.enable_agent_control;
+    let previous_port = settings.agent_control_port;
+
+    if let Some(port) = request.agent_control_port {
+        settings.agent_control_port = validate_agent_control_port(port)?;
+    }
 
     if let Some(enable) = request.enable_agent_control {
         settings.enable_agent_control = enable;
@@ -2888,10 +2913,20 @@ fn save_settings(
         // Live start / stop when the user toggles in Settings (no restart needed)
         if enable && !was_enabled {
             if let Some(token) = settings.agent_control_token.clone() {
-                start_agent_control_server(app.clone(), token, &handle)?;
+                start_agent_control_server(app.clone(), token, settings.agent_control_port, &handle)?;
             }
         } else if !enable && was_enabled {
             stop_agent_control_server(&handle);
+        }
+    }
+
+    if settings.enable_agent_control
+        && was_enabled
+        && settings.agent_control_port != previous_port
+    {
+        stop_agent_control_server(&handle);
+        if let Some(token) = settings.agent_control_token.clone() {
+            start_agent_control_server(app.clone(), token, settings.agent_control_port, &handle)?;
         }
     }
 
@@ -2911,7 +2946,7 @@ fn rotate_agent_control_token(
     if settings.enable_agent_control {
         stop_agent_control_server(&handle);
         if let Some(token) = settings.agent_control_token.clone() {
-            start_agent_control_server(app.clone(), token, &handle)?;
+            start_agent_control_server(app.clone(), token, settings.agent_control_port, &handle)?;
         }
     }
 
@@ -4246,11 +4281,13 @@ async fn agent_burn_folder(
 fn start_agent_control_server(
     app: AppHandle,
     token: String,
+    port: u16,
     handle: &AgentControlHandle,
 ) -> Result<(), String> {
     if token.is_empty() {
         return Err("No token configured".to_string());
     }
+    let port = validate_agent_control_port(port)?;
 
     // If already running, do nothing
     {
@@ -4260,7 +4297,7 @@ fn start_agent_control_server(
         }
     }
 
-    let addr: SocketAddr = format!("0.0.0.0:{AGENT_CONTROL_PORT}")
+    let addr: SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .map_err(|error| format!("Invalid agent control bind address: {error}"))?;
     let std_listener = StdTcpListener::bind(addr).map_err(|error| {
@@ -4277,7 +4314,7 @@ fn start_agent_control_server(
         .map_err(|error| format!("Failed to configure agent control listener: {error}"))?;
 
     // Write discovery only after bind succeeds, so agents never pick up a dead token.
-    if let Err(e) = write_agent_control_discovery(&app, &token) {
+    if let Err(e) = write_agent_control_discovery(&app, &token, port) {
         eprintln!("[agent-control] Could not write discovery file: {}", e);
     }
 

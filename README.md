@@ -128,13 +128,13 @@ curl -H "Authorization: Bearer <token>" http://<address>/api/v1/state
 
 (The discovery file contains the exact address and token — no need to guess them.)
 
-If the connection times out, check Tailscale Access Controls. Add a rule where the remote agent machine is the source, the Windows machine running Venice Media Local is the destination, and the port/protocol is:
+The default control port is `9876`, and Settings lets you change it. If the connection times out, check Tailscale Access Controls. Add a rule where the remote agent machine is the source, the Windows machine running Venice Media Local is the destination, and the port/protocol matches the discovery file:
 
 ```text
-tcp:9876
+tcp:<port>
 ```
 
-In plain English: allow the remote agent source to control this local Windows destination on `tcp:9876`.
+In plain English: allow the remote agent source to control this local Windows destination on the configured TCP port.
 
 Useful Theater Mode endpoints:
 

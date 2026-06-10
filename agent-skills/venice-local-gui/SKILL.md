@@ -36,14 +36,14 @@ Then store the target:
 ```yaml
 venice_local:
   target_host: "100.64.x.x"   # Tailscale IP of the Windows machine
-  port: 9876
+  port: 9876                  # default; use the discovery file/settings value
   token: "vl-xxxxx"            # shown in Settings > AI Agent Control
   # output dir on Windows (from /api/v1/state): C:\Users\you\Desktop\VeniceMedia
 ```
 
 Fallback: use the memory tool with the same keys.
 
-The app also writes the discovery file `%APPDATA%\venice-media-local\control-api.json` on startup when the feature is on.
+The app also writes the discovery file `%APPDATA%\venice-media-local\control-api.json` on startup when the feature is on. Prefer the `address`, `port`, and `token` from that file because the port is configurable.
 
 ## Available Control Endpoints (v1)
 
@@ -102,7 +102,7 @@ This file contains the full ImageGenerationRequest, AgentRequest wrapper, proven
 1. Always start with a quick health + model check:
    ```bash
    curl -H "Authorization: Bearer *** \
-     http://<host>:9876/api/v1/state
+     http://<host>:<port>/api/v1/state
    ```
    This returns current models, settings, output dir, and confirms the server is reachable.
 
@@ -112,7 +112,7 @@ This file contains the full ImageGenerationRequest, AgentRequest wrapper, proven
    Minimal working example (succeeded in live test):
    ```bash
    curl -X POST \
-     http://100.64.131.86:9876/api/v1/generate-image \
+     http://100.64.131.86:<port>/api/v1/generate-image \
      -H "Authorization: Bearer *** \
      -H "Content-Type: application/json" \
      -d '{
@@ -187,7 +187,7 @@ This file contains the full ImageGenerationRequest, AgentRequest wrapper, proven
    with open('/tmp/edit_payload.json', 'w') as f:
        json.dump(payload, f)
    subprocess.run(["curl", "-s", "-X", "POST",
-       "http://<host>:9876/api/v1/edit-image",
+       "http://<host>:<port>/api/v1/edit-image",
        "-H", "Authorization: Bearer ***
        "-H", "Content-Type: application/json",
        "--data-binary", "@/tmp/edit_payload.json"],
@@ -209,7 +209,7 @@ See `references/venice-local-gui-request-types.md` for the complete, up-to-date 
 ## Current Status (as of 2026-05-21 verification)
 
 - Live toggle in Settings (off by default, starts/stops HTTP server immediately on flip, no app restart): **done**
-- HTTP server on 0.0.0.0:9876 with Bearer token auth + auto-generated token shown with copy button: **done**
+- HTTP server on 0.0.0.0:<port> with Bearer token auth + auto-generated token shown with copy button: **done**
 - Discovery file `control-api.json` written to app data dir automatically when enabled: **done**
 - Core endpoints implemented and wired directly to the real internal Rust functions (GUI updates live):
   - GET /api/v1/state — **verified working**

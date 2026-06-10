@@ -33,10 +33,16 @@ import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEve
 const APP_ICON_URL = '/app-icon.png'
 const APP_BOOT_STARTED_AT = typeof performance !== 'undefined' ? performance.now() : 0
 const MIN_STARTUP_SPLASH_MS = 700
+const DEFAULT_AGENT_CONTROL_PORT = 9876
 
 type ModeId = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe' | 'models' | 'settings'
 type ModelKind = 'image' | 'edit' | 'video' | 'music' | 'sfx' | 'voice' | 'transcribe'
 type ThemeId = 'eva-dark' | 'pearl-white' | 'abyss-teal' | 'ember' | 'mosswood' | 'rose-noir'
+
+function normalizeAgentControlPort(value: string) {
+  const port = Number(value)
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null
+}
 
 type ModelRecord = {
   id: string
@@ -69,6 +75,7 @@ type AppSettings = {
   outputDir: string
   showDiemBalance: boolean
   enableAgentControl: boolean
+  agentControlPort: number
   agentControlToken?: string
 }
 
@@ -1085,7 +1092,8 @@ function AgentControlBusyModal({ message }: { message: string }) {
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
-  const [settings, setSettings] = useState<AppSettings>({ theme: readStoredTheme(), outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlToken: undefined })
+  const [settings, setSettings] = useState<AppSettings>({ theme: readStoredTheme(), outputDir: '', showDiemBalance: false, enableAgentControl: false, agentControlPort: DEFAULT_AGENT_CONTROL_PORT, agentControlToken: undefined })
+  const [agentControlPortDraft, setAgentControlPortDraft] = useState(String(DEFAULT_AGENT_CONTROL_PORT))
   const [startupReady, setStartupReady] = useState(false)
   const [startupTimingSummary, setStartupTimingSummary] = useState<StartupTimingSummary | null>(null)
   const [showStartupTimingDetails, setShowStartupTimingDetails] = useState(false)
@@ -1259,7 +1267,9 @@ export function App() {
           theme,
           showDiemBalance: Boolean(state.settings.showDiemBalance),
           enableAgentControl: Boolean(state.settings.enableAgentControl || false),
+          agentControlPort: Number(state.settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT),
         })
+        setAgentControlPortDraft(String(state.settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT))
         applyTheme(theme)
         writeStoredTheme(theme)
         setModels(state.models)
@@ -1835,7 +1845,7 @@ export function App() {
       const address = await call<string>('get_agent_control_address')
       setAgentControlAddress(address)
     } catch {
-      setAgentControlAddress('0.0.0.0:9876')
+      setAgentControlAddress(`0.0.0.0:${settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT}`)
     }
   }
 
@@ -1859,7 +1869,9 @@ export function App() {
         ...saved,
         showDiemBalance: Boolean(saved.showDiemBalance),
         enableAgentControl: Boolean(saved.enableAgentControl),
+        agentControlPort: Number(saved.agentControlPort || DEFAULT_AGENT_CONTROL_PORT),
       })
+      setAgentControlPortDraft(String(saved.agentControlPort || DEFAULT_AGENT_CONTROL_PORT))
       if (saved.enableAgentControl) {
         await refreshAgentControlAddress()
       }
@@ -1887,6 +1899,22 @@ export function App() {
     setTimeout(() => setStatus(''), 2000)
   }
 
+  async function applyAgentControlPort() {
+    const port = normalizeAgentControlPort(agentControlPortDraft)
+    if (port === null) {
+      setError('Choose an Agent Control port between 1 and 65535.')
+      setStatus('Needs attention')
+      setAgentControlPortDraft(String(settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT))
+      return
+    }
+    if (port === settings.agentControlPort) return
+    const saved = await persistSettings({ ...settings, agentControlPort: port })
+    if (saved) {
+      setStatus(`Agent Control port set to ${saved.agentControlPort || port}`)
+      setLastActionMs(null)
+    }
+  }
+
   async function rotateAgentControlToken() {
     const confirmed = window.confirm('Rotate the Agent Control token? Any remote agents using the old token will need the new one.')
     if (!confirmed) return
@@ -1900,7 +1928,9 @@ export function App() {
           ...saved,
           showDiemBalance: Boolean(saved.showDiemBalance),
           enableAgentControl: Boolean(saved.enableAgentControl),
+          agentControlPort: Number(saved.agentControlPort || DEFAULT_AGENT_CONTROL_PORT),
         })
+        setAgentControlPortDraft(String(saved.agentControlPort || DEFAULT_AGENT_CONTROL_PORT))
         if (saved.enableAgentControl) {
           await refreshAgentControlAddress()
         }
@@ -2975,8 +3005,25 @@ export function App() {
                     <span>Enable AI Agent Remote Control</span>
                   </label>
                   <small className="field-help">
-                    Starts a local HTTP API on port 9876. This is always off when the app launches and must be enabled manually. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window.
+                    Starts a local HTTP API on the selected port. This is always off when the app launches and must be enabled manually. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window.
                   </small>
+                  <label className="field">
+                    <span>Control Port</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="65535"
+                      value={agentControlPortDraft}
+                      disabled={Boolean(agentControlBusyMessage)}
+                      onChange={(event) => setAgentControlPortDraft(event.target.value)}
+                      onBlur={() => { void applyAgentControlPort() }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.currentTarget.blur()
+                        }
+                      }}
+                    />
+                  </label>
                   {settings.enableAgentControl && settings.agentControlToken && (
                     <div className="agent-control-details">
                       <label className="field">
@@ -3011,13 +3058,13 @@ export function App() {
                         <div className="agent-value-row">
                           <input
                             className="agent-value-input"
-                            value={agentControlAddress || '0.0.0.0:9876'}
+                            value={agentControlAddress || `0.0.0.0:${settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT}`}
                             readOnly
                           />
                           <button
                             type="button"
                             className="agent-copy-button"
-                            onClick={() => copyAgentControlValue(agentControlAddress || '0.0.0.0:9876', 'Tailscale address')}
+                            onClick={() => copyAgentControlValue(agentControlAddress || `0.0.0.0:${settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT}`, 'Tailscale address')}
                             title="Copy Tailscale address"
                           >
                             Copy
@@ -3025,7 +3072,7 @@ export function App() {
                         </div>
                       </label>
                       <small className="field-help">
-                        The server binds locally on 0.0.0.0:9876. Give the agent the Tailscale address and control token above. If the agent times out, open Tailscale Access controls and add a rule allowing the remote agent source to reach this local machine destination on tcp:9876.
+                        The server binds locally on 0.0.0.0:{settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT}. Give the agent the Tailscale address and control token above. If the agent times out, open Tailscale Access controls and add a rule allowing the remote agent source to reach this local machine destination on the same TCP port.
                       </small>
                     </div>
                   )}

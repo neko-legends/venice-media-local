@@ -43,11 +43,11 @@ The `/api/v1/navigate` endpoint + `agent:navigate` Tauri event allows the agent 
 
 ## Debugging Remote Access (Tailscale + Windows)
 When the server is listening locally but not reachable over Tailscale:
-1. Confirm local `127.0.0.1:9876` works on the Windows machine.
+1. Confirm local `127.0.0.1:<port>` works on the Windows machine.
 2. Confirm the machine can reach itself on its own Tailscale IP.
 3. Run `tailscale ping <other-machine>` both directions.
-4. Add specific Windows Firewall inbound rule (TCP 9876, Tailscale interface, exact remote Tailscale IP).
-5. Add Tailscale ACL allowing the source tag/machine to the destination on `tcp:9876`.
+4. Add specific Windows Firewall inbound rule (configured TCP port, Tailscale interface, exact remote Tailscale IP).
+5. Add Tailscale ACL allowing the source tag/machine to the destination on `tcp:<port>`.
 
 This pattern was required to make the feature work between the Linux Hermes machine and the Windows "ripper".
 

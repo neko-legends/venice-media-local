@@ -5,9 +5,9 @@ This document captures the diagnostic pattern that emerged when the embedded HTT
 ## When the Server Appears Up But the Agent Can't Reach It
 
 ### Confirmed working on target machine
-- Local loopback test succeeds: `curl -H "Authorization: Bearer *** http://127.0.0.1:9876/api/v1/state`
-- Self-Tailscale-IP test succeeds from the target machine: `curl ... http://<target-tailscale-ip>:9876/api/v1/state`
-- `netstat` / `Get-NetTCPConnection` shows `0.0.0.0:9876` LISTENING on the correct process
+- Local loopback test succeeds: `curl -H "Authorization: Bearer *** http://127.0.0.1:<port>/api/v1/state`
+- Self-Tailscale-IP test succeeds from the target machine: `curl ... http://<target-tailscale-ip>:<port>/api/v1/state`
+- `netstat` / `Get-NetTCPConnection` shows `0.0.0.0:<port>` LISTENING on the correct process
 - Discovery file written and token visible in Settings
 
 ### Tests to run from the agent side (Linux)
@@ -18,19 +18,19 @@ Run these in order:
 
 2. Verbose curl with short timeout:
    ```bash
-   curl -v --connect-timeout 8 -H "Authorization: Bearer *** http://<target-ip>:9876/api/v1/state
+   curl -v --connect-timeout 8 -H "Authorization: Bearer *** http://<target-ip>:<port>/api/v1/state
    ```
 
 3. Raw TCP check:
    ```bash
-   nc -vz <target-ip> 9876
+   nc -vz <target-ip> <port>
    ```
 
 ### Common root causes when Tailscale ping works but port is blocked
 
 - **Windows Firewall on the target** (most frequent in this household)
   - Generic "allow the exe" rules often do not cover traffic arriving on the Tailscale virtual adapter.
-  - Fix: Either temporarily disable Windows Firewall for testing, or create an explicit inbound TCP rule for port 9876 allowing the specific source Tailscale IP of the agent machine.
+  - Fix: Either temporarily disable Windows Firewall for testing, or create an explicit inbound TCP rule for the configured port allowing the specific source Tailscale IP of the agent machine.
 
 - Tailscale peer connection type
   - Check in the Tailscale GUI on the target: is the agent peer showing as **Direct** or **Relay**?
@@ -58,12 +58,12 @@ This pattern prevents wasting time debugging the Rust code when the problem is i
 
 From agent:
 - `tailscale ping ripper`
-- `curl -v --connect-timeout 8 -H "Authorization: Bearer *** http://<ip>:9876/api/v1/state`
-- `nc -vz <ip> 9876`
+- `curl -v --connect-timeout 8 -H "Authorization: Bearer *** http://<ip>:<port>/api/v1/state`
+- `nc -vz <ip> <port>`
 
 From target (Windows):
-- Local: `curl -H "Authorization: Bearer *** http://127.0.0.1:9876/api/v1/state`
-- Self Tailscale: `curl -H "Authorization: Bearer *** http://<own-tailscale-ip>:9876/api/v1/state`
+- Local: `curl -H "Authorization: Bearer *** http://127.0.0.1:<port>/api/v1/state`
+- Self Tailscale: `curl -H "Authorization: Bearer *** http://<own-tailscale-ip>:<port>/api/v1/state`
 
 ## Related
 
