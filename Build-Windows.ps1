@@ -1,15 +1,32 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$npm = 'C:\Program Files\nodejs\npm.cmd'
+$nodeBin = 'C:\Program Files\nodejs'
+$node = Join-Path $nodeBin 'node.exe'
 $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+$localBin = Join-Path $root 'node_modules\.bin'
 
-$env:Path = "$cargoBin;$env:Path"
-$env:npm_config_prefix = 'C:\Program Files\nodejs'
+$env:Path = "$localBin;$nodeBin;$cargoBin;$env:Path"
+
+function Invoke-Checked {
+  param(
+    [Parameter(Mandatory = $true)][string]$Label,
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string[]]$Arguments
+  )
+
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Label failed with exit code $LASTEXITCODE"
+  }
+}
 
 Set-Location -LiteralPath $root
-& $npm run version:build
-& $npm run tauri -- build --config src-tauri/tauri.version.conf.json
+$buildStartedAt = Get-Date
+Invoke-Checked 'Generate build config' $node @((Join-Path $root 'scripts\write-build-config.mjs'))
+Invoke-Checked 'TypeScript build' $node @((Join-Path $root 'node_modules\typescript\bin\tsc'))
+Invoke-Checked 'Vite build' $node @((Join-Path $root 'node_modules\vite\bin\vite.js'), 'build')
+Invoke-Checked 'Tauri build' $node @((Join-Path $root 'node_modules\@tauri-apps\cli\tauri.js'), 'build', '--config', 'src-tauri/tauri.version.conf.json')
 
 $versionConfig = Get-Content -LiteralPath (Join-Path $root 'src-tauri\tauri.version.conf.json') -Raw | ConvertFrom-Json
 $version = [string]$versionConfig.version
@@ -21,6 +38,11 @@ $portableTarget = Join-Path $bundleDir $portableName
 
 if (-not (Test-Path -LiteralPath $portableSource -PathType Leaf)) {
   throw "Portable source executable not found: $portableSource"
+}
+
+$portableItem = Get-Item -LiteralPath $portableSource
+if ($portableItem.LastWriteTime -lt $buildStartedAt) {
+  throw "Portable source executable was not refreshed by this build: $portableSource"
 }
 
 New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null

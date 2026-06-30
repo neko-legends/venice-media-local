@@ -84,6 +84,7 @@ type AppSettings = {
   agentControlPort: number
   agentControlBindAll: boolean
   agentControlToken?: string
+  selectedModels?: Partial<Record<ModelKind, string>>
 }
 
 type AppState = {
@@ -701,6 +702,17 @@ function firstModelId(models: ModelRecord[]): string {
   return models[0]?.id ?? ''
 }
 
+function selectedOrFirstModelId(
+  models: ModelRecord[],
+  selectedModels: Partial<Record<ModelKind, string>> | undefined,
+  kind: ModelKind,
+): string {
+  const selected = selectedModels?.[kind]?.trim() ?? ''
+  return selected && models.some((model) => model.id === selected)
+    ? selected
+    : firstModelId(models)
+}
+
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -759,18 +771,31 @@ async function flipImageDataUrlHorizontal(dataUrl: string): Promise<string> {
   return canvasToDataUrl(canvas, mimeType)
 }
 
-function controlArray(model: ModelRecord | undefined, key: string, fallback: string[]): string[] {
+function rawControlArray(model: ModelRecord | undefined, key: string): string[] {
   const value = model?.controls?.[key]
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string') && value.length > 0
-    ? value
-    : fallback
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : []
+}
+
+function controlArray(model: ModelRecord | undefined, key: string, fallback: string[]): string[] {
+  const value = rawControlArray(model, key)
+  return value.length > 0 ? value : fallback
 }
 
 function supportedControlArray(model: ModelRecord | undefined, key: string, fallback: string[]): string[] {
   if (!model) return fallback
   if (!Object.prototype.hasOwnProperty.call(model.controls ?? {}, key)) return fallback
-  const value = model.controls?.[key]
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string') ? value : []
+  return rawControlArray(model, key)
+}
+
+function controlString(model: ModelRecord | undefined, key: string): string {
+  const value = model?.controls?.[key]
+  return typeof value === 'string' ? value : ''
+}
+
+function selectedControlOption(options: string[], current: string, preferred = ''): string {
+  if (options.includes(current)) return current
+  if (preferred && options.includes(preferred)) return preferred
+  return options[0] ?? ''
 }
 
 function controlBool(model: ModelRecord | undefined, key: string, fallback: boolean): boolean {
@@ -1099,7 +1124,7 @@ function AgentControlBusyModal({ message }: { message: string }) {
 export function App() {
   const [mode, setMode] = useState<ModeId>('image')
   const [models, setModels] = useState<ModelCache>(fallbackModels)
-  const [settings, setSettings] = useState<AppSettings>({ theme: readStoredTheme(), outputDir: '', writeMetadataSidecars: true, privateSession: false, genericFilenames: false, showDiemBalance: false, enableAgentControl: false, agentControlPort: DEFAULT_AGENT_CONTROL_PORT, agentControlBindAll: false, agentControlToken: undefined })
+  const [settings, setSettings] = useState<AppSettings>({ theme: readStoredTheme(), outputDir: '', writeMetadataSidecars: true, privateSession: false, genericFilenames: false, showDiemBalance: false, enableAgentControl: false, agentControlPort: DEFAULT_AGENT_CONTROL_PORT, agentControlBindAll: false, agentControlToken: undefined, selectedModels: {} })
   const [agentControlPortDraft, setAgentControlPortDraft] = useState(String(DEFAULT_AGENT_CONTROL_PORT))
   const [startupReady, setStartupReady] = useState(false)
   const [startupTimingSummary, setStartupTimingSummary] = useState<StartupTimingSummary | null>(null)
@@ -1139,6 +1164,7 @@ export function App() {
   const runningJobStartsRef = useRef<Record<JobKind, number[]>>(createJobStartQueues())
   const cancelledRemoteQueueIdsRef = useRef(new Set<string>())
   const concurrencyRef = useRef<JobConcurrency>(concurrency)
+  const selectedModelsRef = useRef<Partial<Record<ModelKind, string>>>({})
   const pointerSeedRef = useRef(0n)
   const pointerFrameRef = useRef<number | null>(null)
 
@@ -1264,11 +1290,13 @@ export function App() {
         if (disposed) return
         const appStateRequestEndedAt = performance.now()
         const theme = isThemeId(state.settings.theme) ? state.settings.theme : 'eva-dark'
+        const selectedModels = state.settings.selectedModels ?? {}
         const summary: StartupTimingSummary = {
           frontendTotalMs: appStateRequestEndedAt - APP_BOOT_STARTED_AT,
           appStateRequestMs: appStateRequestEndedAt - appStateRequestStartedAt,
           backend: state.startupTimings,
         }
+        selectedModelsRef.current = selectedModels
         setSettings({
           ...state.settings,
           theme,
@@ -1279,6 +1307,7 @@ export function App() {
           enableAgentControl: Boolean(state.settings.enableAgentControl || false),
           agentControlPort: Number(state.settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT),
           agentControlBindAll: Boolean(state.settings.agentControlBindAll || false),
+          selectedModels,
         })
         setAgentControlPortDraft(String(state.settings.agentControlPort || DEFAULT_AGENT_CONTROL_PORT))
         applyTheme(theme)
@@ -1491,14 +1520,47 @@ export function App() {
   }, [keyConfigured, settings.showDiemBalance])
 
   useEffect(() => {
-    if (!imageModel && imageModels.length > 0) setImageModel(firstModelId(imageModels))
-    if (!editModel && editModels.length > 0) setEditModel(firstModelId(editModels))
-    if (!videoModel && videoModels.length > 0) setVideoModel(firstModelId(videoModels))
-    if (!musicModel && musicModels.length > 0) setMusicModel(firstModelId(musicModels))
-    if (!sfxModel && sfxModels.length > 0) setSfxModel(firstModelId(sfxModels))
-    if (!voiceModel && voiceModels.length > 0) setVoiceModel(firstModelId(voiceModels))
-    if (!transcribeModel && transcribeModels.length > 0) setTranscribeModel(firstModelId(transcribeModels))
-  }, [editModel, editModels, imageModel, imageModels, musicModel, musicModels, sfxModel, sfxModels, transcribeModel, transcribeModels, videoModel, videoModels, voiceModel, voiceModels])
+    const selectedModels = settings.selectedModels ?? {}
+    if (!imageModel && imageModels.length > 0) setImageModel(selectedOrFirstModelId(imageModels, selectedModels, 'image'))
+    if (!editModel && editModels.length > 0) setEditModel(selectedOrFirstModelId(editModels, selectedModels, 'edit'))
+    if (!videoModel && videoModels.length > 0) setVideoModel(selectedOrFirstModelId(videoModels, selectedModels, 'video'))
+    if (!musicModel && musicModels.length > 0) setMusicModel(selectedOrFirstModelId(musicModels, selectedModels, 'music'))
+    if (!sfxModel && sfxModels.length > 0) setSfxModel(selectedOrFirstModelId(sfxModels, selectedModels, 'sfx'))
+    if (!voiceModel && voiceModels.length > 0) setVoiceModel(selectedOrFirstModelId(voiceModels, selectedModels, 'voice'))
+    if (!transcribeModel && transcribeModels.length > 0) setTranscribeModel(selectedOrFirstModelId(transcribeModels, selectedModels, 'transcribe'))
+  }, [editModel, editModels, imageModel, imageModels, musicModel, musicModels, settings.selectedModels, sfxModel, sfxModels, transcribeModel, transcribeModels, videoModel, videoModels, voiceModel, voiceModels])
+
+  useEffect(() => {
+    if (!startupReady) return
+    const next: Partial<Record<ModelKind, string>> = {}
+    if (imageModel) next.image = imageModel
+    if (editModel) next.edit = editModel
+    if (videoModel) next.video = videoModel
+    if (musicModel) next.music = musicModel
+    if (sfxModel) next.sfx = sfxModel
+    if (voiceModel) next.voice = voiceModel
+    if (transcribeModel) next.transcribe = transcribeModel
+
+    const previousJson = JSON.stringify(selectedModelsRef.current)
+    const nextJson = JSON.stringify(next)
+    if (previousJson === nextJson) return
+
+    selectedModelsRef.current = next
+    setSettings((current) => ({ ...current, selectedModels: next }))
+    call<AppSettings>('save_settings', { request: { selectedModels: next } })
+      .then((saved) => {
+        selectedModelsRef.current = saved.selectedModels ?? next
+        setSettings((current) => ({
+          ...current,
+          ...saved,
+          theme: current.theme,
+          selectedModels: saved.selectedModels ?? next,
+        }))
+      })
+      .catch((err) => {
+        console.warn('Failed to save selected models', err)
+      })
+  }, [editModel, imageModel, musicModel, sfxModel, startupReady, transcribeModel, videoModel, voiceModel])
 
   useEffect(() => {
     concurrencyRef.current = concurrency
@@ -1535,9 +1597,9 @@ export function App() {
   const videoDurations = supportedControlArray(currentVideoModel, 'durationOptions', VIDEO_DURATION_OPTIONS)
   const videoResolutions = supportedControlArray(currentVideoModel, 'resolutionOptions', VIDEO_RESOLUTION_OPTIONS)
   const videoRatios = supportedControlArray(currentVideoModel, 'aspectRatioOptions', VIDEO_ASPECT_OPTIONS)
-  const selectedVideoDuration = videoDurations.includes(videoDuration) ? videoDuration : videoDurations[0] ?? ''
-  const selectedVideoResolution = videoResolutions.includes(videoResolution) ? videoResolution : videoResolutions[0] ?? ''
-  const selectedVideoAspectRatio = videoRatios.includes(videoAspectRatio) ? videoAspectRatio : videoRatios[0] ?? ''
+  const selectedVideoDuration = selectedControlOption(videoDurations, videoDuration, controlString(currentVideoModel, 'defaultDuration'))
+  const selectedVideoResolution = selectedControlOption(videoResolutions, videoResolution, controlString(currentVideoModel, 'defaultResolution'))
+  const selectedVideoAspectRatio = selectedControlOption(videoRatios, videoAspectRatio, controlString(currentVideoModel, 'defaultAspectRatio'))
   const supportsMusicDuration = controlBool(currentMusicModel, 'supportsDurationSeconds', true)
   const supportsMusicLyrics = controlBool(currentMusicModel, 'supportsLyrics', true)
   const supportsMusicInstrumental = controlBool(currentMusicModel, 'supportsInstrumental', true)
@@ -3744,6 +3806,40 @@ function QueueSummary({ label, stats, limit, now }: { label: string; stats: JobS
   )
 }
 
+function compactOptions(options: string[], limit = 4): string {
+  if (options.length <= limit) return options.join(', ')
+  return `${options.slice(0, limit).join(', ')} +${options.length - limit}`
+}
+
+function videoInputSummary(model: ModelRecord): string {
+  const inputs = [
+    controlBool(model, 'supportsTextToVideo', false) && 'text',
+    controlBool(model, 'supportsSourceImage', false) && 'image',
+    controlBool(model, 'supportsSourceVideo', false) && 'video',
+  ].filter(Boolean)
+  return inputs.length > 0 ? `Input ${inputs.join('/')}` : ''
+}
+
+function modelConstraintSummary(model: ModelRecord): string {
+  if (model.kind !== 'video') return model.id
+
+  const details = [model.id]
+  const durations = rawControlArray(model, 'durationOptions')
+  const resolutions = rawControlArray(model, 'resolutionOptions')
+  const ratios = rawControlArray(model, 'aspectRatioOptions')
+  const promptLimit = numberFromValue(model.controls?.promptCharacterLimit)
+  const inputSummary = videoInputSummary(model)
+
+  if (durations.length > 0) details.push(`Seconds ${compactOptions(durations)}`)
+  if (resolutions.length > 0) details.push(`Resolution ${compactOptions(resolutions)}`)
+  if (ratios.length > 0) details.push(`Aspect ${compactOptions(ratios)}`)
+  if (inputSummary) details.push(inputSummary)
+  if (controlBool(model, 'supportsAudio', false)) details.push('Audio')
+  if (promptLimit !== null) details.push(`Prompt ${promptLimit.toLocaleString()} chars`)
+
+  return details.join(' · ')
+}
+
 function ModelTable({
   kind,
   models,
@@ -3759,7 +3855,7 @@ function ModelTable({
         <div className="model-row" key={model.id}>
           <div>
             <strong>{modelDisplayName(model)}</strong>
-            <small>{model.id}</small>
+            <small title={modelConstraintSummary(model)}>{modelConstraintSummary(model)}</small>
           </div>
           <button className="icon-button danger" type="button" onClick={() => onHide(kind, model.id)} title="Remove model">
             <Trash2 size={16} />

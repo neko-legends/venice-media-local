@@ -8,18 +8,21 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Local, Utc};
+use local_ip_address::list_afinet_netifas;
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
-    io::{ErrorKind, Seek, SeekFrom, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 use tokio::net::TcpListener;
@@ -83,6 +86,8 @@ struct AppSettings {
     agent_control_bind_all: bool,
     #[serde(default)]
     agent_control_token: Option<String>,
+    #[serde(default)]
+    selected_models: BTreeMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -100,6 +105,7 @@ impl Default for AppSettings {
             agent_control_port: default_agent_control_port(),
             agent_control_bind_all: false,
             agent_control_token: None,
+            selected_models: BTreeMap::new(),
         }
     }
 }
@@ -118,6 +124,7 @@ fn default_settings(app: &AppHandle) -> AppSettings {
         agent_control_port: default_agent_control_port(),
         agent_control_bind_all: false,
         agent_control_token: None,
+        selected_models: BTreeMap::new(),
     }
 }
 
@@ -184,6 +191,7 @@ struct SaveSettingsRequest {
     enable_agent_control: Option<bool>,
     agent_control_port: Option<u16>,
     agent_control_bind_all: Option<bool>,
+    selected_models: Option<BTreeMap<String, String>>,
     // We do not allow the frontend to set the token directly for security
 }
 
@@ -460,6 +468,18 @@ fn has_api_key() -> bool {
 }
 
 const DEFAULT_AGENT_CONTROL_PORT: u16 = 9876;
+const TAILSCALE_IP_SUCCESS_CACHE_TTL: Duration = Duration::from_secs(30);
+const TAILSCALE_IP_MISS_CACHE_TTL: Duration = Duration::from_secs(3);
+const TAILSCALE_IP_LOOKUP_TIMEOUT: Duration = Duration::from_millis(600);
+const TAILSCALE_IP_LOOKUP_POLL: Duration = Duration::from_millis(10);
+
+#[derive(Clone)]
+struct TailscaleLookupCache {
+    value: Option<String>,
+    checked_at: Instant,
+}
+
+static TAILSCALE_IPV4_CACHE: OnceLock<Mutex<Option<TailscaleLookupCache>>> = OnceLock::new();
 
 fn default_agent_control_port() -> u16 {
     DEFAULT_AGENT_CONTROL_PORT
@@ -483,17 +503,93 @@ fn generate_agent_control_token() -> String {
     format!("vl-{mixed:016x}")
 }
 
-fn tailscale_ipv4_address() -> Option<String> {
-    let output = Command::new("tailscale").args(["ip", "-4"]).output().ok()?;
-    if !output.status.success() {
-        return None;
+fn tailscale_cache_ttl(value: &Option<String>) -> Duration {
+    if value.is_some() {
+        TAILSCALE_IP_SUCCESS_CACHE_TTL
+    } else {
+        TAILSCALE_IP_MISS_CACHE_TTL
     }
+}
 
-    String::from_utf8_lossy(&output.stdout)
+fn is_tailscale_ipv4_address(ip: Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 100 && (64..=127).contains(&second)
+}
+
+fn parse_tailscale_ipv4_output(stdout: &str) -> Option<String> {
+    stdout
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
-        .map(str::to_string)
+        .find_map(|line| line.parse::<Ipv4Addr>().ok())
+        .filter(|ip| is_tailscale_ipv4_address(*ip))
+        .map(|ip| ip.to_string())
+}
+
+fn tailscale_ipv4_address_from_interfaces() -> Option<String> {
+    for (name, ip) in list_afinet_netifas().ok()? {
+        let IpAddr::V4(ipv4) = ip else {
+            continue;
+        };
+        if name.to_ascii_lowercase().contains("tailscale") && is_tailscale_ipv4_address(ipv4) {
+            return Some(ipv4.to_string());
+        }
+    }
+
+    None
+}
+
+fn tailscale_ipv4_address_from_cli() -> Option<String> {
+    let mut child = Command::new("tailscale")
+        .args(["ip", "-4"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started_at = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().ok()? {
+            if !status.success() {
+                return None;
+            }
+
+            let mut stdout = String::new();
+            child.stdout.as_mut()?.read_to_string(&mut stdout).ok()?;
+            return parse_tailscale_ipv4_output(&stdout);
+        }
+
+        if started_at.elapsed() >= TAILSCALE_IP_LOOKUP_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        thread::sleep(TAILSCALE_IP_LOOKUP_POLL);
+    }
+}
+
+fn lookup_tailscale_ipv4_address() -> Option<String> {
+    tailscale_ipv4_address_from_interfaces().or_else(tailscale_ipv4_address_from_cli)
+}
+
+fn tailscale_ipv4_address() -> Option<String> {
+    let cache = TAILSCALE_IPV4_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.checked_at.elapsed() <= tailscale_cache_ttl(&cached.value) {
+                return cached.value.clone();
+            }
+        }
+    }
+
+    let value = lookup_tailscale_ipv4_address();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(TailscaleLookupCache {
+            value: value.clone(),
+            checked_at: Instant::now(),
+        });
+    }
+    value
 }
 
 fn agent_control_bind_host(bind_all: bool) -> String {
@@ -967,6 +1063,9 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
     }
     for model in &mut cache.edit_models {
         apply_known_image_resolution_controls(model);
+    }
+    for model in &mut cache.video_models {
+        apply_video_constraint_controls(model);
     }
     for model in &mut cache.music_models {
         apply_audio_support_controls(model);
@@ -1551,17 +1650,35 @@ fn balance_number(balances: &Value, keys: &[&str]) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+fn option_value_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(entry) => {
+            let trimmed = entry.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Object(map) => ["value", "label", "id", "name"]
+            .into_iter()
+            .find_map(|key| option_value_string(map.get(key)?)),
+        _ => None,
+    }
+}
+
+fn unique_options(options: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    options
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| seen.insert(entry.to_lowercase()))
+        .collect()
+}
+
 fn string_array(value: Option<&Value>) -> Vec<String> {
     match value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(ToString::to_string)
-            .collect(),
+        Some(Value::Array(items)) => items.iter().filter_map(option_value_string).collect(),
         Some(Value::Object(map)) => {
-            for key in ["options", "values", "allowed", "enum"] {
+            for key in ["options", "values", "allowed", "enum", "items"] {
                 let entries = string_array(map.get(key));
                 if !entries.is_empty() {
                     return entries;
@@ -1569,14 +1686,7 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
             }
             Vec::new()
         }
-        Some(Value::String(entry)) => {
-            let trimmed = entry.trim();
-            if trimmed.is_empty() {
-                Vec::new()
-            } else {
-                vec![trimmed.to_string()]
-            }
-        }
+        Some(value) => option_value_string(value).into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -1586,6 +1696,154 @@ fn first_string_array(value: &Value, keys: &[&str]) -> Vec<String> {
         let entries = string_array(value.get(key));
         if !entries.is_empty() {
             return entries;
+        }
+    }
+    Vec::new()
+}
+
+fn first_options_from_sources(sources: &[&Value], keys: &[&str]) -> Vec<String> {
+    sources
+        .iter()
+        .find_map(|source| {
+            let entries = first_string_array(source, keys);
+            (!entries.is_empty()).then_some(entries)
+        })
+        .unwrap_or_default()
+}
+
+fn first_option_from_sources(sources: &[&Value], keys: &[&str]) -> Option<String> {
+    sources.iter().find_map(|source| {
+        keys.iter()
+            .find_map(|key| source.get(*key).and_then(option_value_string))
+    })
+}
+
+fn bool_from_sources(sources: &[&Value], keys: &[&str]) -> Option<bool> {
+    sources.iter().find_map(|source| bool_field(source, keys))
+}
+
+fn normalize_duration_option(entry: String) -> Option<String> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if lower == "auto" {
+        return Some("Auto".to_string());
+    }
+
+    let number_text = [" seconds", " second", " secs", " sec"]
+        .into_iter()
+        .find_map(|suffix| {
+            lower
+                .strip_suffix(suffix)
+                .map(|_| &trimmed[..trimmed.len() - suffix.len()])
+        })
+        .or_else(|| {
+            if lower.ends_with('s') && !lower.ends_with("ms") {
+                Some(&trimmed[..trimmed.len() - 1])
+            } else {
+                None
+            }
+        })
+        .unwrap_or(trimmed)
+        .trim();
+
+    if let Ok(seconds) = number_text.parse::<f64>() {
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Some(format!("{}s", format_number_for_message(seconds)));
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn normalize_duration_options(options: Vec<String>) -> Vec<String> {
+    unique_options(
+        options
+            .into_iter()
+            .filter_map(normalize_duration_option)
+            .collect(),
+    )
+}
+
+fn duration_range_options(value: &Value) -> Vec<String> {
+    let min = number_field(
+        value,
+        &[
+            "min",
+            "minimum",
+            "min_seconds",
+            "minSeconds",
+            "min_duration",
+            "minDuration",
+            "min_duration_seconds",
+            "minDurationSeconds",
+            "minimum_duration_seconds",
+            "minimumDurationSeconds",
+        ],
+    );
+    let max = number_field(
+        value,
+        &[
+            "max",
+            "maximum",
+            "max_seconds",
+            "maxSeconds",
+            "max_duration",
+            "maxDuration",
+            "max_duration_seconds",
+            "maxDurationSeconds",
+            "maximum_duration_seconds",
+            "maximumDurationSeconds",
+        ],
+    );
+    let Some(min) = min else {
+        return Vec::new();
+    };
+    let Some(max) = max else {
+        return Vec::new();
+    };
+    if !min.is_finite() || !max.is_finite() || min < 0.0 || max < min {
+        return Vec::new();
+    }
+
+    let step = number_field(value, &["step", "step_seconds", "stepSeconds"])
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let count = ((max - min) / step).floor() as usize + 1;
+    if count == 0 || count > 120 {
+        return Vec::new();
+    }
+
+    let mut options = Vec::with_capacity(count);
+    let mut current = min;
+    while current <= max + f64::EPSILON && options.len() < count {
+        options.push(format!("{}s", format_number_for_message(current)));
+        current += step;
+    }
+    options
+}
+
+fn first_duration_options_from_sources(sources: &[&Value], keys: &[&str]) -> Vec<String> {
+    for source in sources {
+        for key in keys {
+            let Some(value) = source.get(*key) else {
+                continue;
+            };
+            let entries = normalize_duration_options(string_array(Some(value)));
+            if !entries.is_empty() {
+                return entries;
+            }
+            let range_entries = duration_range_options(value);
+            if !range_entries.is_empty() {
+                return range_entries;
+            }
+        }
+        let range_entries = duration_range_options(source);
+        if !range_entries.is_empty() {
+            return range_entries;
         }
     }
     Vec::new()
@@ -1620,8 +1878,10 @@ fn image_resolution_options(
         constraints,
         &[
             "resolutions",
+            "resolutionOptions",
             "resolution_options",
             "supported_resolutions",
+            "supportedResolutions",
             "resolutionTiers",
             "resolution_tiers",
         ],
@@ -1634,8 +1894,10 @@ fn image_resolution_options(
         capabilities,
         &[
             "resolutions",
+            "resolutionOptions",
             "resolution_options",
             "supported_resolutions",
+            "supportedResolutions",
             "resolutionTiers",
             "resolution_tiers",
         ],
@@ -1697,11 +1959,14 @@ fn normalized_model_id(entry: &Value) -> String {
 }
 
 fn video_mode_suffix(id: &str, name: &str, constraints: &Value) -> &'static str {
-    let model_type = as_string(constraints, "model_type");
+    let model_type =
+        first_option_from_sources(&[constraints], &["model_type", "modelType"]).unwrap_or_default();
+    let model_type_lower = model_type.to_lowercase();
     let haystack = format!("{id} {name} {model_type}").to_lowercase();
-    if haystack.contains("video-to-video") {
+    let video_input = bool_field(constraints, &["video_input", "videoInput"]).unwrap_or(false);
+    if haystack.contains("video-to-video") || (model_type_lower == "video" && video_input) {
         "V2V"
-    } else if haystack.contains("image-to-video") {
+    } else if haystack.contains("image-to-video") || haystack.contains("reference-to-video") {
         "I2V"
     } else if haystack.contains("text-to-video") {
         "T2V"
@@ -1719,6 +1984,227 @@ fn append_mode_suffix(name: &str, suffix: &str) -> String {
         name.to_string()
     } else {
         format!("{name} ({suffix})")
+    }
+}
+
+fn video_duration_options(constraints: &Value, capabilities: &Value) -> Vec<String> {
+    first_duration_options_from_sources(
+        &[constraints, capabilities],
+        &[
+            "durations",
+            "durationOptions",
+            "duration_options",
+            "supportedDurations",
+            "supported_durations",
+            "durationSeconds",
+            "duration_seconds",
+            "seconds",
+        ],
+    )
+}
+
+fn video_resolution_options(constraints: &Value, capabilities: &Value) -> Vec<String> {
+    unique_options(first_options_from_sources(
+        &[constraints, capabilities],
+        &[
+            "resolutions",
+            "resolutionOptions",
+            "resolution_options",
+            "supportedResolutions",
+            "supported_resolutions",
+        ],
+    ))
+}
+
+fn video_aspect_ratio_options(constraints: &Value, capabilities: &Value) -> Vec<String> {
+    unique_options(first_options_from_sources(
+        &[constraints, capabilities],
+        &[
+            "aspect_ratios",
+            "aspectRatios",
+            "aspectRatioOptions",
+            "aspect_ratio_options",
+            "supportedAspectRatios",
+            "supported_aspect_ratios",
+            "ratios",
+        ],
+    ))
+}
+
+fn video_default_duration(constraints: &Value, capabilities: &Value) -> Option<String> {
+    first_option_from_sources(
+        &[constraints, capabilities],
+        &[
+            "default_duration",
+            "defaultDuration",
+            "default_duration_seconds",
+            "defaultDurationSeconds",
+            "default_seconds",
+            "defaultSeconds",
+        ],
+    )
+    .and_then(normalize_duration_option)
+}
+
+fn video_controls_from_constraints(
+    id: &str,
+    name: &str,
+    haystack: &str,
+    constraints: &Value,
+    capabilities: &Value,
+) -> Value {
+    let sources = [constraints, capabilities];
+    let model_type =
+        first_option_from_sources(&sources, &["model_type", "modelType"]).unwrap_or_default();
+    let model_type_lower = model_type.to_lowercase();
+    let supports_source_image = bool_from_sources(
+        &sources,
+        &[
+            "image_input",
+            "imageInput",
+            "reference_image_input",
+            "referenceImageInput",
+            "supports_image_input",
+            "supportsImageInput",
+        ],
+    )
+    .unwrap_or_else(|| {
+        model_type_lower == "image-to-video"
+            || model_type_lower == "reference-to-video"
+            || haystack.contains("image-to-video")
+            || haystack.contains("reference-to-video")
+    });
+    let supports_source_video = bool_from_sources(
+        &sources,
+        &[
+            "video_input",
+            "videoInput",
+            "source_video",
+            "sourceVideo",
+            "supports_video_input",
+            "supportsVideoInput",
+        ],
+    )
+    .unwrap_or_else(|| {
+        model_type_lower == "video"
+            || model_type_lower == "video-to-video"
+            || haystack.contains("video-to-video")
+    });
+    let supports_text_to_video = bool_from_sources(
+        &sources,
+        &[
+            "text_input",
+            "textInput",
+            "supports_text_input",
+            "supportsTextInput",
+            "supports_text_to_video",
+            "supportsTextToVideo",
+        ],
+    )
+    .unwrap_or_else(|| model_type_lower == "text-to-video" || haystack.contains("text-to-video"));
+    let prompt_character_limit = model_number_field(
+        &Value::Null,
+        &Value::Null,
+        constraints,
+        capabilities,
+        &["prompt_character_limit", "promptCharacterLimit"],
+    );
+
+    let mut controls = json!({
+        "durationOptions": video_duration_options(constraints, capabilities),
+        "resolutionOptions": video_resolution_options(constraints, capabilities),
+        "aspectRatioOptions": video_aspect_ratio_options(constraints, capabilities),
+        "modelType": model_type,
+        "supportsSourceImage": supports_source_image,
+        "supportsSourceVideo": supports_source_video,
+        "supportsTextToVideo": supports_text_to_video,
+        "rawConstraints": constraints,
+        "rawCapabilities": capabilities
+    });
+
+    if let Some(default_duration) = video_default_duration(constraints, capabilities) {
+        controls["defaultDuration"] = json!(default_duration);
+    }
+    if let Some(default_resolution) =
+        first_option_from_sources(&sources, &["default_resolution", "defaultResolution"])
+    {
+        controls["defaultResolution"] = json!(default_resolution);
+    }
+    if let Some(default_aspect_ratio) =
+        first_option_from_sources(&sources, &["default_aspect_ratio", "defaultAspectRatio"])
+    {
+        controls["defaultAspectRatio"] = json!(default_aspect_ratio);
+    }
+    if let Some(limit) = prompt_character_limit {
+        controls["promptCharacterLimit"] = json!(limit);
+    }
+    if let Some(supports_audio) =
+        bool_from_sources(&sources, &["audio", "supports_audio", "supportsAudio"])
+    {
+        controls["supportsAudio"] = json!(supports_audio);
+    }
+    if let Some(audio_configurable) =
+        bool_from_sources(&sources, &["audio_configurable", "audioConfigurable"])
+    {
+        controls["audioConfigurable"] = json!(audio_configurable);
+    }
+    if let Some(supports_audio_input) = bool_from_sources(&sources, &["audio_input", "audioInput"])
+    {
+        controls["supportsAudioInput"] = json!(supports_audio_input);
+    }
+
+    let model_label = format!("{id} {name}").trim().to_string();
+    if !model_label.is_empty() {
+        controls["modelLabel"] = json!(model_label);
+    }
+
+    controls
+}
+
+fn apply_video_constraint_controls(model: &mut ModelRecord) {
+    if model.kind != "video" {
+        return;
+    }
+
+    let spec = model.raw.get("model_spec").unwrap_or(&Value::Null);
+    let constraints = spec
+        .get("constraints")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| model.controls.get("rawConstraints").cloned())
+        .unwrap_or(Value::Null);
+    let capabilities = spec
+        .get("capabilities")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| model.controls.get("rawCapabilities").cloned())
+        .unwrap_or(Value::Null);
+    if constraints.is_null() && capabilities.is_null() {
+        return;
+    }
+
+    let description = as_string(spec, "description").to_lowercase();
+    let haystack = format!(
+        "{} {} {}",
+        model.id.to_lowercase(),
+        model.name.to_lowercase(),
+        description
+    );
+    let normalized = video_controls_from_constraints(
+        &model.id,
+        &model.name,
+        &haystack,
+        &constraints,
+        &capabilities,
+    );
+
+    if !model.controls.is_object() {
+        model.controls = json!({});
+    }
+    if let (Some(target), Some(source)) = (model.controls.as_object_mut(), normalized.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -1775,7 +2261,17 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
             } else {
                 "generate-image"
             };
-            let size_options = string_array(constraints.get("aspect_ratios"));
+            let size_options = unique_options(first_options_from_sources(
+                &[&constraints, &capabilities],
+                &[
+                    "aspect_ratios",
+                    "aspectRatios",
+                    "aspectRatioOptions",
+                    "aspect_ratio_options",
+                    "supportedAspectRatios",
+                    "supported_aspect_ratios",
+                ],
+            ));
             let resolution_options =
                 image_resolution_options(&id, &name, &constraints, &capabilities);
             let controls = if is_edit {
@@ -1825,25 +2321,16 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
             })
         }
         "video" => {
-            let model_type = as_string(&constraints, "model_type");
-            let model_type_lower = model_type.to_lowercase();
             let suffix = video_mode_suffix(&id, &name, &constraints);
+            let display_name = append_mode_suffix(&name, suffix);
+            let controls =
+                video_controls_from_constraints(&id, &name, &haystack, &constraints, &capabilities);
             Some(ModelRecord {
                 id,
-                name: append_mode_suffix(&name, suffix),
+                name: display_name,
                 kind: "video".to_string(),
                 modes: vec!["generate-video".to_string()],
-                controls: json!({
-                    "durationOptions": string_array(constraints.get("durations")),
-                    "resolutionOptions": string_array(constraints.get("resolutions")),
-                    "aspectRatioOptions": string_array(constraints.get("aspect_ratios")),
-                    "modelType": model_type,
-                    "supportsSourceImage": haystack.contains("image-to-video") || model_type_lower == "image-to-video",
-                    "supportsSourceVideo": haystack.contains("video-to-video") || model_type_lower == "video-to-video",
-                    "supportsTextToVideo": haystack.contains("text-to-video") || model_type_lower == "text-to-video",
-                    "rawConstraints": constraints,
-                    "rawCapabilities": capabilities
-                }),
+                controls,
                 raw: entry,
             })
         }
@@ -2359,8 +2846,7 @@ fn save_media_bytes(
             .and_then(|value| value.as_u64())
             .map(|index| format!("-v{index}"))
             .unwrap_or_default();
-        image_file_stem(&metadata)
-            .unwrap_or_else(|| format!("{timestamp}-{stem}{variant_suffix}"))
+        image_file_stem(&metadata).unwrap_or_else(|| format!("{timestamp}-{stem}{variant_suffix}"))
     };
     let (name, path) = unique_file_path(&dir, &file_stem, ext);
     fs::write(&path, bytes).map_err(|err| err.to_string())?;
@@ -3154,7 +3640,10 @@ fn collect_app_state(
     let agent_control_port = settings.agent_control_port;
 
     Ok(AppState {
-        agent_control_address: agent_control_address(agent_control_port, settings.agent_control_bind_all),
+        agent_control_address: agent_control_address(
+            agent_control_port,
+            settings.agent_control_bind_all,
+        ),
         settings,
         key_configured: false,
         models,
@@ -3213,6 +3702,20 @@ fn save_settings(
     }
     if let Some(show_diem_balance) = request.show_diem_balance {
         settings.show_diem_balance = show_diem_balance;
+    }
+    if let Some(selected_models) = request.selected_models {
+        settings.selected_models = selected_models
+            .into_iter()
+            .filter_map(|(kind, model)| {
+                let kind = kind.trim().to_string();
+                let model = model.trim().to_string();
+                if kind.is_empty() || model.is_empty() {
+                    None
+                } else {
+                    Some((kind, model))
+                }
+            })
+            .collect();
     }
     let was_enabled = settings.enable_agent_control;
     let previous_port = settings.agent_control_port;

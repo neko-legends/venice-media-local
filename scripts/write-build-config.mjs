@@ -58,6 +58,9 @@ const version = packageInfo.version
 
 const config = {
   version,
+  build: {
+    beforeBuildCommand: null,
+  },
   bundle: {
     shortDescription: `Local Venice media generator (${builtAt}, ${metadata})`,
     longDescription: `A local desktop app for generating images, video, music, sound effects, and voice through the Venice API. Build ${builtAt}, ${metadata}.`,
