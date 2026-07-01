@@ -4,7 +4,7 @@ version = "26.6.30"
 description = "Local Venice media generation desktop app"
 authors = ["Neko Legends"]
 license = "MIT"
-repository = ""
+repository = "https://github.com/neko-legends/venice-media-local"
 edition = "2021"
 rust-version = "1.77.2"
 

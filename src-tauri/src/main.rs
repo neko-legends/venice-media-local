@@ -31,7 +31,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
 const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/neko-legends/VeniceMediaLocal/releases/latest";
+    "https://api.github.com/repos/neko-legends/venice-media-local/releases/latest";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
 const MIN_WINDOW_WIDTH: u32 = 960;

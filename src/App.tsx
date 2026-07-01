@@ -3152,11 +3152,14 @@ export function App() {
                       disabled={Boolean(agentControlBusyMessage)}
                       onChange={(event) => persistSettings({ ...settings, agentControlBindAll: event.target.checked })}
                     />
-                    <span>Bind all interfaces</span>
+                    <span>Bind all interfaces (advanced)</span>
                   </label>
+                  <small className="field-help">
+                    Leave this off unless a trusted agent cannot connect through the normal Tailscale or localhost address. It is mainly useful for LAN, VM, Docker, WSL, or unusual remote-agent setups.
+                  </small>
                   {settings.agentControlBindAll && (
                     <small className="field-help danger-help">
-                      This exposes Agent Control on 0.0.0.0. Use it only on a trusted network with a fresh token.
+                      This listens on 0.0.0.0, so every reachable network adapter can accept Agent Control connections. Use a trusted network and rotate the token first.
                     </small>
                   )}
                   <label className="field">

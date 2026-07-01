@@ -35,6 +35,12 @@ $bundleDir = Join-Path $releaseDir 'bundle\nsis'
 $portableSource = Join-Path $releaseDir 'venice-media-local.exe'
 $portableName = "Venice Media Local_${version}_x64-portable.exe"
 $portableTarget = Join-Path $bundleDir $portableName
+$installerName = "Venice Media Local_${version}_x64-setup.exe"
+$installerSource = Join-Path $bundleDir $installerName
+$standardInstallerDir = Join-Path $root 'release\installer'
+$standardPortableDir = Join-Path $root 'release\portable'
+$standardInstallerTarget = Join-Path $standardInstallerDir $installerName
+$standardPortableTarget = Join-Path $standardPortableDir 'venice-media-local.exe'
 
 if (-not (Test-Path -LiteralPath $portableSource -PathType Leaf)) {
   throw "Portable source executable not found: $portableSource"
@@ -60,4 +66,21 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
     Start-Sleep -Milliseconds 700
   }
 }
-Write-Host "Portable executable: $portableTarget"
+
+if (-not (Test-Path -LiteralPath $installerSource -PathType Leaf)) {
+  throw "Installer executable not found: $installerSource"
+}
+
+$installerItem = Get-Item -LiteralPath $installerSource
+if ($installerItem.LastWriteTime -lt $buildStartedAt) {
+  throw "Installer executable was not refreshed by this build: $installerSource"
+}
+
+New-Item -ItemType Directory -Force -Path $standardInstallerDir | Out-Null
+New-Item -ItemType Directory -Force -Path $standardPortableDir | Out-Null
+Copy-Item -LiteralPath $installerSource -Destination $standardInstallerTarget -Force
+Copy-Item -LiteralPath $portableSource -Destination $standardPortableTarget -Force
+
+Write-Host "Installer executable: $standardInstallerTarget"
+Write-Host "Portable executable: $standardPortableTarget"
+Write-Host "Versioned portable executable: $portableTarget"

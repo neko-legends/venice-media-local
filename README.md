@@ -20,7 +20,7 @@ Use an official release build or build the app locally, paste in your own Venice
 
 Release safety:
 
-Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience because Windows is the maintainer's main workstation. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
+Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience because Windows is the maintainer's main workstation. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/neko-legends/venice-media-local/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
 
 Platform note:
 
@@ -30,7 +30,7 @@ Installed and portable Windows builds share the same app identity, settings, and
 
 Plain-English release path:
 
-1. Download the latest release from this repo's [GitHub Releases page](https://github.com/flashosophy/VeniceMediaLocal/releases).
+1. Download the latest release from this repo's [GitHub Releases page](https://github.com/neko-legends/venice-media-local/releases).
 2. Compare the downloaded file's SHA256 hash with the hash in the release notes.
 3. Optionally upload the file to [VirusTotal](https://www.virustotal.com/gui/home/upload).
 4. Run the installer or direct `.exe`.
@@ -101,8 +101,8 @@ Agent install/build handoff:
 1. If a human wants convenience, point them to this repo's official GitHub Releases page, not random third-party `.exe` mirrors.
 2. If building locally on Windows, run `.\Build-Windows.ps1` from the repo root.
 3. If building locally on macOS or Linux, install the normal Tauri prerequisites for that OS, then run `npm run version:build` and `npm run tauri -- build --config src-tauri/tauri.version.conf.json`.
-4. After a successful Windows build, the installer and versioned portable executable are in `src-tauri\target\release\bundle\nsis\`.
-5. Tauri's raw direct Windows executable is also left in `src-tauri\target\release\`.
+4. After a successful Windows build, the installer is in `release\installer\` and the portable executable is in `release\portable\`.
+5. Tauri's raw bundle outputs are also left in `src-tauri\target\release\bundle\nsis\`.
 6. Do not commit `dist/`, `src-tauri/target/`, `node_modules/`, `.env*`, or generated media.
 7. If preparing release notes, include the build version, commit hash, SHA256 hashes, and a VirusTotal link if available.
 
@@ -124,7 +124,7 @@ Agents should start by reading the discovery file on the Windows machine:
 %APPDATA%\community.venice.media.local\control-api.json
 ```
 
-That file includes the `address`, `port`, `token`, app `version`, and bind address. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Binding `0.0.0.0` is an explicit Settings opt-in with a warning. Use the token as a Bearer token:
+That file includes the `address`, `port`, `token`, app `version`, and bind address. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Most users should leave **Bind all interfaces** off; turn it on only when a trusted agent cannot connect through the normal Tailscale or localhost address, such as LAN, VM, Docker, WSL, or unusual remote-agent setups. Binding `0.0.0.0` is an explicit Settings opt-in with a warning because every reachable network adapter can accept Agent Control connections. Use the token as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer <token>" http://<address>/api/v1/state
@@ -266,16 +266,18 @@ Keeping the app identifier stable and increasing this version on each build lets
 
 Note: Windows file metadata requires numeric version pieces, so Windows may strip the commit hash from the low-level `VIProductVersion`. The setup filename and generated Tauri version still include the hash metadata.
 
-Current bundle output:
+Current release output:
+
+```text
+release\installer\Venice Media Local_<build-version>_x64-setup.exe
+release\portable\venice-media-local.exe
+```
+
+Tauri's raw bundle outputs are also produced at:
 
 ```text
 src-tauri\target\release\bundle\nsis\Venice Media Local_<build-version>_x64-setup.exe
 src-tauri\target\release\bundle\nsis\Venice Media Local_<build-version>_x64-portable.exe
-```
-
-Tauri's raw direct executable is also produced at:
-
-```text
 src-tauri\target\release\venice-media-local.exe
 ```
 
