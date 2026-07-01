@@ -169,6 +169,8 @@ Remote media actions update the already-open Windows GUI live. Navigation, queue
 
 Two pitfalls discovered in live use:
 
+**Prefer camelCase in agent JSON.** The HTTP control API mirrors the GUI request structs, so fields like `aspectRatio`, `negativePrompt`, `safeMode`, `sourceImage`, and `queueId` are the canonical spelling. Snake_case aliases are accepted for compatibility, but older builds ignored optional snake_case fields such as `aspect_ratio`, which could silently produce the wrong image shape.
+
 **Cache the dataUrl after every generate call.** The generate response includes a base64 `dataUrl` field for each output image. The edit endpoint requires a dataUrl — not a Windows file path. If you don't save it immediately, you will have to re-generate the same image just to recover it. Write it to a temp file right after each generation and read it back when editing.
 
 **Send edit payloads via a file, not via shell arguments.** Edit request bodies contain a full base64 dataUrl and can be 300–400 KB. Passing that on the command line will exceed the OS argument length limit. Always write the JSON body to a temp file and use `--data-binary @/tmp/payload.json` with curl.

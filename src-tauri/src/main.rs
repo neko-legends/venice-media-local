@@ -198,7 +198,9 @@ struct SaveSettingsRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveDataUrlRequest {
+    #[serde(alias = "data_url")]
     data_url: String,
+    #[serde(alias = "destination_path")]
     destination_path: String,
 }
 
@@ -208,14 +210,19 @@ struct ImageGenerationRequest {
     model: String,
     title: Option<String>,
     prompt: String,
+    #[serde(alias = "negative_prompt")]
     negative_prompt: Option<String>,
+    #[serde(alias = "aspect_ratio")]
     aspect_ratio: Option<String>,
     resolution: Option<String>,
     variants: Option<u8>,
     steps: Option<u32>,
+    #[serde(alias = "cfg_scale")]
     cfg_scale: Option<f32>,
     seed: Option<u64>,
+    #[serde(alias = "hide_watermark")]
     hide_watermark: Option<bool>,
+    #[serde(alias = "safe_mode")]
     safe_mode: Option<bool>,
     format: Option<String>,
 }
@@ -223,12 +230,14 @@ struct ImageGenerationRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BackgroundRemoveRequest {
+    #[serde(alias = "source_image")]
     source_image: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageUpscaleRequest {
+    #[serde(alias = "source_image")]
     source_image: String,
     scale: u8,
 }
@@ -239,8 +248,10 @@ struct ImageMultiEditRequest {
     model: String,
     prompt: String,
     images: Vec<String>,
+    #[serde(alias = "aspect_ratio")]
     aspect_ratio: Option<String>,
     resolution: Option<String>,
+    #[serde(alias = "safe_mode")]
     safe_mode: Option<bool>,
 }
 
@@ -249,25 +260,36 @@ struct ImageMultiEditRequest {
 struct QueueMediaRequest {
     model: String,
     prompt: String,
+    #[serde(alias = "negative_prompt")]
     negative_prompt: Option<String>,
+    #[serde(alias = "source_image")]
     source_image: Option<String>,
+    #[serde(alias = "source_video")]
     source_video: Option<String>,
     duration: Option<String>,
+    #[serde(alias = "duration_seconds")]
     duration_seconds: Option<String>,
     resolution: Option<String>,
+    #[serde(alias = "aspect_ratio")]
     aspect_ratio: Option<String>,
+    #[serde(alias = "upscale_factor")]
     upscale_factor: Option<u8>,
+    #[serde(alias = "force_instrumental")]
     force_instrumental: Option<bool>,
+    #[serde(alias = "lyrics_prompt")]
     lyrics_prompt: Option<String>,
+    #[serde(alias = "lyrics_optimizer")]
     lyrics_optimizer: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RetrieveRequest {
+    #[serde(alias = "queue_id")]
     queue_id: String,
     model: Option<String>,
     kind: Option<String>,
+    #[serde(alias = "download_url")]
     download_url: Option<String>,
 }
 
@@ -279,9 +301,12 @@ struct SpeechRequest {
     voice: Option<String>,
     speed: Option<f32>,
     language: Option<String>,
+    #[serde(alias = "response_format")]
     response_format: Option<String>,
+    #[serde(alias = "style_prompt")]
     style_prompt: Option<String>,
     temperature: Option<f32>,
+    #[serde(alias = "top_p")]
     top_p: Option<f32>,
 }
 
@@ -290,8 +315,11 @@ struct SpeechRequest {
 struct TranscriptionRequest {
     model: String,
     audio: String,
+    #[serde(alias = "file_name")]
     file_name: Option<String>,
+    #[serde(alias = "mime_type")]
     mime_type: Option<String>,
+    #[serde(alias = "response_format")]
     response_format: Option<String>,
     timestamps: Option<bool>,
     language: Option<String>,
@@ -5413,6 +5441,74 @@ mod tests {
         assert_eq!(
             generic_file_stem(&metadata, "20260612-120000-000"),
             "20260612-120000-000"
+        );
+    }
+
+    #[test]
+    fn image_generation_request_accepts_camel_case_and_snake_case() {
+        let camel_case: ImageGenerationRequest = serde_json::from_value(json!({
+            "model": "gpt-image-2",
+            "prompt": "cat knight",
+            "negativePrompt": "text",
+            "aspectRatio": "1:1",
+            "resolution": "1K",
+            "cfgScale": 7.0,
+            "hideWatermark": true,
+            "safeMode": false
+        }))
+        .expect("camelCase request should deserialize");
+        assert_eq!(camel_case.aspect_ratio.as_deref(), Some("1:1"));
+        assert_eq!(camel_case.negative_prompt.as_deref(), Some("text"));
+        assert_eq!(camel_case.cfg_scale, Some(7.0));
+        assert_eq!(camel_case.hide_watermark, Some(true));
+        assert_eq!(camel_case.safe_mode, Some(false));
+
+        let snake_case: ImageGenerationRequest = serde_json::from_value(json!({
+            "model": "gpt-image-2",
+            "prompt": "cat knight",
+            "negative_prompt": "text",
+            "aspect_ratio": "1:1",
+            "resolution": "1K",
+            "cfg_scale": 7.0,
+            "hide_watermark": true,
+            "safe_mode": false
+        }))
+        .expect("snake_case aliases should deserialize");
+        assert_eq!(snake_case.aspect_ratio.as_deref(), Some("1:1"));
+        assert_eq!(snake_case.negative_prompt.as_deref(), Some("text"));
+        assert_eq!(snake_case.cfg_scale, Some(7.0));
+        assert_eq!(snake_case.hide_watermark, Some(true));
+        assert_eq!(snake_case.safe_mode, Some(false));
+    }
+
+    #[test]
+    fn agent_media_requests_accept_snake_case_aliases() {
+        let background: BackgroundRemoveRequest = serde_json::from_value(json!({
+            "source_image": "data:image/webp;base64,abc"
+        }))
+        .expect("background remove snake_case alias should deserialize");
+        assert_eq!(background.source_image, "data:image/webp;base64,abc");
+
+        let edit: ImageMultiEditRequest = serde_json::from_value(json!({
+            "model": "gpt-image-2-edit",
+            "prompt": "make it square",
+            "images": ["data:image/webp;base64,abc"],
+            "aspect_ratio": "1:1",
+            "safe_mode": false
+        }))
+        .expect("edit snake_case aliases should deserialize");
+        assert_eq!(edit.aspect_ratio.as_deref(), Some("1:1"));
+        assert_eq!(edit.safe_mode, Some(false));
+
+        let retrieve: RetrieveRequest = serde_json::from_value(json!({
+            "queue_id": "queue-123",
+            "download_url": "https://example.com/result"
+        }))
+        .expect("retrieve snake_case aliases should deserialize");
+        assert_eq!(retrieve.queue_id, "queue-123");
+        assert_eq!(
+            retrieve.download_url.as_deref(),
+            Some("https://example.com/result")
         );
     }
 }

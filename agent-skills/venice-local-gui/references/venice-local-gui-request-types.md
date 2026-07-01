@@ -4,6 +4,8 @@ Extracted directly from the running app source (`src-tauri/src/main.rs`) during 
 
 These are the **exact** shapes the HTTP handlers accept. Use them when building bodies for curl, Python requests, or any future client helper.
 
+JSON request bodies use camelCase by default because the Rust request structs are deserialized with `#[serde(rename_all = "camelCase")]`. Snake_case aliases are accepted for agent/back-compat convenience, but new examples and scripts should prefer camelCase so fields like `aspectRatio` are not accidentally dropped by older app builds.
+
 ## AgentRequest wrapper (used by most POST endpoints)
 
 ```rust
@@ -28,18 +30,25 @@ struct ImageGenerationRequest {
     model: String,
     title: Option<String>,
     prompt: String,
+    #[serde(alias = "negative_prompt")]
     negative_prompt: Option<String>,
+    #[serde(alias = "aspect_ratio")]
     aspect_ratio: Option<String>,
     resolution: Option<String>,
     variants: Option<u8>,
     steps: Option<u32>,
+    #[serde(alias = "cfg_scale")]
     cfg_scale: Option<f32>,
     seed: Option<u64>,
+    #[serde(alias = "hide_watermark")]
     hide_watermark: Option<bool>,
+    #[serde(alias = "safe_mode")]
     safe_mode: Option<bool>,
     format: Option<String>,
 }
 ```
+
+Canonical JSON field names: `model`, `title`, `prompt`, `negativePrompt`, `aspectRatio`, `resolution`, `variants`, `steps`, `cfgScale`, `seed`, `hideWatermark`, `safeMode`, `format`.
 
 **Minimal working body example** (what actually succeeded in the 2026-05-21 verification run):
 
@@ -48,7 +57,7 @@ struct ImageGenerationRequest {
   "model": "flux-2-max",
   "prompt": "cyberpunk cat on a neon motorcycle",
   "variants": 2,
-  "aspect_ratio": "16:9"
+  "aspectRatio": "16:9"
 }
 ```
 
@@ -62,10 +71,10 @@ The handler:
 
 ## Other key types (abbreviated, same source)
 
-- `BackgroundRemoveRequest { source_image: String }`
-- `ImageUpscaleRequest { source_image: String, scale: u8 }` (only 2 or 4)
-- `ImageMultiEditRequest { model, prompt, images: Vec<String>, aspect_ratio?, resolution?, safe_mode? }` — used by `/api/v1/edit-image`. `images` must be base64 data URLs, not file paths.
-- `QueueMediaRequest` for video/music/SFX queues (has queue_id + retrieve pattern)
+- `BackgroundRemoveRequest { sourceImage: String }` (alias: `source_image`)
+- `ImageUpscaleRequest { sourceImage: String, scale: u8 }` (only 2 or 4; alias: `source_image`)
+- `ImageMultiEditRequest { model, prompt, images: Vec<String>, aspectRatio?, resolution?, safeMode? }` - used by `/api/v1/edit-image`. `images` must be base64 data URLs, not file paths.
+- `QueueMediaRequest` for video/music/SFX queues (retrieve with `queueId`; alias: `queue_id`)
 
 ## ImageMultiEditRequest (for POST /api/v1/edit-image) — verified 2026-05-21
 
@@ -76,11 +85,15 @@ struct ImageMultiEditRequest {
     model: String,
     prompt: String,
     images: Vec<String>,        // base64 data URLs (e.g. "data:image/webp;base64,...")
+    #[serde(alias = "aspect_ratio")]
     aspect_ratio: Option<String>,
     resolution: Option<String>,
+    #[serde(alias = "safe_mode")]
     safe_mode: Option<bool>,
 }
 ```
+
+Canonical JSON field names: `model`, `prompt`, `images`, `aspectRatio`, `resolution`, `safeMode`.
 
 **CRITICAL:** The `images` field takes base64 data URLs, NOT Windows file paths. The app's `multi_edit_image_input()` passes the string directly to the Venice API `/image/multi-edit` endpoint.
 

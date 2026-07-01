@@ -57,7 +57,7 @@ Auth header (required for now):
 - `POST /api/v1/generate-image`
   Body: ImageGenerationRequest (see types below)
 
-- `POST /api/v1/edit-image`          (ImageMultiEditRequest — body: model, prompt, images: [dataUrl], aspect_ratio?)
+- `POST /api/v1/edit-image`          (ImageMultiEditRequest - body: model, prompt, images: [dataUrl], aspectRatio?)
 - `POST /api/v1/remove-background`
 - `POST /api/v1/upscale-image`
 
@@ -119,7 +119,7 @@ This file contains the full ImageGenerationRequest, AgentRequest wrapper, proven
        "model": "flux-2-max",
        "prompt": "cyberpunk cat on a neon motorcycle",
        "variants": 2,
-       "aspect_ratio": "16:9"
+       "aspectRatio": "16:9"
      }'
    ```
 
