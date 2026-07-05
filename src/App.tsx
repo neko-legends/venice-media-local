@@ -3143,7 +3143,7 @@ export function App() {
                     <span>Enable AI Agent Remote Control</span>
                   </label>
                   <small className="field-help">
-                    Starts a local HTTP API on the selected port. This is always off when the app launches and must be enabled manually. By default it binds to your Tailscale IP when available, otherwise 127.0.0.1.
+                    Starts a local HTTP API on the selected port. This setting is saved across launches. By default it binds to your Tailscale IP when available, otherwise 127.0.0.1.
                   </small>
                   <label className="toggle-row">
                     <input

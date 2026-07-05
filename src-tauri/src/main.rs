@@ -734,16 +734,49 @@ fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), Str
     write_json_file(&path, settings)
 }
 
-fn force_session_settings_off_on_launch(app: &AppHandle) {
+fn force_private_session_off_on_launch(app: &AppHandle) {
     let mut settings = read_settings(app);
-    if !settings.enable_agent_control && !settings.private_session {
+    if !settings.private_session {
         return;
     }
 
-    settings.enable_agent_control = false;
     settings.private_session = false;
     if let Err(err) = save_settings_file(app, &settings) {
         eprintln!("[settings] Failed to reset launch state: {err}");
+    }
+}
+
+fn start_saved_agent_control_on_launch(app: AppHandle, handle: &AgentControlHandle) {
+    let mut settings = read_settings(&app);
+    if !settings.enable_agent_control {
+        return;
+    }
+
+    let token = match settings
+        .agent_control_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => token.to_string(),
+        None => {
+            let token = generate_agent_control_token();
+            settings.agent_control_token = Some(token.clone());
+            if let Err(err) = save_settings_file(&app, &settings) {
+                eprintln!("[settings] Failed to save Agent Control token on launch: {err}");
+            }
+            token
+        }
+    };
+
+    if let Err(err) = start_agent_control_server(
+        app,
+        token,
+        settings.agent_control_port,
+        settings.agent_control_bind_all,
+        handle,
+    ) {
+        eprintln!("[agent-control] Failed to restore saved Agent Control state: {err}");
     }
 }
 
@@ -5357,8 +5390,13 @@ fn main() {
 
             let app_handle = app.handle().clone();
             let started_at = Instant::now();
-            force_session_settings_off_on_launch(&app_handle);
-            metrics.push("reset session launch state", started_at);
+            force_private_session_off_on_launch(&app_handle);
+            metrics.push("reset private session launch state", started_at);
+
+            let started_at = Instant::now();
+            let agent_handle = app.state::<AgentControlHandle>();
+            start_saved_agent_control_on_launch(app_handle.clone(), &*agent_handle);
+            metrics.push("restore agent control launch state", started_at);
 
             let started_at = Instant::now();
             if let Some(window) = app.get_webview_window("main") {
