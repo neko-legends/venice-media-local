@@ -10,7 +10,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 1421",
     "version:build": "node scripts/write-build-config.mjs",
     "tauri": "tauri",
-    "test:readiness-contract": "node --test scripts/readiness-contract.test.mjs"
+    "test:readiness-contract": "node --test scripts/readiness-contract.test.mjs",
+    "test:provider-contract": "node --test scripts/provider-contract.test.mjs scripts/provider-cross-contract.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

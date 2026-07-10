@@ -116,7 +116,7 @@ venice-media-local / venice-api-key
 
 ### Theater Mode Remote Control
 
-Venice Media Local can expose a local HTTP control API for trusted agents on the same Tailscale network. The human must open the app, go to Settings, and manually enable **AI Agent Remote Control** each session. It is always off when the app starts.
+Venice Media Local can expose a local HTTP control API for trusted agents on the same Tailscale network. The human enables **AI Agent Remote Control** in Settings. That choice is saved: if it was enabled when the app closed, the app restores the control server on its next launch. Turning it off in Settings stops the server and keeps it off on later launches.
 
 Agents should start by reading the discovery file on the Windows machine:
 
@@ -124,7 +124,7 @@ Agents should start by reading the discovery file on the Windows machine:
 %APPDATA%\community.venice.media.local\control-api.json
 ```
 
-That file includes the `address`, `port`, `token`, app `version`, and bind address. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Most users should leave **Bind all interfaces** off; turn it on only when a trusted agent cannot connect through the normal Tailscale or localhost address, such as LAN, VM, Docker, WSL, or unusual remote-agent setups. Binding `0.0.0.0` is an explicit Settings opt-in with a warning because every reachable network adapter can accept Agent Control connections. Use the token as a Bearer token:
+That file includes the existing `address`, `port`, `token`, app `version`, and bind address fields, plus additive `manifestUrl`, `healthUrl`, and `schemaVersions` provider-discovery fields. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Most users should leave **Bind all interfaces** off; turn it on only when a trusted agent cannot connect through the normal Tailscale or localhost address, such as LAN, VM, Docker, WSL, or unusual remote-agent setups. Binding `0.0.0.0` is an explicit Settings opt-in with a warning because every reachable network adapter can accept Agent Control connections. Use the token as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer <token>" http://<address>/api/v1/state
@@ -144,6 +144,8 @@ Useful Theater Mode endpoints:
 
 ```text
 GET  /api/v1/state
+GET  /api/v1/capabilities
+GET  /api/v1/health
 POST /api/v1/navigate
 POST /api/v1/generate-image
 POST /api/v1/edit-image

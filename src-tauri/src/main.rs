@@ -34,6 +34,7 @@ const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/neko-legends/venice-media-local/releases/latest";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
+const CAPABILITY_SCHEMA_VERSION: &str = "1.0";
 const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 540;
 const FALLBACK_WINDOW_WIDTH: u32 = 1280;
@@ -508,6 +509,7 @@ struct TailscaleLookupCache {
 }
 
 static TAILSCALE_IPV4_CACHE: OnceLock<Mutex<Option<TailscaleLookupCache>>> = OnceLock::new();
+static INSTALLATION_INSTANCE_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn default_agent_control_port() -> u16 {
     DEFAULT_AGENT_CONTROL_PORT
@@ -639,6 +641,146 @@ fn agent_control_address(port: u16, bind_all: bool) -> String {
     }
 }
 
+fn capability_machine_id() -> String {
+    let raw = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local-machine".to_string());
+    let normalized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        "local-machine".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn installation_instance_id_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("capability-provider-instance-id"))
+}
+
+fn is_valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-'))
+}
+
+fn installation_instance_id(app: &AppHandle) -> Result<String, String> {
+    let cache = INSTALLATION_INSTANCE_ID.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "Installation instance ID lock is unavailable".to_string())?;
+    if let Some(value) = cached.as_ref() {
+        return Ok(value.clone());
+    }
+
+    let path = installation_instance_id_path(app)?;
+    if let Ok(value) = fs::read_to_string(&path) {
+        let value = value.trim();
+        if is_valid_provider_id(value) {
+            let value = value.to_string();
+            *cached = Some(value.clone());
+            return Ok(value);
+        }
+    }
+
+    let instance_id = format!(
+        "vml-{}",
+        generate_agent_control_token().trim_start_matches("vl-")
+    );
+    fs::write(&path, format!("{instance_id}\n")).map_err(|err| err.to_string())?;
+    *cached = Some(instance_id.clone());
+    Ok(instance_id)
+}
+
+fn capability_base_url(address: &str) -> String {
+    format!("http://{address}")
+}
+
+fn capability_manifest(app: &AppHandle, address: &str) -> Result<Value, String> {
+    let mut manifest: Value = serde_json::from_str(include_str!("capability-manifest.v1.json"))
+        .expect("embedded capability manifest must be valid JSON");
+    let base_url = capability_base_url(address);
+    manifest["provider"]["instanceId"] = json!(installation_instance_id(app)?);
+    manifest["provider"]["machineId"] = json!(capability_machine_id());
+    manifest["provider"]["version"] = json!(app.package_info().version.to_string());
+    manifest["transport"]["baseUrl"] = json!(base_url);
+    manifest["transport"]["manifestUrl"] = json!(format!(
+        "{}/api/v1/capabilities",
+        capability_base_url(address)
+    ));
+    Ok(manifest)
+}
+
+fn model_cache_has_usable_models(cache: &ModelCache) -> bool {
+    [
+        &cache.image_models,
+        &cache.edit_models,
+        &cache.video_models,
+        &cache.music_models,
+        &cache.sfx_models,
+        &cache.voice_models,
+        &cache.transcribe_models,
+    ]
+    .into_iter()
+    .any(|models| models.iter().any(|model| !model.id.trim().is_empty()))
+}
+
+fn capability_health(app: &AppHandle) -> Result<Value, String> {
+    let key_configured = has_api_key();
+    let models_loaded = model_cache_has_usable_models(&read_model_cache(app));
+    let operations_ready = key_configured && models_loaded;
+    let status = if operations_ready {
+        "ready"
+    } else if key_configured {
+        "degraded"
+    } else {
+        "unavailable"
+    };
+    Ok(json!({
+        "schemaVersion": CAPABILITY_SCHEMA_VERSION,
+        "provider": {
+            "id": "venice-media-local",
+            "instanceId": installation_instance_id(app)?
+        },
+        "status": status,
+        "observedAt": Utc::now().to_rfc3339(),
+        "checks": {
+            "agentControl": { "status": "ready" },
+            "veniceCredential": {
+                "status": if key_configured { "ready" } else { "unavailable" },
+                "configured": key_configured
+            },
+            "models": {
+                "status": if models_loaded { "ready" } else { "unavailable" },
+                "loaded": models_loaded
+            },
+            "operations": {
+                "status": if operations_ready { "ready" } else { "unavailable" },
+                "ready": operations_ready
+            }
+        },
+        "version": app.package_info().version.to_string()
+    }))
+}
+
 /// Write the control-api.json discovery file so agents / the skill can auto-discover
 /// the address, port and token without manual config.
 fn write_agent_control_discovery(
@@ -666,6 +808,9 @@ fn write_agent_control_discovery(
         "port": port,
         "token": token,
         "version": app.package_info().version.to_string(),
+        "manifestUrl": format!("{}/api/v1/capabilities", capability_base_url(&address)),
+        "healthUrl": format!("{}/api/v1/health", capability_base_url(&address)),
+        "schemaVersions": [CAPABILITY_SCHEMA_VERSION],
         "note": "Connect using the address and token. Same Tailscale network recommended."
     });
     let path = dir.join("control-api.json");
@@ -4937,6 +5082,27 @@ async fn agent_get_state(
     Ok(Json(serde_json::to_value(app_state).unwrap()))
 }
 
+async fn agent_get_capabilities(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    let settings = read_settings(&state.app);
+    let address =
+        agent_control_address(settings.agent_control_port, settings.agent_control_bind_all);
+    Ok(Json(
+        capability_manifest(&state.app, &address).map_err(agent_error)?,
+    ))
+}
+
+async fn agent_get_health(
+    State(state): State<AgentControlState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AgentApiError> {
+    check_agent_token(&state, &headers)?;
+    Ok(Json(capability_health(&state.app).map_err(agent_error)?))
+}
+
 async fn agent_navigate(
     State(state): State<AgentControlState>,
     headers: HeaderMap,
@@ -5307,6 +5473,8 @@ fn start_agent_control_server(
 
         let router = Router::new()
             .route("/api/v1/state", get(agent_get_state))
+            .route("/api/v1/capabilities", get(agent_get_capabilities))
+            .route("/api/v1/health", get(agent_get_health))
             .route("/api/v1/navigate", post(agent_navigate))
             .route("/api/v1/generate-image", post(agent_generate_image))
             .route("/api/v1/edit-image", post(agent_edit_image))
