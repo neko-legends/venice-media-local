@@ -3706,7 +3706,7 @@ fn collect_app_state(
             settings.agent_control_bind_all,
         ),
         settings,
-        key_configured: false,
+        key_configured: has_api_key(),
         models,
         build_version,
         startup_timings: StartupTimings {
