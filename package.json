@@ -12,6 +12,7 @@
     "tauri": "tauri",
     "test:readiness-contract": "node --test scripts/readiness-contract.test.mjs",
     "test:provider-contract": "node --test scripts/provider-contract.test.mjs scripts/provider-cross-contract.test.mjs",
+    "test:phase5h": "node --test scripts/phase5h-readiness.test.mjs",
     "test:provider-real-cross-repo": "node --test ../eva-core/server/phase5-real-venice-wire.test.js"
   },
   "dependencies": {
