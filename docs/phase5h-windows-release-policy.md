@@ -2,6 +2,8 @@
 
 Status: verification-ready specification. No production action is performed by the readiness harness.
 
+The reviewed release source commit must carry the workspace-required agent identity and `Agent:` trailer before it can be named by the LAND packet.
+
 ## Inputs and roots
 
 - Accepted artifacts are the NSIS setup executable and portable executable produced by `Build-Windows.ps1`: `Venice Media Local_<version>_x64-setup.exe` and `Venice Media Local_<version>_x64-portable.exe`. Release archives are not accepted.
