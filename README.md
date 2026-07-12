@@ -276,17 +276,24 @@ The helper script generates a temporary Tauri config at:
 src-tauri\tauri.version.conf.json
 ```
 
-That file is ignored by git. It currently uses the fixed version from `package.json`, shaped like:
+That file is ignored by git. It gives the installer a build-time version shaped like:
 
 ```text
-26.7.6
+2026.5.9221530+gabcdef12
 ```
 
-The build timestamp and git state are recorded in the generated bundle descriptions, not in the version or artifact filename. Commit first for real public release installers so that metadata identifies a commit rather than a dirty tree.
+Meaning:
+
+- `2026` = year
+- `5` = month
+- `9221530` = day + time, here day 9 at 22:15:30
+- `gabcdef12` = git commit hash
+
+If the project has not been committed in its own repo yet, the hash part becomes `gnogit`. Commit first for real public release installers.
 
 Keeping the app identifier stable and increasing this version on each build lets the Windows setup executable install over/upgrade an existing install instead of looking like the same old build.
 
-The generated Tauri version and Windows file version are the same numeric package version.
+Note: Windows file metadata requires numeric version pieces, so Windows may strip the commit hash from the low-level `VIProductVersion`. The setup filename and generated Tauri version still include the hash metadata.
 
 Current release output:
 
