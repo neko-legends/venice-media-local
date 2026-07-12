@@ -3,119 +3,159 @@ import fs from 'node:fs'
 import test from 'node:test'
 
 const root = new URL('../', import.meta.url)
-const source = fs.readFileSync(new URL('src-tauri/src/main.rs', root), 'utf8').replaceAll('\r\n', '\n')
+const main = fs.readFileSync(new URL('src-tauri/src/main.rs', root), 'utf8').replaceAll('\r\n', '\n')
+const provider = fs.readFileSync(new URL('src-tauri/src/provider.rs', root), 'utf8').replaceAll('\r\n', '\n')
+const kernel = fs.readFileSync(new URL('src-tauri/provider-kernel/src/lib.rs', root), 'utf8').replaceAll('\r\n', '\n')
 const manifest = JSON.parse(fs.readFileSync(new URL('src-tauri/src/capability-manifest.v1.json', root), 'utf8'))
+const wire = JSON.parse(fs.readFileSync(new URL('../eva-core/docs/venice-media-operation-v1-wire-fixture.json', root), 'utf8'))
 
-const expectedCapabilities = new Map([
-  ['media.image.generate', ['/api/v1/generate-image', 'none']],
-  ['media.image.edit', ['/api/v1/edit-image', 'none']],
-  ['media.image.background-remove', ['/api/v1/remove-background', 'none']],
-  ['media.image.upscale', ['/api/v1/upscale-image', 'none']],
-  ['media.video.generate', ['/api/v1/queue-video', 'poll']],
-  ['media.audio.music.generate', ['/api/v1/queue-music', 'poll']],
-  ['media.audio.sfx.generate', ['/api/v1/queue-sfx', 'poll']],
-  ['media.voice.generate', ['/api/v1/generate-speech', 'none']],
-  ['media.transcribe', ['/api/v1/transcribe-audio', 'none']],
-  ['media.models.list', ['/api/v1/state', 'none']],
-  ['media.models.refresh', ['/api/v1/refresh-models', 'none']],
-])
+const expected = [
+  'media.image.generate', 'media.image.edit', 'media.image.background-remove', 'media.image.upscale',
+  'media.video.generate', 'media.audio.music.generate', 'media.audio.sfx.generate', 'media.voice.generate',
+  'media.transcribe', 'media.models.list', 'media.models.refresh',
+]
 
-test('schema 1.0 manifest maps exactly to the existing media routes', () => {
+test('schema 1.0 exposes unique routable revision-2 capabilities and deprecated revision-1 descriptors', () => {
   assert.equal(manifest.schemaVersion, '1.0')
-  assert.equal(manifest.provider.id, 'venice-media-local')
-  assert.equal(manifest.provider.kind, 'media')
-  assert.deepEqual(new Set(manifest.capabilities.map(({ id }) => id)), new Set(expectedCapabilities.keys()))
-
+  assert.deepEqual(manifest.capabilities.map(({ id }) => id), expected)
+  assert.deepEqual(manifest.compatibilityCapabilities.map(({ id }) => id), expected)
   for (const capability of manifest.capabilities) {
-    const [path, progressMode] = expectedCapabilities.get(capability.id)
-    assert.equal(capability.invocation.path, path, capability.id)
-    assert.match(source, new RegExp(`\\.route\\("${path.replaceAll('/', '\\/')}"`), `${path} must remain routed`)
-    assert.equal(capability.progress.mode, progressMode, capability.id)
-    assert.deepEqual(capability.cancellation, { supported: false }, capability.id)
-    assert.equal(capability.inputSchema.$schema, 'https://json-schema.org/draft/2020-12/schema')
-    assert.equal(capability.outputSchema.$schema, 'https://json-schema.org/draft/2020-12/schema')
-    assert.ok(Array.isArray(capability.sideEffects) && capability.sideEffects.length > 0)
-    assert.ok(typeof capability.riskClass === 'string' && capability.riskClass.length > 0)
-    assert.ok(typeof capability.approvalClass === 'string' && capability.approvalClass.length > 0)
-    assert.ok(Array.isArray(capability.artifacts))
+    assert.equal(capability.revision, '2')
+    assert.deepEqual(capability.invocation, { envelope: 'veniceMediaOperation.v1', method: 'POST', path: '/api/v1/operations' })
+    assert.deepEqual(capability.progress, {
+      mode: 'callback',
+      pollFallbackPath: '/api/v1/operations/{providerOperationId}',
+      eventReplayPath: '/api/v1/operations/{providerOperationId}/events',
+    })
+    assert.equal(capability.cancellation.supported, true)
+    assert.equal(capability.cancellation.idempotent, true)
+    assert.deepEqual(capability.cancellation.scope, ['pre_submission'])
+    assert.equal(capability.inputSchema.additionalProperties, false)
+  }
+  for (const compatibility of manifest.compatibilityCapabilities) {
+    assert.equal(compatibility.revision, '1')
+    assert.equal(compatibility.deprecated, true)
+    assert.match(main, new RegExp(`\\.route\\("${compatibility.path.replaceAll('/', '\\/')}"`))
   }
 })
 
-test('queued capabilities advertise polling but no provider cancellation', () => {
-  const queued = manifest.capabilities.filter(({ progress }) => progress.mode === 'poll')
-  assert.deepEqual(queued.map(({ id }) => id).sort(), [
-    'media.audio.music.generate',
-    'media.audio.sfx.generate',
-    'media.video.generate',
-  ])
-  for (const capability of queued) {
-    assert.equal(capability.progress.intervalMs, 2000)
-    assert.equal(capability.invocation.poll.path, capability.progress.path)
-    assert.equal(capability.invocation.poll.operationIdField, 'queueId')
-    assert.equal(capability.cancellation.supported, false)
-    assert.equal(capability.cancellation.path, undefined)
-  }
-})
-
-test('manifest and health routes are bearer protected and credential-free', () => {
-  for (const handler of ['agent_get_capabilities', 'agent_get_health']) {
-    const body = source.match(new RegExp(`async fn ${handler}[\\s\\S]*?\\n\\}`))?.[0] || ''
-    assert.match(body, /check_agent_token\(&state, &headers\)\?/)
-  }
-
-  const serialized = JSON.stringify(manifest).toLowerCase()
-  for (const forbidden of ['token', 'api_key', 'apikey', 'cookie', 'password', 'settings', 'outputdir']) {
-    assert.equal(serialized.includes(forbidden), false, `manifest leaked forbidden field: ${forbidden}`)
-  }
-
-  const health = source.match(/fn capability_health[\s\S]*?\n\}/)?.[0] || ''
-  assert.doesNotMatch(health, /read_settings|agent_control_token|output_dir|VENICE_API_KEY|read_api_key/)
-  assert.match(health, /key_configured = has_api_key\(\)/)
-  assert.match(health, /models_loaded = model_cache_has_usable_models\(&read_model_cache\(app\)\)/)
-  assert.match(health, /operations_ready = key_configured && models_loaded/)
-  assert.match(health, /if operations_ready[\s\S]*"ready"[\s\S]*else if key_configured[\s\S]*"degraded"[\s\S]*else[\s\S]*"unavailable"/)
-})
-
-test('discovery keeps legacy fields and adds provider URLs and schema versions', () => {
-  const writer = source.match(/fn write_agent_control_discovery[\s\S]*?\n\}/)?.[0] || ''
-  for (const legacyField of ['address', 'bindAddress', 'bindAll', 'tailscaleIp', 'port', 'token', 'version', 'note']) {
-    assert.match(writer, new RegExp(`"${legacyField}"\\s*:`), `missing legacy discovery field ${legacyField}`)
-  }
-  assert.match(writer, /"manifestUrl": format!\("\{\}\/api\/v1\/capabilities"/)
-  assert.match(writer, /"healthUrl": format!\("\{\}\/api\/v1\/health"/)
-  assert.match(writer, /"schemaVersions": \[CAPABILITY_SCHEMA_VERSION\]/)
-  assert.match(source, /\.route\("\/api\/v1\/capabilities", get\(agent_get_capabilities\)\)/)
-  assert.match(source, /\.route\("\/api\/v1\/health", get\(agent_get_health\)\)/)
-})
-
-test('artifact declarations match provider-local response delivery', () => {
-  const producing = manifest.capabilities.filter(({ artifacts }) => artifacts.length > 0)
-  assert.ok(producing.length > 0)
-  for (const capability of producing) {
-    for (const artifact of capability.artifacts) {
-      assert.ok(artifact.role)
-      assert.ok(artifact.kinds.length > 0)
-      assert.equal(artifact.kind, undefined)
-      assert.ok(artifact.mimeTypes.length > 0)
-      assert.ok(artifact.deliveryModes.length > 0)
-      for (const mode of artifact.deliveryModes) {
-        assert.ok(['data-url', 'provider-path', 'inline', 'provider-reference', 'url', 'eva-core', 'project'].includes(mode), `${capability.id}: ${mode}`)
-      }
+test('async operation, upload, artifact, event, and cancel routes are all wired', () => {
+  for (const [method, path, constant] of [
+    ['post', '/api/v1/operations', 'OPERATIONS_PATH'],
+    ['get', '/api/v1/operations/:operation_id', 'OPERATION_PATH'],
+    ['get', '/api/v1/operations/:operation_id/events', 'OPERATION_EVENTS_PATH'],
+    ['post', '/api/v1/operations/:operation_id/cancel', 'OPERATION_CANCEL_PATH'],
+    ['post', '/api/v1/operations/:operation_id/execute', 'OPERATION_EXECUTE_PATH'],
+    ['post', '/api/v1/operations/:operation_id/transfer-grants', 'OPERATION_GRANTS_PATH'],
+    ['post', '/api/v1/artifact-uploads', 'UPLOADS_PATH'],
+    ['put', '/api/v1/artifact-uploads/:upload_id/content', 'UPLOAD_CONTENT_PATH'],
+    ['post', '/api/v1/artifact-uploads/:upload_id/complete', 'UPLOAD_COMPLETE_PATH'],
+    ['delete', '/api/v1/artifact-uploads/:upload_id', 'UPLOAD_PATH'],
+    ['get', '/api/v1/artifacts/:artifact_id', 'ARTIFACT_PATH'],
+    ['get', '/api/v1/artifacts/:artifact_id/content', 'ARTIFACT_CONTENT_PATH'],
+  ]) {
+    if (constant) {
+      assert.match(kernel, new RegExp(`pub const ${constant}: &str = "${path.replaceAll('/', '\\/')}"`), path)
+      assert.match(kernel, new RegExp(`\\.route\\(\\s*${constant}[\\s\\S]*?${method}\\(`), path)
+    } else {
+      assert.match(provider, new RegExp(`\\.route\\(\\s*"${path.replaceAll('/', '\\/')}"[\\s\\S]*?${method}\\(`), path)
     }
   }
+  assert.match(main, /\.merge\(kernel\.router\(\)\)/)
+  assert.doesNotMatch(main, /\.merge\(provider::routes\(\)\)/)
+  assert.doesNotMatch(main, /provider::recover\(/)
 })
 
-test('installation instance ID is persisted separately from machine identity', () => {
-  const idHelper = source.match(/fn installation_instance_id\([\s\S]*?\n\}/)?.[0] || ''
-  const manifestHelper = source.match(/fn capability_manifest\([\s\S]*?\n\}/)?.[0] || ''
-  const healthHelper = source.match(/fn capability_health\([\s\S]*?\n\}/)?.[0] || ''
+test('the executable provider uses the canonical Core wire ordering and field names', () => {
+  assert.equal(wire.type, 'veniceMediaOperation.v1')
+  assert.equal(wire.grantRegistration.path, '/api/v1/operations/{providerOperationId}/transfer-grants')
+  assert.deepEqual(wire.uploadOrdering.slice(-2), [
+    'POST /api/v1/artifact-uploads/{uploadId}/complete',
+    'POST /api/v1/operations/{providerOperationId}/execute',
+  ])
+  for (const field of Object.keys(wire.grantRegistration.body)) {
+    const rustField = field.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)
+    assert.match(kernel, new RegExp(`\\b${rustField}\\b`), field)
+  }
+  assert.match(kernel, /x-transfer-grant-id/)
+  assert.match(kernel, /x-transfer-grant"/)
+})
 
-  assert.match(source, /join\("capability-provider-instance-id"\)/)
-  assert.match(source, /static INSTALLATION_INSTANCE_ID: OnceLock<Mutex<Option<String>>>/)
-  assert.match(idHelper, /INSTALLATION_INSTANCE_ID\.get_or_init/)
-  assert.match(idHelper, /fs::read_to_string\(&path\)/)
-  assert.match(idHelper, /fs::write\(&path, format!\("\{instance_id\}\\n"\)\)/)
-  assert.match(manifestHelper, /\["instanceId"\] = json!\(installation_instance_id\(app\)\?\)/)
-  assert.match(manifestHelper, /\["machineId"\] = json!\(capability_machine_id\(\)\)/)
-  assert.match(healthHelper, /"instanceId": installation_instance_id\(app\)\?/)
+test('manifest, health, state, discovery, and ledgers exclude credentials', () => {
+  const serialized = JSON.stringify(manifest).toLowerCase()
+  for (const forbidden of ['api_key', 'apikey', 'cookie', 'password', 'authorization']) {
+    assert.equal(serialized.includes(forbidden), false, forbidden)
+  }
+  assert.match(main, /agent_control_token: Option<String>/)
+  assert.match(main, /persisted\.agent_control_token = None/)
+  assert.match(main, /settings\.remove\("agentControlToken"\)/)
+  assert.doesNotMatch(main.match(/let discovery = serde_json::json!\([\s\S]*?\n    \}\);/)?.[0] || '', /"token"\s*:/)
+  assert.match(main, /"credentialId"\s*:/)
+  assert.match(provider, /EncryptedSecrets/)
+  assert.match(provider, /AES-256-GCM/)
+  assert.match(provider, /keyring::Entry/)
+  assert.match(kernel, /SecretProtector/)
+  assert.match(kernel, /EncryptedSecret/)
+  for (const field of ['grant_id', 'core_operation_id', 'attempt', 'assignment_revision', 'capability_id', 'method', 'path', 'scope', 'upload_id', 'artifact_id', 'expected_sha256', 'expected_byte_size', 'expected_mime_type', 'not_before', 'expires_at', 'max_uses', 'uses']) {
+    assert.match(kernel, new RegExp(`\\b${field}\\b`), field)
+  }
+  assert.match(kernel, /verify_grant/)
+  assert.match(provider, /register_lifecycle_once/)
+  assert.match(provider, /send_lifecycle_heartbeat/)
+  assert.match(provider, /unregister_lifecycle/)
+})
+
+test('health is compatibility-shaped but fallback-only catalogs cannot report ready', () => {
+  const health = main.match(/fn capability_health[\s\S]*?\n\}/)?.[0] || ''
+  for (const field of ['agentControl', 'veniceCredential', 'models', 'operations', 'operationLedger', 'callbackOutbox', 'artifactStore', 'disk']) {
+    assert.match(health, new RegExp(`"${field}"`))
+  }
+  assert.match(health, /MODEL_CATALOG_FALLBACK_ONLY/)
+  assert.match(health, /operations_ready = key_configured && models_loaded && ledger_ready && artifact_writable/)
+  assert.match(health, /"availableBytes": null/)
+})
+
+test('provider ledger records admission before execution and never blindly resubmits', () => {
+  assert.match(kernel, /submission_not_started/)
+  assert.match(kernel, /submission_started/)
+  assert.match(kernel, /submitted_confirmed/)
+  assert.match(kernel, /executor\.submit/)
+  assert.match(kernel, /executor\.resume/)
+  assert.match(kernel, /Started submission cannot be invoked again/)
+  assert.match(kernel, /SUBMISSION_OUTCOME_UNKNOWN/)
+  assert.match(main, /TauriMediaExecutor/)
+  assert.match(main, /\.merge\(kernel\.router\(\)\)/)
+  assert.doesNotMatch(main, /\.merge\(provider::routes\(\)\)/)
+})
+
+test('sidecars and async records are bounded and descriptor-first while legacy dataUrl remains', () => {
+  assert.match(main, /omittedMetadataSha256/)
+  assert.match(main, /Media sidecar exceeds the 64 KiB safety limit/)
+  assert.match(main, /atomic_write_bytes/)
+  assert.doesNotMatch(main.match(/fn media_sidecar_json[\s\S]*?\n\}/)?.[0] || '', /unwrap_or_else\(\|\| metadata\.clone\(\)\)/)
+  assert.match(main, /data_url: format!\("data:\{mime_type\};base64,\{encoded\}"\)/)
+  for (const capability of manifest.capabilities.filter(({ artifacts }) => artifacts.length)) {
+    assert.ok(capability.artifacts.every(({ deliveryModes }) => deliveryModes.includes('provider-reference')))
+  }
+})
+
+test('production catalog binds model and model-less capabilities explicitly', () => {
+  assert.match(main, /"capabilityIds": capability_ids/)
+  for (const [id, capability] of [
+    ['background-remove', 'media.image.background-remove'],
+    ['upscale', 'media.image.upscale'],
+    ['model-list', 'media.models.list'],
+    ['model-refresh', 'media.models.refresh'],
+  ]) {
+    assert.match(main, new RegExp(`"id":"${id}"[\\s\\S]*?"capabilityIds":\\["${capability.replaceAll('.', '\\.')}"\\]`))
+  }
+})
+
+test('shared ledger replacement is Windows-safe and recoverable', () => {
+  assert.match(kernel, /create_new\(true\)/)
+  assert.match(kernel, /sync_all\(\)/)
+  assert.match(kernel, /random_id\(""\)/)
+  assert.match(kernel, /with_extension\("bak"\)/)
+  assert.match(kernel, /recover_atomic\("ledger\.json"\)/)
+  assert.doesNotMatch(kernel, /let temp = path\.with_extension\("tmp"\)/)
 })

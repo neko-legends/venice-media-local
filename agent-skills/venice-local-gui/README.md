@@ -6,7 +6,7 @@ This skill allows your Hermes agent (or compatible skill loader) to control a ru
 
 1. In Venice Media Local, go to **Settings > AI Agent Control** and turn on **Enable AI Agent Remote Control**.
 2. Copy this entire folder (`agent-skills/venice-local-gui/`) into your `~/.hermes/skills/` directory.
-3. In `~/.hermes/config.yaml`, add a `venice_local` section with the Tailscale IP, port, and token shown in the Settings panel (or let the agent read the `control-api.json` discovery file automatically).
+3. In `~/.hermes/config.yaml`, add a `venice_local` section with the Tailscale IP, port, and locally provisioned credential. Discovery provides the address and credential fingerprint, never the credential value.
 
 Once installed, you can say things like:
 

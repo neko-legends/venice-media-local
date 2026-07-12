@@ -16,14 +16,25 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 local-ip-address = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2.4.2"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 # For the AI Agent Remote Control HTTP API (gated behind the setting)
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit", "timeout"] }
+aes-gcm = "0.10"
+async-trait = "0.1"
+atomicwrites = "0.4"
+futures-util = "0.3"
+image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "webp"] }
+jsonschema = { version = "=0.18.0", default-features = false, features = ["draft202012"] }
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+venice-provider-kernel = { path = "provider-kernel" }

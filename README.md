@@ -124,13 +124,13 @@ Agents should start by reading the discovery file on the Windows machine:
 %APPDATA%\community.venice.media.local\control-api.json
 ```
 
-That file includes the existing `address`, `port`, `token`, app `version`, and bind address fields, plus additive `manifestUrl`, `healthUrl`, and `schemaVersions` provider-discovery fields. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Most users should leave **Bind all interfaces** off; turn it on only when a trusted agent cannot connect through the normal Tailscale or localhost address, such as LAN, VM, Docker, WSL, or unusual remote-agent setups. Binding `0.0.0.0` is an explicit Settings opt-in with a warning because every reachable network adapter can accept Agent Control connections. Use the token as a Bearer token:
+That file includes non-secret `address`, `port`, app `version`, bind address, credential fingerprint, `manifestUrl`, `healthUrl`, and `schemaVersions` fields. The bearer credential is held in the operating-system credential store and is never written to discovery or returned by `/api/v1/state`. By default the server binds to the Tailscale IPv4 address when available, otherwise `127.0.0.1`. Most users should leave **Bind all interfaces** off; turn it on only when a trusted agent cannot connect through the normal Tailscale or localhost address, such as LAN, VM, Docker, WSL, or unusual remote-agent setups. Binding `0.0.0.0` is an explicit Settings opt-in with a warning because every reachable network adapter can accept Agent Control connections. Use the locally provisioned credential as a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer <token>" http://<address>/api/v1/state
 ```
 
-(The discovery file contains the exact address and token — no need to guess them.)
+(The discovery file contains the exact address and a non-secret credential fingerprint. It does not contain credential material.)
 
 The default control port is `9876`, and Settings lets you change it. If the connection times out, check Tailscale Access Controls. Add a rule where the remote agent machine is the source, the Windows machine running Venice Media Local is the destination, and the port/protocol matches the discovery file:
 
@@ -167,15 +167,40 @@ GET  /api/v1/burn-folder-stats
 POST /api/v1/burn-folder
 ```
 
+The endpoints above are revision-1 compatibility routes and retain their existing response shapes, including `dataUrl`. Phase 5 automation should use the revision-2 provider contract:
+
+```text
+POST   /api/v1/operations
+GET    /api/v1/operations/:providerOperationId
+GET    /api/v1/operations/:providerOperationId/events
+POST   /api/v1/operations/:providerOperationId/cancel
+POST   /api/v1/operations/:providerOperationId/transfer-grants
+POST   /api/v1/operations/:providerOperationId/execute
+POST   /api/v1/artifact-uploads
+PUT    /api/v1/artifact-uploads/:uploadId/content
+POST   /api/v1/artifact-uploads/:uploadId/complete
+DELETE /api/v1/artifact-uploads/:uploadId
+GET    /api/v1/artifacts/:providerArtifactId
+GET    /api/v1/artifacts/:providerArtifactId/content
+```
+
+Revision 2 is descriptor-first: it stores durable operation/event evidence, streams sealed inputs and artifact downloads, bounds upstream output buffering, and does not persist inline media. Callback credentials are encrypted with a key protected by the OS credential store. If protected storage is unavailable or an existing ledger key is missing, operation admission fails closed and never replaces the key.
+
+Every transfer requires `X-Transfer-Grant-ID` plus `X-Transfer-Grant`. Grants are durable, consumable, and exact-bound to the operation, attempt, assignment revision, capability, HTTP method/path/scope, artifact or upload identity, SHA-256, byte size, MIME type, validity interval, and maximum uses. Core first admits the operation with exact expected input artifacts, then registers grants through the operation-bound route, creates/writes/seals those uploads, and finally calls `execute`. Text-to-video declares no input artifact; image-to-video declares and seals its first-frame artifact before execution.
+
+Provider lifecycle credentials are separate from the invocation token and Venice API key. The protected local `configure_provider_lifecycle` command stores the scoped credential only in the OS credential store; lifecycle credentials are never imported from environment variables. Non-secret Core origin/credential metadata is written atomically. When configured, the provider self-registers, persists each exact heartbeat body/sequence/digest before delivery, replays ambiguous heartbeats unchanged, and unregisters on Agent Control shutdown or application exit. Discovery-file/manual handoff remains available while lifecycle configuration is absent or degraded.
+
+Queued work can be canceled only during `pre_submission` while `submission_not_started`; cancellation after Venice submission truthfully reports `unsupported`.
+
 Remote media actions update the already-open Windows GUI live. Navigation, queues, generated results, result clearing, and burn-folder moves should appear in the app as if the human had clicked through the workflow.
 
 Two pitfalls discovered in live use:
 
 **Prefer camelCase in agent JSON.** The HTTP control API mirrors the GUI request structs, so fields like `aspectRatio`, `negativePrompt`, `safeMode`, `sourceImage`, and `queueId` are the canonical spelling. Snake_case aliases are accepted for compatibility, but older builds ignored optional snake_case fields such as `aspect_ratio`, which could silently produce the wrong image shape.
 
-**Cache the dataUrl after every generate call.** The generate response includes a base64 `dataUrl` field for each output image. The edit endpoint requires a dataUrl — not a Windows file path. If you don't save it immediately, you will have to re-generate the same image just to recover it. Write it to a temp file right after each generation and read it back when editing.
+**Legacy only: cache the dataUrl after every generate call.** The revision-1 generate response includes a base64 `dataUrl` field for each output image, and the legacy edit endpoint requires it. Revision-2 operations use sealed artifact uploads instead and never require command-line base64.
 
-**Send edit payloads via a file, not via shell arguments.** Edit request bodies contain a full base64 dataUrl and can be 300–400 KB. Passing that on the command line will exceed the OS argument length limit. Always write the JSON body to a temp file and use `--data-binary @/tmp/payload.json` with curl.
+**Legacy only: send edit payloads via a file, not via shell arguments.** Revision-1 edit bodies can contain a large data URL. Revision 2 streams exact bytes through the upload routes and forbids embedded media in operation JSON.
 
 #### Agent skill for Hermes
 

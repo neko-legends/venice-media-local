@@ -11,7 +11,8 @@
     "version:build": "node scripts/write-build-config.mjs",
     "tauri": "tauri",
     "test:readiness-contract": "node --test scripts/readiness-contract.test.mjs",
-    "test:provider-contract": "node --test scripts/provider-contract.test.mjs scripts/provider-cross-contract.test.mjs"
+    "test:provider-contract": "node --test scripts/provider-contract.test.mjs scripts/provider-cross-contract.test.mjs",
+    "test:provider-real-cross-repo": "node --test ../eva-core/server/phase5-real-venice-wire.test.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

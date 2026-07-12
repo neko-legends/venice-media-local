@@ -8,7 +8,7 @@ This document captures the diagnostic pattern that emerged when the embedded HTT
 - Local loopback test succeeds: `curl -H "Authorization: Bearer *** http://127.0.0.1:<port>/api/v1/state`
 - Self-Tailscale-IP test succeeds from the target machine: `curl ... http://<target-tailscale-ip>:<port>/api/v1/state`
 - `netstat` / `Get-NetTCPConnection` shows `0.0.0.0:<port>` LISTENING on the correct process
-- Discovery file written and token visible in Settings
+- Discovery file written with address and credential fingerprint; credential provisioned locally through protected storage
 
 ### Tests to run from the agent side (Linux)
 Run these in order:

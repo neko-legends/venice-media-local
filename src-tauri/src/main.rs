@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -8,8 +9,10 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{Local, Utc};
+use futures_util::StreamExt;
 use local_ip_address::list_afinet_netifas;
 use reqwest::header::CONTENT_TYPE;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
@@ -27,9 +30,16 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
+
+mod provider;
+mod provider_kernel;
 
 const VENICE_BASE_URL: &str = "https://api.venice.ai/api/v1";
+#[cfg(test)]
+static TEST_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(test)]
+static TEST_VENICE_BASE_URL: OnceLock<String> = OnceLock::new();
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/neko-legends/venice-media-local/releases/latest";
 const KEYRING_SERVICE: &str = "venice-media-local";
@@ -144,6 +154,10 @@ struct ModelRecord {
 #[serde(rename_all = "camelCase")]
 struct ModelCache {
     last_fetched: String,
+    #[serde(default)]
+    catalog_source: String,
+    #[serde(default)]
+    category_errors: Vec<Value>,
     image_models: Vec<ModelRecord>,
     edit_models: Vec<ModelRecord>,
     video_models: Vec<ModelRecord>,
@@ -326,7 +340,7 @@ struct TranscriptionRequest {
     language: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaResult {
     id: String,
@@ -479,6 +493,10 @@ fn keyring_entry() -> Result<keyring::Entry, String> {
 }
 
 fn read_api_key() -> Result<String, String> {
+    #[cfg(test)]
+    if TEST_VENICE_BASE_URL.get().is_some() {
+        return Ok("synthetic-test-api-key".to_string());
+    }
     if let Ok(value) = std::env::var("VENICE_API_KEY") {
         let trimmed = value.trim().to_string();
         if !trimmed.is_empty() {
@@ -523,14 +541,32 @@ fn validate_agent_control_port(port: u16) -> Result<u16, String> {
 }
 
 fn generate_agent_control_token() -> String {
-    // Simple but sufficient token for Tailscale/local use (no extra deps)
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let pid = std::process::id();
-    let mixed = ts.rotate_left(17) ^ (pid as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    format!("vl-{mixed:016x}")
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("vl-{}", provider::hex(&bytes))
+}
+
+fn control_token_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, "agent-control-token").map_err(|err| err.to_string())
+}
+
+fn read_control_token(settings: &AppSettings) -> Result<Option<String>, String> {
+    match control_token_entry()?.get_password() {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        _ => Ok(settings
+            .agent_control_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)),
+    }
+}
+
+fn store_control_token(token: &str) -> Result<(), String> {
+    control_token_entry()?
+        .set_password(token)
+        .map_err(|err| err.to_string())
 }
 
 fn tailscale_cache_ttl(value: &Option<String>) -> Duration {
@@ -745,20 +781,53 @@ fn model_cache_has_usable_models(cache: &ModelCache) -> bool {
 
 fn capability_health(app: &AppHandle) -> Result<Value, String> {
     let key_configured = has_api_key();
-    let models_loaded = model_cache_has_usable_models(&read_model_cache(app));
-    let operations_ready = key_configured && models_loaded;
+    let cached = model_cache_path(app)
+        .ok()
+        .filter(|path| path.is_file())
+        .map(|path| read_json_file(&path, fallback_model_cache()));
+    let models_loaded = cached.as_ref().is_some_and(model_cache_has_usable_models);
+    let model_source = cached
+        .as_ref()
+        .map(|cache| match cache.catalog_source.as_str() {
+            "live" => "live",
+            "cached" => "cached",
+            _ if models_loaded => "cached",
+            _ => "fallback",
+        })
+        .unwrap_or("fallback");
+    let operation_health = provider::operation_health(app);
+    let ledger_ready = operation_health["ready"].as_bool().unwrap_or(false);
+    let artifact_writable = operation_health["artifactWritable"]
+        .as_bool()
+        .unwrap_or(false);
+    let operations_ready = key_configured && models_loaded && ledger_ready && artifact_writable;
     let status = if operations_ready {
         "ready"
-    } else if key_configured {
+    } else if key_configured && ledger_ready && artifact_writable {
         "degraded"
     } else {
         "unavailable"
     };
+    let mut degraded_reasons = Vec::new();
+    if !key_configured {
+        degraded_reasons.push("VENICE_CREDENTIAL_NOT_CONFIGURED");
+    }
+    if model_source == "fallback" {
+        degraded_reasons.push("MODEL_CATALOG_FALLBACK_ONLY");
+    }
+    if !ledger_ready {
+        degraded_reasons.push("OPERATION_LEDGER_UNAVAILABLE");
+    }
+    if !artifact_writable {
+        degraded_reasons.push("ARTIFACT_STORE_UNAVAILABLE");
+    }
     Ok(json!({
         "schemaVersion": CAPABILITY_SCHEMA_VERSION,
         "provider": {
             "id": "venice-media-local",
-            "instanceId": installation_instance_id(app)?
+            "instanceId": installation_instance_id(app)?,
+            "version": app.package_info().version.to_string(),
+            "machineId": capability_machine_id()
         },
         "status": status,
         "observedAt": Utc::now().to_rfc3339(),
@@ -766,17 +835,28 @@ fn capability_health(app: &AppHandle) -> Result<Value, String> {
             "agentControl": { "status": "ready" },
             "veniceCredential": {
                 "status": if key_configured { "ready" } else { "unavailable" },
-                "configured": key_configured
+                "configured": key_configured,
+                "verification": if key_configured { "configured" } else { "unknown" },
+                "lastVerifiedAt": null
             },
             "models": {
-                "status": if models_loaded { "ready" } else { "unavailable" },
-                "loaded": models_loaded
+                "status": if models_loaded { "ready" } else { "degraded" },
+                "loaded": models_loaded || model_source == "fallback",
+                "source": model_source,
+                "refreshedAt": cached.as_ref().and_then(|cache| if cache.last_fetched.is_empty() { None } else { Some(cache.last_fetched.clone()) })
             },
             "operations": {
                 "status": if operations_ready { "ready" } else { "unavailable" },
                 "ready": operations_ready
-            }
+            },
+            "operationLedger": { "status": if ledger_ready { "ready" } else { "unavailable" } },
+            "callbackOutbox": { "status": if operation_health["callbackDegradedCount"].as_u64().unwrap_or(0) > 0 { "degraded" } else { "ready" }, "pendingCount": operation_health["pendingCallbackCount"] },
+            "artifactStore": { "status": if artifact_writable { "ready" } else { "unavailable" }, "writable": artifact_writable },
+            "disk": { "status": "degraded", "availableBytes": null, "reason": "DISK_CAPACITY_UNKNOWN" }
         },
+        "lifecycle": provider::lifecycle_health(app),
+        "activeOperationCount": operation_health["activeOperationCount"],
+        "degradedReasons": degraded_reasons,
         "version": app.package_info().version.to_string()
     }))
 }
@@ -806,12 +886,12 @@ fn write_agent_control_discovery(
         "bindAll": bind_all,
         "tailscaleIp": tailscale_ip,
         "port": port,
-        "token": token,
+        "credentialId": format!("sha256:{}", &provider::sha256_hex(token.as_bytes())[..16]),
         "version": app.package_info().version.to_string(),
         "manifestUrl": format!("{}/api/v1/capabilities", capability_base_url(&address)),
         "healthUrl": format!("{}/api/v1/health", capability_base_url(&address)),
         "schemaVersions": [CAPABILITY_SCHEMA_VERSION],
-        "note": "Connect using the address and token. Same Tailscale network recommended."
+        "note": "Connect using the address and a separately provisioned credential. Same Tailscale network recommended."
     });
     let path = dir.join("control-api.json");
     std::fs::write(&path, serde_json::to_string_pretty(&discovery).unwrap())
@@ -821,12 +901,21 @@ fn write_agent_control_discovery(
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_APP_DATA_DIR.get() {
+        fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        return Ok(dir.clone());
+    }
     let dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     Ok(dir)
 }
 
 fn default_output_dir(app: &AppHandle) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_APP_DATA_DIR.get() {
+        return Ok(dir.join("output").to_string_lossy().to_string());
+    }
     let desktop = app.path().desktop_dir().map_err(|err| err.to_string())?;
     Ok(desktop.join("VeniceMedia").to_string_lossy().to_string())
 }
@@ -876,7 +965,9 @@ fn read_settings(app: &AppHandle) -> AppSettings {
 
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_path(app)?;
-    write_json_file(&path, settings)
+    let mut persisted = settings.clone();
+    persisted.agent_control_token = None;
+    write_json_file(&path, &persisted)
 }
 
 fn force_private_session_off_on_launch(app: &AppHandle) {
@@ -897,26 +988,36 @@ fn start_saved_agent_control_on_launch(app: AppHandle, handle: &AgentControlHand
         return;
     }
 
-    let token = match settings
-        .agent_control_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        Some(token) => token.to_string(),
-        None => {
-            let token = generate_agent_control_token();
-            settings.agent_control_token = Some(token.clone());
-            if let Err(err) = save_settings_file(&app, &settings) {
-                eprintln!("[settings] Failed to save Agent Control token on launch: {err}");
+    let token = match read_control_token(&settings) {
+        Ok(Some(token)) => {
+            if settings.agent_control_token.is_some() {
+                if let Err(err) = store_control_token(&token) {
+                    eprintln!("[agent-control] Credential migration failed: {err}");
+                    return;
+                }
+                settings.agent_control_token = None;
+                let _ = save_settings_file(&app, &settings);
             }
             token
+        }
+        Ok(None) => {
+            let token = generate_agent_control_token();
+            if let Err(err) = store_control_token(&token) {
+                eprintln!("[agent-control] Credential store unavailable: {err}");
+                return;
+            }
+            token
+        }
+        Err(err) => {
+            eprintln!("[agent-control] Credential store unavailable: {err}");
+            return;
         }
     };
 
     if let Err(err) = start_agent_control_server(
         app,
         token,
+        None,
         settings.agent_control_port,
         settings.agent_control_bind_all,
         handle,
@@ -996,6 +1097,8 @@ fn fallback_model_cache() -> ModelCache {
 
     ModelCache {
         last_fetched: String::new(),
+        catalog_source: "fallback".to_string(),
+        category_errors: Vec::new(),
         image_models: vec![
             model(
                 "gpt-image-2",
@@ -1387,17 +1490,20 @@ fn transcribe_controls(supports_language: bool, supports_timestamps: bool) -> Va
     })
 }
 
-fn client() -> reqwest::Client {
+fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("venice-media-local/0.1")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .map_err(|err| format!("Failed to initialize hardened HTTP client: {err}"))
 }
 
 async fn venice_get(path: &str) -> Result<reqwest::Response, String> {
     let key = read_api_key().map_err(|_| "Venice API key is not configured".to_string())?;
-    let url = format!("{VENICE_BASE_URL}{path}");
-    let response = client()
+    let url = format!("{}{path}", venice_base_url());
+    let response = client()?
         .get(url)
         .bearer_auth(key)
         .send()
@@ -1408,8 +1514,8 @@ async fn venice_get(path: &str) -> Result<reqwest::Response, String> {
 
 async fn venice_post_json(path: &str, body: Value) -> Result<reqwest::Response, String> {
     let key = read_api_key().map_err(|_| "Venice API key is not configured".to_string())?;
-    let url = format!("{VENICE_BASE_URL}{path}");
-    let response = client()
+    let url = format!("{}{path}", venice_base_url());
+    let response = client()?
         .post(url)
         .bearer_auth(key)
         .json(&body)
@@ -1419,17 +1525,60 @@ async fn venice_post_json(path: &str, body: Value) -> Result<reqwest::Response, 
     ensure_success(response).await
 }
 
+fn venice_base_url() -> &'static str {
+    #[cfg(test)]
+    if let Some(value) = TEST_VENICE_BASE_URL.get() {
+        return value;
+    }
+    VENICE_BASE_URL
+}
+
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, String> {
     if response.status().is_success() {
         return Ok(response);
     }
 
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = bounded_response_bytes(response, 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
     Err(format!(
         "Venice API returned {status}: {}",
         trim_error_text(&text)
     ))
+}
+
+async fn bounded_response_bytes(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err("HTTP response exceeds its configured bound".to_string());
+    }
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err("HTTP response exceeds its configured bound".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn bounded_response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T, String> {
+    serde_json::from_slice(&bounded_response_bytes(response, limit).await?)
+        .map_err(|error| error.to_string())
 }
 
 fn trim_error_text(text: &str) -> String {
@@ -2427,6 +2576,36 @@ fn is_deprecated_or_offline(entry: &Value) -> bool {
     !as_string(deprecation, "date").is_empty()
 }
 
+fn bounded_model_raw_summary(entry: &Value) -> Value {
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "id",
+        "name",
+        "type",
+        "model_type",
+        "owned_by",
+        "description",
+    ] {
+        if let Some(value) = entry.get(key) {
+            if let Some(text) = value.as_str() {
+                summary.insert(
+                    key.to_string(),
+                    json!(text.chars().take(512).collect::<String>()),
+                );
+            } else if value.is_boolean() || value.is_number() || value.is_null() {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    summary.insert(
+        "sourceDigest".to_string(),
+        json!(provider::sha256_hex(
+            serde_json::to_string(entry).unwrap_or_default().as_bytes()
+        )),
+    );
+    Value::Object(summary)
+}
+
 fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
     if is_deprecated_or_offline(&entry) {
         return None;
@@ -2523,7 +2702,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 kind: kind.to_string(),
                 modes: vec![mode.to_string()],
                 controls,
-                raw: entry,
+                raw: bounded_model_raw_summary(&entry),
             })
         }
         "video" => {
@@ -2537,7 +2716,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 kind: "video".to_string(),
                 modes: vec!["generate-video".to_string()],
                 controls,
-                raw: entry,
+                raw: bounded_model_raw_summary(&entry),
             })
         }
         "music" => {
@@ -2571,7 +2750,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                     "rawConstraints": constraints,
                     "rawCapabilities": capabilities
                 }),
-                raw: entry,
+                raw: bounded_model_raw_summary(&entry),
             })
         }
         "tts" => {
@@ -2586,7 +2765,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 kind: "voice".to_string(),
                 modes: vec!["generate-voice".to_string()],
                 controls: voice_controls(voices),
-                raw: entry,
+                raw: bounded_model_raw_summary(&entry),
             })
         }
         "asr" => {
@@ -2604,7 +2783,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
                 kind: "transcribe".to_string(),
                 modes: vec!["transcribe-audio".to_string()],
                 controls: transcribe_controls(supports_language, supports_timestamps),
-                raw: entry,
+                raw: bounded_model_raw_summary(&entry),
             })
         }
         _ => None,
@@ -2613,7 +2792,7 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
 
 async fn fetch_model_type(model_type: &str) -> Result<Vec<Value>, String> {
     let response = venice_get(&format!("/models?type={model_type}")).await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     Ok(payload
         .get("data")
         .and_then(Value::as_array)
@@ -2622,11 +2801,38 @@ async fn fetch_model_type(model_type: &str) -> Result<Vec<Value>, String> {
 }
 
 async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
-    let image_entries = fetch_model_type("image").await?;
-    let video_entries = fetch_model_type("video").await?;
-    let music_entries = fetch_model_type("music").await?;
-    let tts_entries = fetch_model_type("tts").await?;
-    let asr_entries = fetch_model_type("asr").await?;
+    let previous = read_model_cache(app);
+    let (image_result, video_result, music_result, tts_result, asr_result) = tokio::join!(
+        fetch_model_type("image"),
+        fetch_model_type("video"),
+        fetch_model_type("music"),
+        fetch_model_type("tts"),
+        fetch_model_type("asr")
+    );
+    let any_success = image_result.is_ok()
+        || video_result.is_ok()
+        || music_result.is_ok()
+        || tts_result.is_ok()
+        || asr_result.is_ok();
+    let previous_fetched = previous.last_fetched.clone();
+    let previous_source = previous.catalog_source.clone();
+    let mut category_errors = Vec::new();
+    let mut category = |name: &str, result: Result<Vec<Value>, String>| match result {
+        Ok(entries) => entries,
+        Err(error) => {
+            category_errors.push(json!({
+                "category": name,
+                "code": "UPSTREAM_UNAVAILABLE",
+                "message": trim_error_text(&error)
+            }));
+            Vec::new()
+        }
+    };
+    let image_entries = category("image", image_result);
+    let video_entries = category("video", video_result);
+    let music_entries = category("music", music_result);
+    let tts_entries = category("tts", tts_result);
+    let asr_entries = category("asr", asr_result);
 
     let mut seen = HashSet::new();
     let mut push_unique = |records: Vec<ModelRecord>| -> Vec<ModelRecord> {
@@ -2664,7 +2870,20 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
     );
 
     let mut cache = ModelCache {
-        last_fetched: Utc::now().to_rfc3339(),
+        last_fetched: if any_success {
+            Utc::now().to_rfc3339()
+        } else {
+            previous_fetched
+        },
+        catalog_source: if category_errors.is_empty() {
+            "live"
+        } else if any_success {
+            "cached"
+        } else {
+            previous_source.as_str()
+        }
+        .to_string(),
+        category_errors,
         image_models: image_like
             .iter()
             .filter(|entry| entry.kind == "image")
@@ -2689,6 +2908,28 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
         voice_models,
         transcribe_models,
     };
+
+    if cache.image_models.is_empty() {
+        cache.image_models = previous.image_models;
+    }
+    if cache.edit_models.is_empty() {
+        cache.edit_models = previous.edit_models;
+    }
+    if cache.video_models.is_empty() {
+        cache.video_models = previous.video_models;
+    }
+    if cache.music_models.is_empty() {
+        cache.music_models = previous.music_models;
+    }
+    if cache.sfx_models.is_empty() {
+        cache.sfx_models = previous.sfx_models;
+    }
+    if cache.voice_models.is_empty() {
+        cache.voice_models = previous.voice_models;
+    }
+    if cache.transcribe_models.is_empty() {
+        cache.transcribe_models = previous.transcribe_models;
+    }
 
     apply_model_fallbacks(&mut cache);
 
@@ -2957,12 +3198,18 @@ fn source_files_from_metadata(metadata: &Value) -> Vec<String> {
         return files
             .iter()
             .filter_map(Value::as_str)
-            .map(str::to_string)
+            .filter_map(|value| {
+                Path::new(value)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
             .collect();
     }
     metadata
         .get("fileName")
         .and_then(Value::as_str)
+        .and_then(|file| Path::new(file).file_name().and_then(|name| name.to_str()))
         .map(|file| vec![file.to_string()])
         .unwrap_or_default()
 }
@@ -2982,6 +3229,20 @@ fn tags_from_metadata(metadata: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn safe_sidecar_summary_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
+        Value::String(text)
+            if text.len() <= 256
+                && !text.starts_with("data:")
+                && !text.to_ascii_lowercase().starts_with("bearer ") =>
+        {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
 fn media_sidecar_json(
     app: &AppHandle,
     kind: &str,
@@ -2989,6 +3250,17 @@ fn media_sidecar_json(
     mime_type: &str,
     metadata: &Value,
 ) -> Value {
+    let raw = metadata.get("raw").unwrap_or(metadata);
+    let raw_digest =
+        provider::sha256_hex(serde_json::to_string(raw).unwrap_or_default().as_bytes());
+    let raw_summary = ["id", "request_id", "queue_id", "status", "state", "model"]
+        .into_iter()
+        .filter_map(|key| {
+            raw.get(key)
+                .and_then(safe_sidecar_summary_value)
+                .map(|value| (key.to_string(), value))
+        })
+        .collect::<serde_json::Map<_, _>>();
     json!({
         "schema": "nekolegends.media-sidecar",
         "schemaVersion": 1,
@@ -3009,23 +3281,180 @@ fn media_sidecar_json(
         "durationSeconds": sidecar_value_f64(metadata, &["durationSeconds", "duration_seconds"]),
         "sourceFiles": source_files_from_metadata(metadata),
         "tags": tags_from_metadata(metadata),
-        "raw": metadata.get("raw").cloned().unwrap_or_else(|| metadata.clone())
+        "raw": {
+            "summary": raw_summary,
+            "omittedMetadataSha256": raw_digest
+        }
     })
 }
 
-fn write_media_sidecar(
-    app: &AppHandle,
-    path: &Path,
-    kind: &str,
-    prompt: &str,
-    mime_type: &str,
-    metadata: &Value,
-) -> Result<(), String> {
-    let Some(sidecar_path) = media_sidecar_path(path) else {
-        return Ok(());
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Output path has no parent".to_string())?;
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    AtomicFile::new(path, AllowOverwrite)
+        .write(|file| file.write_all(bytes).and_then(|_| file.sync_all()))
+        .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaCommitMarker {
+    schema_version: u32,
+    media_path: String,
+    sidecar_path: Option<String>,
+    media_sha256: String,
+    media_byte_size: u64,
+    sidecar: Option<Value>,
+    created_at: String,
+}
+
+fn media_commit_marker_path(path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Media commit path is invalid".to_string())?;
+    Ok(path.with_file_name(format!(".{name}.vml-commit.json")))
+}
+
+fn validate_media_sidecar_schema(sidecar: &Value) -> Result<(), String> {
+    let schema: Value =
+        serde_json::from_str(include_str!("../../schemas/media-sidecar.v1.schema.json"))
+            .map_err(|error| error.to_string())?;
+    let validator = jsonschema::JSONSchema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .compile(&schema)
+        .map_err(|error| error.to_string())?;
+    if let Err(errors) = validator.validate(sidecar) {
+        let message = errors
+            .take(3)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Media sidecar schema validation failed: {message}"));
+    }
+    Ok(())
+}
+
+fn write_media_commit(path: &Path, bytes: &[u8], sidecar: Option<Value>) -> Result<(), String> {
+    if let Some(value) = sidecar.as_ref() {
+        validate_media_sidecar_schema(value)?;
+    }
+    let sidecar_path = sidecar.as_ref().and_then(|_| media_sidecar_path(path));
+    let marker_path = media_commit_marker_path(path)?;
+    let marker = MediaCommitMarker {
+        schema_version: 1,
+        media_path: path.to_string_lossy().to_string(),
+        sidecar_path: sidecar_path
+            .as_ref()
+            .map(|value| value.to_string_lossy().to_string()),
+        media_sha256: provider::sha256_hex(bytes),
+        media_byte_size: bytes.len() as u64,
+        sidecar: sidecar.clone(),
+        created_at: Utc::now().to_rfc3339(),
     };
-    let sidecar = media_sidecar_json(app, kind, prompt, mime_type, metadata);
-    write_json_file(&sidecar_path, &sidecar)
+    atomic_write_bytes(
+        &marker_path,
+        &serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?,
+    )?;
+    atomic_write_bytes(path, bytes)?;
+    if let (Some(sidecar_path), Some(sidecar)) = (sidecar_path, sidecar) {
+        atomic_write_bytes(
+            &sidecar_path,
+            &serde_json::to_vec_pretty(&sidecar).map_err(|error| error.to_string())?,
+        )?;
+    }
+    let _ = fs::remove_file(marker_path);
+    Ok(())
+}
+
+fn hash_file_bounded(path: &Path) -> Result<(u64, String), String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        size = size.saturating_add(count as u64);
+        hasher.update(&buffer[..count]);
+    }
+    Ok((size, provider::hex(&hasher.finalize())))
+}
+
+fn collect_media_commit_markers(dir: &Path, depth: usize, output: &mut Vec<PathBuf>) {
+    if depth > 6 || output.len() >= 1024 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_media_commit_markers(&path, depth + 1, output);
+        } else if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.ends_with(".vml-commit.json"))
+        {
+            output.push(path);
+        }
+    }
+}
+
+fn recover_media_commits(app: &AppHandle) -> Result<(), String> {
+    let settings = read_settings(app);
+    let root = ensure_output_folders_for_settings(app, &settings)?;
+    let mut markers = Vec::new();
+    collect_media_commit_markers(&root, 0, &mut markers);
+    for marker_path in markers {
+        if fs::metadata(&marker_path)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 128 * 1024
+        {
+            return Err("Media commit marker exceeds its safety bound".to_string());
+        }
+        let marker: MediaCommitMarker =
+            serde_json::from_slice(&fs::read(&marker_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if marker.schema_version != 1 {
+            return Err("Media commit marker version is unsupported".to_string());
+        }
+        let media_path = PathBuf::from(&marker.media_path);
+        if media_path.parent() != marker_path.parent() {
+            return Err("Media commit marker escaped its output directory".to_string());
+        }
+        if !media_path.exists() {
+            fs::remove_file(&marker_path).map_err(|error| error.to_string())?;
+            continue;
+        }
+        ensure_under_output(app, &media_path)?;
+        let (media_size, media_hash) = hash_file_bounded(&media_path)?;
+        if media_size != marker.media_byte_size || media_hash != marker.media_sha256 {
+            return Err("Recovered media does not match its commit marker".to_string());
+        }
+        if let (Some(sidecar_path), Some(sidecar)) =
+            (marker.sidecar_path.as_ref(), marker.sidecar.as_ref())
+        {
+            let sidecar_path = PathBuf::from(sidecar_path);
+            if sidecar_path.parent() != media_path.parent() {
+                return Err("Media sidecar commit escaped its output directory".to_string());
+            }
+            validate_media_sidecar_schema(sidecar)?;
+            atomic_write_bytes(
+                &sidecar_path,
+                &serde_json::to_vec_pretty(sidecar).map_err(|error| error.to_string())?,
+            )?;
+        }
+        fs::remove_file(&marker_path).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn save_media_bytes(
@@ -3055,10 +3484,12 @@ fn save_media_bytes(
         image_file_stem(&metadata).unwrap_or_else(|| format!("{timestamp}-{stem}{variant_suffix}"))
     };
     let (name, path) = unique_file_path(&dir, &file_stem, ext);
-    fs::write(&path, bytes).map_err(|err| err.to_string())?;
-    if settings.write_metadata_sidecars && !settings.private_session {
-        write_media_sidecar(app, &path, kind, prompt, mime_type, &metadata)?;
-    }
+    let sidecar = if settings.write_metadata_sidecars && !settings.private_session {
+        Some(media_sidecar_json(app, kind, prompt, mime_type, &metadata))
+    } else {
+        None
+    };
+    write_media_commit(&path, bytes, sidecar)?;
     let encoded = general_purpose::STANDARD.encode(bytes);
     Ok(MediaResult {
         id: format!("{kind}-{name}"),
@@ -3525,13 +3956,13 @@ fn diem_snapshot_from_rate_limits(
 
 async fn fetch_diem_billing_balance() -> Result<DiemBalanceSnapshot, String> {
     let response = venice_get("/billing/balance").await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     diem_snapshot_from_billing(payload)
 }
 
 async fn fetch_diem_rate_limits(warning: Option<String>) -> Result<DiemBalanceSnapshot, String> {
     let response = venice_get("/api_keys/rate_limits").await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     diem_snapshot_from_rate_limits(payload, warning)
 }
 
@@ -3803,7 +4234,29 @@ async fn save_binary_response(
         .unwrap_or("application/octet-stream")
         .trim()
         .to_string();
-    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+    let limit = match mime.as_str() {
+        value if value.starts_with("image/") => 32 * 1024 * 1024,
+        value if value.starts_with("audio/") => 64 * 1024 * 1024,
+        value if value.starts_with("video/") => 256 * 1024 * 1024,
+        "text/plain" | "application/json" => 4 * 1024 * 1024,
+        _ => return Err("Upstream response media type is unsupported".to_string()),
+    };
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err("Upstream response exceeds the bounded media output size".to_string());
+    }
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| err.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err("Upstream response exceeds the bounded media output size".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     save_media_bytes(app, kind, prompt, &mime, &bytes, metadata)
 }
 
@@ -3815,7 +4268,8 @@ fn collect_app_state(
     let mut sections = Vec::new();
 
     let started_at = Instant::now();
-    let settings = read_settings(&app);
+    let mut settings = read_settings(&app);
+    settings.agent_control_token = read_control_token(&settings).ok().flatten();
     sections.push(StartupTimingEntry {
         name: "read settings".to_string(),
         ms: elapsed_ms(started_at),
@@ -3936,23 +4390,24 @@ fn save_settings(
 
     if let Some(enable) = request.enable_agent_control {
         settings.enable_agent_control = enable;
-        // Generate a token the first time the user enables the feature
-        if enable && settings.agent_control_token.is_none() {
-            settings.agent_control_token = Some(generate_agent_control_token());
-        }
-
         // Live start / stop when the user toggles in Settings (no restart needed)
         if enable && !was_enabled {
-            if let Some(token) = settings.agent_control_token.clone() {
-                start_agent_control_server(
-                    app.clone(),
-                    token,
-                    settings.agent_control_port,
-                    settings.agent_control_bind_all,
-                    &handle,
-                )?;
-            }
+            let token = read_control_token(&settings)?.unwrap_or_else(generate_agent_control_token);
+            store_control_token(&token)?;
+            settings.agent_control_token = Some(token.clone());
+            start_agent_control_server(
+                app.clone(),
+                token,
+                None,
+                settings.agent_control_port,
+                settings.agent_control_bind_all,
+                &handle,
+            )?;
         } else if !enable && was_enabled {
+            let lifecycle_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                provider::unregister_lifecycle(&lifecycle_app).await;
+            });
             stop_agent_control_server(&handle);
         }
     }
@@ -3963,15 +4418,17 @@ fn save_settings(
             || settings.agent_control_bind_all != previous_bind_all)
     {
         stop_agent_control_server(&handle);
-        if let Some(token) = settings.agent_control_token.clone() {
-            start_agent_control_server(
-                app.clone(),
-                token,
-                settings.agent_control_port,
-                settings.agent_control_bind_all,
-                &handle,
-            )?;
-        }
+        let token = read_control_token(&settings)?
+            .ok_or_else(|| "Agent Control credential is unavailable".to_string())?;
+        settings.agent_control_token = Some(token.clone());
+        start_agent_control_server(
+            app.clone(),
+            token,
+            None,
+            settings.agent_control_port,
+            settings.agent_control_bind_all,
+            &handle,
+        )?;
     }
 
     ensure_output_folders_for_settings(&app, &settings)?;
@@ -3985,18 +4442,32 @@ fn rotate_agent_control_token(
     handle: tauri::State<AgentControlHandle>,
 ) -> Result<AppSettings, String> {
     let mut settings = read_settings(&app);
-    settings.agent_control_token = Some(generate_agent_control_token());
+    let previous_token = read_control_token(&settings)?
+        .ok_or_else(|| "Agent Control credential is unavailable".to_string())?;
+    let token = generate_agent_control_token();
+    store_control_token(&token)?;
+    settings.agent_control_token = Some(token.clone());
 
     if settings.enable_agent_control {
         stop_agent_control_server(&handle);
-        if let Some(token) = settings.agent_control_token.clone() {
-            start_agent_control_server(
+        if let Err(error) = start_agent_control_server(
+            app.clone(),
+            token.clone(),
+            Some(previous_token.clone()),
+            settings.agent_control_port,
+            settings.agent_control_bind_all,
+            &handle,
+        ) {
+            store_control_token(&previous_token)?;
+            let _ = start_agent_control_server(
                 app.clone(),
-                token,
+                previous_token,
+                None,
                 settings.agent_control_port,
                 settings.agent_control_bind_all,
                 &handle,
-            )?;
+            );
+            return Err(format!("Credential rotation was rolled back: {error}"));
         }
     }
 
@@ -4023,6 +4494,24 @@ fn clear_api_key() -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+#[tauri::command]
+fn configure_provider_lifecycle(
+    app: AppHandle,
+    core_origin: String,
+    credential_id: String,
+    credential: String,
+) -> Result<bool, String> {
+    provider::configure_lifecycle(&app, &core_origin, &credential_id, &credential)?;
+    provider::start_lifecycle(app);
+    Ok(true)
+}
+
+#[tauri::command]
+fn clear_provider_lifecycle(app: AppHandle) -> Result<bool, String> {
+    provider::clear_lifecycle(&app)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -4083,13 +4572,13 @@ fn recommended_update_asset(
 
 #[tauri::command]
 async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
-    let response = client()
+    let response = client()?
         .get(GITHUB_LATEST_RELEASE_URL)
         .send()
         .await
         .map_err(|err| err.to_string())?;
     let response = ensure_success(response).await?;
-    let release: GithubRelease = response.json().await.map_err(|err| err.to_string())?;
+    let release: GithubRelease = bounded_response_json(response, 1024 * 1024).await?;
     let current_version = app.package_info().version.to_string();
     let latest_version = clean_release_version(&release.tag_name);
     let (setup_asset, portable_asset) = preferred_update_assets(&release.assets);
@@ -4156,7 +4645,7 @@ async fn download_update_installer(app: AppHandle, asset: UpdateAsset) -> Result
         return Err("Update asset URL did not come from GitHub releases".to_string());
     }
 
-    let response = client()
+    let response = client()?
         .get(&asset.url)
         .send()
         .await
@@ -4242,7 +4731,7 @@ async fn generate_image(
     }
 
     let response = venice_post_json("/image/generate", body.clone()).await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     let mut encoded_images = Vec::new();
 
     if let Some(items) = payload.get("images").and_then(Value::as_array) {
@@ -4481,7 +4970,7 @@ async fn queue_video_inner(
     }
 
     let response = venice_post_json("/video/queue", body).await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     let queue_id = first_string_field(&payload, &["id", "queue_id", "request_id"])
         .or_else(|| {
             payload
@@ -4585,7 +5074,7 @@ async fn queue_audio(app: AppHandle, request: QueueMediaRequest) -> Result<Queue
     }
 
     let response = venice_post_json("/audio/queue", body).await?;
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     let queue_id = first_string_field(&payload, &["id", "queue_id", "request_id"])
         .or_else(|| {
             payload
@@ -4672,7 +5161,7 @@ async fn retrieve_queued_media(
         });
     }
 
-    let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+    let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     let status = json_status_label(&payload);
     let prompt = request.model.as_deref().unwrap_or(default_kind);
     let download_url = request
@@ -4688,8 +5177,20 @@ async fn retrieve_queued_media(
 
     if is_done_status(&status) {
         if let Some(url) = download_url {
+            let parsed = reqwest::Url::parse(&url)
+                .map_err(|_| "Venice download URL is invalid".to_string())?;
+            if parsed.scheme() != "https" || parsed.host_str() != Some("api.venice.ai") {
+                return Err(
+                    "Refusing to forward Venice credentials to an untrusted download origin"
+                        .to_string(),
+                );
+            }
             let key = read_api_key().map_err(|_| "Venice API key is not configured".to_string())?;
-            let response = client()
+            let response = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(120))
+                .build()
+                .map_err(|err| err.to_string())?
                 .get(url)
                 .bearer_auth(key)
                 .send()
@@ -4766,8 +5267,8 @@ async fn transcribe_audio(
         form = form.text("language", language);
     }
 
-    let response = client()
-        .post(format!("{VENICE_BASE_URL}/audio/transcriptions"))
+    let response = client()?
+        .post(format!("{}/audio/transcriptions", venice_base_url()))
         .bearer_auth(key)
         .multipart(form)
         .send()
@@ -4782,13 +5283,14 @@ async fn transcribe_audio(
         .to_lowercase();
 
     let (text, raw) = if content_type.contains("json") {
-        let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+        let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
         let text = first_string_field(&payload, &["text", "transcript"])
             .unwrap_or("")
             .to_string();
         (text, payload)
     } else {
-        let text = response.text().await.map_err(|err| err.to_string())?;
+        let text = String::from_utf8(bounded_response_bytes(response, 8 * 1024 * 1024).await?)
+            .map_err(|err| err.to_string())?;
         (text.trim().to_string(), json!({ "text": text }))
     };
 
@@ -4856,7 +5358,7 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
         .to_lowercase();
 
     if content_type.contains("json") {
-        let payload: Value = response.json().await.map_err(|err| err.to_string())?;
+        let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
         if let Some(encoded) = first_string_field(&payload, &["audio", "base64", "b64_json"]) {
             let mime = format!("audio/{}", response_format.trim().trim_start_matches('.'));
             let bytes = decode_base64_payload(encoded)?;
@@ -4884,6 +5386,762 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
     .await
 }
 
+#[derive(Clone)]
+struct TauriMediaExecutor {
+    app: AppHandle,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedExecutionCache {
+    results: Vec<MediaResult>,
+    result: Value,
+}
+
+fn shared_execution_cache_path(app: &AppHandle, request_id: &str) -> Result<PathBuf, String> {
+    let root = app_data_dir(app)?.join("provider-v2-execution");
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    Ok(root.join(format!("{request_id}.json")))
+}
+
+fn shared_execution_input(input: &venice_provider_kernel::ExecutionInput) -> Result<Value, String> {
+    let mut value = input.operation.input.clone();
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Operation input must be an object".to_string())?;
+    let mut data_urls = input
+        .artifacts
+        .iter()
+        .map(|(reference, bytes)| {
+            format!(
+                "data:{};base64,{}",
+                reference.mime_type,
+                general_purpose::STANDARD.encode(bytes)
+            )
+        })
+        .collect::<Vec<_>>();
+    match input.operation.capability.id.as_str() {
+        "media.image.edit" => {
+            object.insert("images".into(), json!(data_urls));
+        }
+        "media.image.background-remove" | "media.image.upscale" => {
+            object.insert(
+                "sourceImage".into(),
+                json!(data_urls
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "A sealed source image is required".to_string())?),
+            );
+        }
+        "media.video.generate" if !data_urls.is_empty() => {
+            object.insert("sourceImage".into(), json!(data_urls.remove(0)));
+        }
+        "media.transcribe" => {
+            object.insert(
+                "audio".into(),
+                json!(data_urls
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "A sealed source audio artifact is required".to_string())?),
+            );
+        }
+        _ => {}
+    }
+    if let Some(duration) = object.get("durationSeconds").and_then(Value::as_f64) {
+        object.insert("durationSeconds".into(), json!(duration.to_string()));
+    }
+    Ok(value)
+}
+
+fn shared_execution_result(
+    input: &venice_provider_kernel::ExecutionInput,
+    cache: SharedExecutionCache,
+) -> Result<venice_provider_kernel::ExecutionResult, String> {
+    let controls = Value::Object(
+        input
+            .operation
+            .input
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.iter())
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "model" | "prompt" | "title" | "catalogRevision"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let model = input
+        .operation
+        .input
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| match input.operation.capability.id.as_str() {
+            "media.image.background-remove" => "background-remove".into(),
+            "media.image.upscale" => "upscale".into(),
+            "media.models.list" => "model-list".into(),
+            "media.models.refresh" => "model-refresh".into(),
+            _ => "provider-default".into(),
+        });
+    let artifacts = cache
+        .results
+        .into_iter()
+        .map(|result| {
+            let bytes = fs::read(&result.file_path).map_err(|error| error.to_string())?;
+            let kind = match result.kind.as_str() {
+                "images" | "edits" => "image",
+                "videos" => "video",
+                "audio" => "music",
+                "sfx" => "sound-effect",
+                "transcripts" => "transcript",
+                other => other,
+            }
+            .to_string();
+            Ok(venice_provider_kernel::ExecutionArtifact {
+                kind,
+                mime_type: result.mime_type,
+                bytes,
+                media: result.metadata,
+                model: json!({"id":model}),
+                controls: controls.clone(),
+                recipe: json!({"prompt":input.operation.input.get("prompt")}),
+                source_evidence: None,
+                source_path: Some(PathBuf::from(result.file_path)),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(venice_provider_kernel::ExecutionResult {
+        artifacts,
+        output: cache.result.clone(),
+        result: cache.result,
+    })
+}
+
+#[async_trait::async_trait]
+impl venice_provider_kernel::Executor for TauriMediaExecutor {
+    async fn validate(
+        &self,
+        capability: &venice_provider_kernel::CapabilityRef,
+        input: &Value,
+    ) -> Result<(), String> {
+        validate_operation_model_controls_for_admission(&self.app, &capability.id, input)
+    }
+
+    async fn submit(
+        &self,
+        execution: venice_provider_kernel::ExecutionInput,
+        provider_request_id: &str,
+    ) -> Result<venice_provider_kernel::SubmissionReceipt, String> {
+        let input = shared_execution_input(&execution)?;
+        validate_typed_provider_input(&execution.operation.capability.id, &input)?;
+        let (results, result, upstream_id) = match execution.operation.capability.id.as_str() {
+            "media.models.list" => (
+                vec![],
+                model_catalog(&self.app),
+                provider_request_id.to_string(),
+            ),
+            "media.models.refresh" => {
+                refresh_models_inner(&self.app).await?;
+                (
+                    vec![],
+                    model_catalog(&self.app),
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.image.generate" => {
+                let request: ImageGenerationRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    generate_image(self.app.clone(), request).await?,
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.image.edit" => {
+                let request: ImageMultiEditRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    vec![multi_edit_image(self.app.clone(), request).await?],
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.image.background-remove" => {
+                let request: BackgroundRemoveRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    vec![remove_background(self.app.clone(), request).await?],
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.image.upscale" => {
+                let request: ImageUpscaleRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    vec![upscale_image(self.app.clone(), request).await?],
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.voice.generate" => {
+                let request: SpeechRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    vec![generate_speech(self.app.clone(), request).await?],
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.transcribe" => {
+                let request: TranscriptionRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                (
+                    vec![transcribe_audio(self.app.clone(), request).await?],
+                    Value::Null,
+                    provider_request_id.to_string(),
+                )
+            }
+            "media.video.generate" | "media.audio.music.generate" | "media.audio.sfx.generate" => {
+                let request: QueueMediaRequest =
+                    serde_json::from_value(input).map_err(|error| error.to_string())?;
+                let queued = if execution.operation.capability.id == "media.video.generate" {
+                    queue_video_inner(&self.app, request).await?
+                } else {
+                    queue_audio(self.app.clone(), request).await?
+                };
+                (vec![], Value::Null, queued.queue_id)
+            }
+            _ => return Err("Capability is unavailable".into()),
+        };
+        if !results.is_empty() || !result.is_null() {
+            let cache = SharedExecutionCache { results, result };
+            atomic_write_bytes(
+                &shared_execution_cache_path(&self.app, provider_request_id)?,
+                &serde_json::to_vec(&cache).map_err(|error| error.to_string())?,
+            )?;
+        }
+        Ok(venice_provider_kernel::SubmissionReceipt {
+            upstream_id,
+            certainty: "submitted_confirmed".into(),
+        })
+    }
+
+    async fn resume(
+        &self,
+        execution: venice_provider_kernel::ExecutionInput,
+        upstream_id: &str,
+    ) -> Result<venice_provider_kernel::ExecutionResult, String> {
+        if matches!(
+            execution.operation.capability.id.as_str(),
+            "media.video.generate" | "media.audio.music.generate" | "media.audio.sfx.generate"
+        ) {
+            loop {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                let kind = execution.operation.capability.id.as_str();
+                let request = RetrieveRequest {
+                    queue_id: upstream_id.to_string(),
+                    model: execution
+                        .operation
+                        .input
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    kind: if kind == "media.audio.sfx.generate" {
+                        Some("sfx".into())
+                    } else {
+                        None
+                    },
+                    download_url: None,
+                };
+                let retrieved = if kind == "media.video.generate" {
+                    retrieve_queued_media(self.app.clone(), request, "/video/retrieve", "videos")
+                        .await?
+                } else {
+                    retrieve_queued_media(
+                        self.app.clone(),
+                        request,
+                        "/audio/retrieve",
+                        if kind == "media.audio.sfx.generate" {
+                            "sfx"
+                        } else {
+                            "audio"
+                        },
+                    )
+                    .await?
+                };
+                if let Some(result) = retrieved.result {
+                    return shared_execution_result(
+                        &execution,
+                        SharedExecutionCache {
+                            results: vec![result],
+                            result: Value::Null,
+                        },
+                    );
+                }
+            }
+        }
+        let request_id = execution
+            .operation
+            .provider_request_id
+            .as_deref()
+            .ok_or_else(|| "Provider request identity is missing".to_string())?;
+        let cache: SharedExecutionCache = serde_json::from_slice(
+            &fs::read(shared_execution_cache_path(&self.app, request_id)?)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        shared_execution_result(&execution, cache)
+    }
+
+    async fn finalize_artifact(
+        &self,
+        operation: &venice_provider_kernel::ProviderOperation,
+        artifact_id: &str,
+        sha256: &str,
+        byte_size: u64,
+        mut artifact: venice_provider_kernel::ExecutionArtifact,
+    ) -> Result<venice_provider_kernel::ExecutionArtifact, String> {
+        let media_path = artifact
+            .source_path
+            .as_ref()
+            .ok_or_else(|| "Provider media path is missing".to_string())?;
+        let sidecar_path = media_sidecar_path(media_path)
+            .ok_or_else(|| "Provider sidecar path is invalid".to_string())?;
+        let sidecar_bytes = fs::read(&sidecar_path).map_err(|error| error.to_string())?;
+        if sidecar_bytes.len() > 64 * 1024 {
+            return Err("Media sidecar exceeds the 64 KiB safety limit".to_string());
+        }
+        let mut sidecar: Value =
+            serde_json::from_slice(&sidecar_bytes).map_err(|error| error.to_string())?;
+        validate_media_sidecar_schema(&sidecar)?;
+        sidecar["providerArtifactId"] = json!(artifact_id);
+        sidecar["providerOperationId"] = json!(operation.provider_operation_id);
+        sidecar["sha256"] = json!(sha256);
+        sidecar["byteSize"] = json!(byte_size);
+        sidecar["controls"] = artifact.controls.clone();
+        sidecar["recipe"] = artifact.recipe.clone();
+        sidecar["sourceArtifacts"]=json!(operation.input_artifacts.iter().map(|source|json!({"coreArtifactId":source.core_artifact_id,"relationship":source.relationship,"sha256":source.sha256})).collect::<Vec<_>>());
+        atomic_write_bytes(
+            &sidecar_path,
+            &serde_json::to_vec_pretty(&sidecar).map_err(|error| error.to_string())?,
+        )?;
+        let verified: Value =
+            serde_json::from_slice(&fs::read(&sidecar_path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        for (key, expected) in [
+            ("providerArtifactId", json!(artifact_id)),
+            (
+                "providerOperationId",
+                json!(operation.provider_operation_id),
+            ),
+            ("sha256", json!(sha256)),
+            ("byteSize", json!(byte_size)),
+        ] {
+            if verified.get(key) != Some(&expected) {
+                return Err(format!("Provider sidecar {key} verification failed"));
+            }
+        }
+        let sanitized = venice_provider_kernel::canonical_json(&verified);
+        artifact.source_evidence = Some(
+            json!({"schemaIdentity":"nekolegends.media-sidecar","schemaVersion":1,"sanitizedSha256":venice_provider_kernel::canonical_digest(&sanitized).map_err(|error|error.to_string())?,"sanitizedSidecar":sanitized}),
+        );
+        Ok(artifact)
+    }
+}
+
+fn model_catalog(app: &AppHandle) -> Value {
+    let cache = read_model_cache(app);
+    let source = match cache.catalog_source.as_str() {
+        "live" => "live",
+        "cached" => "cached",
+        _ if cache.last_fetched.trim().is_empty() => "fallback",
+        _ => "cached",
+    };
+    let refreshed_at = cache.last_fetched.clone();
+    let errors = cache.category_errors.clone();
+    let groups = [
+        ("image", cache.image_models),
+        ("image-edit", cache.edit_models),
+        ("video", cache.video_models),
+        ("music", cache.music_models),
+        ("sfx", cache.sfx_models),
+        ("voice", cache.voice_models),
+        ("transcription", cache.transcribe_models),
+    ];
+    let models = groups
+        .into_iter()
+        .flat_map(|(kind, models)| {
+            models.into_iter().map(move |model| {
+                let raw_digest = provider::sha256_hex(
+                    serde_json::to_string(&model.raw)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+                let capability_ids = match kind {
+                    "image" => vec!["media.image.generate"],
+                    "image-edit" => vec!["media.image.edit"],
+                    "video" => vec!["media.video.generate"],
+                    "music" => vec!["media.audio.music.generate"],
+                    "sfx" => vec!["media.audio.sfx.generate"],
+                    "voice" => vec!["media.voice.generate"],
+                    "transcription" => vec!["media.transcribe"],
+                    _ => vec![],
+                };
+                json!({
+                    "id": model.id,
+                    "displayName": model.name,
+                    "mediaKind": kind,
+                    "modes": model.modes,
+                    "capabilityIds": capability_ids,
+                    "available": source != "fallback",
+                    "controlsSchema": controls_to_schema(kind, &model.controls),
+                    "resourceEstimateSchema": {"type":"object","properties":{},"additionalProperties":false},
+                    "rawProviderMetadataDigest": raw_digest
+                })
+            })
+        })
+        .chain([
+            json!({"id":"background-remove","displayName":"Background removal","mediaKind":"image","capabilityIds":["media.image.background-remove"],"available":true,"controlsSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+            json!({"id":"upscale","displayName":"Image upscale","mediaKind":"image","capabilityIds":["media.image.upscale"],"available":true,"controlsSchema":{"type":"object","properties":{"scale":{"enum":[2,4]}},"required":["scale"],"additionalProperties":false}}),
+            json!({"id":"model-list","displayName":"Model catalog","mediaKind":"models","capabilityIds":["media.models.list"],"available":true,"controlsSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+            json!({"id":"model-refresh","displayName":"Model catalog refresh","mediaKind":"models","capabilityIds":["media.models.refresh"],"available":true,"controlsSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        ])
+        .collect::<Vec<_>>();
+    let normalized = serde_json::to_vec(&models).unwrap_or_default();
+    json!({
+        "schemaVersion": "1.0",
+        "catalogRevision": format!("sha256:{}", provider::sha256_hex(&normalized)),
+        "source": source,
+        "refreshedAt": if refreshed_at.is_empty() { Value::Null } else { json!(refreshed_at) },
+        "partial": !errors.is_empty(),
+        "errors": if source == "fallback" { json!([{"code":"MODEL_CATALOG_FALLBACK_ONLY","message":"No live or cached catalog is available"}]) } else { json!(errors) },
+        "models": models
+    })
+}
+
+fn controls_to_schema(media_kind: &str, controls: &Value) -> Value {
+    let mut properties = serde_json::Map::new();
+    let option = |key: &str| controls.get(key).and_then(Value::as_array).cloned();
+    match media_kind {
+        "image" => {
+            if controls
+                .get("negativePrompt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("negativePrompt".into(), json!({"type":"string"}));
+            }
+            if controls
+                .get("steps")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("steps".into(), json!({"type":"integer","minimum":1}));
+            }
+            if controls
+                .get("cfg")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("cfgScale".into(), json!({"type":"number"}));
+            }
+            if controls
+                .get("seed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("seed".into(), json!({"type":"integer","minimum":0}));
+            }
+            if controls
+                .get("hideWatermark")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("hideWatermark".into(), json!({"type":"boolean"}));
+            }
+            properties.insert("safeMode".into(), json!({"type":"boolean"}));
+            properties.insert(
+                "format".into(),
+                json!({"type":"string","enum":["png","webp"]}),
+            );
+            properties.insert("navigate".into(), json!({"type":"boolean"}));
+            if let Some(values) = option("sizeOptions") {
+                properties.insert("aspectRatio".into(), json!({"type":"string","enum":values}));
+            }
+            if let Some(values) = option("resolutionOptions") {
+                properties.insert("resolution".into(), json!({"type":"string","enum":values}));
+            }
+            if let Some(bounds) = controls.get("variantCount") {
+                properties.insert("variants".into(), json!({"type":"integer","minimum":bounds.get("min").and_then(Value::as_u64).unwrap_or(1),"maximum":bounds.get("max").and_then(Value::as_u64).unwrap_or(4)}));
+            }
+        }
+        "image-edit" => {
+            properties.insert("safeMode".into(), json!({"type":"boolean"}));
+            if let Some(values) = option("sizeOptions") {
+                properties.insert("aspectRatio".into(), json!({"type":"string","enum":values}));
+            }
+            if let Some(values) = option("resolutionOptions") {
+                properties.insert("resolution".into(), json!({"type":"string","enum":values}));
+            }
+        }
+        "video" => {
+            if let Some(values) = option("durationOptions") {
+                properties.insert("duration".into(), json!({"type":"string","enum":values}));
+            }
+            if let Some(values) = option("resolutionOptions") {
+                properties.insert("resolution".into(), json!({"type":"string","enum":values}));
+            }
+            if let Some(values) = option("aspectRatioOptions") {
+                properties.insert("aspectRatio".into(), json!({"type":"string","enum":values}));
+            }
+            properties.insert("negativePrompt".into(), json!({"type":"string"}));
+            properties.insert(
+                "upscaleFactor".into(),
+                json!({"type":"integer","minimum":1,"maximum":4}),
+            );
+        }
+        "music" | "sfx" => {
+            if controls
+                .get("supportsDurationSeconds")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                let bounds = controls.get("durationSeconds").unwrap_or(&Value::Null);
+                properties.insert("durationSeconds".into(), json!({"type":"number","minimum":bounds.get("min").and_then(Value::as_f64).unwrap_or(1.0),"maximum":bounds.get("max").and_then(Value::as_f64).unwrap_or(180.0)}));
+            }
+            if controls
+                .get("supportsLyrics")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("lyricsPrompt".into(), json!({"type":"string"}));
+            }
+            if controls
+                .get("supportsInstrumental")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("forceInstrumental".into(), json!({"type":"boolean"}));
+            }
+            if controls
+                .get("supportsLyricsOptimizer")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("lyricsOptimizer".into(), json!({"type":"boolean"}));
+            }
+        }
+        "voice" => {
+            if let Some(values) = option("responseFormats") {
+                properties.insert(
+                    "responseFormat".into(),
+                    json!({"type":"string","enum":values}),
+                );
+            }
+            for (key, support) in [
+                ("voice", "supportsVoice"),
+                ("language", "supportsLanguage"),
+                ("stylePrompt", "supportsStylePrompt"),
+            ] {
+                if controls.get(support).and_then(Value::as_bool) == Some(true) {
+                    properties.insert(key.into(), json!({"type":"string"}));
+                }
+            }
+            for (key, support) in [
+                ("speed", "supportsSpeed"),
+                ("temperature", "supportsTemperature"),
+                ("topP", "supportsTopP"),
+            ] {
+                if controls.get(support).and_then(Value::as_bool) == Some(true) {
+                    properties.insert(key.into(), json!({"type":"number"}));
+                }
+            }
+        }
+        "transcription" => {
+            if let Some(values) = option("responseFormats") {
+                properties.insert(
+                    "responseFormat".into(),
+                    json!({"type":"string","enum":values}),
+                );
+            }
+            if controls
+                .get("supportsLanguage")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("language".into(), json!({"type":"string"}));
+            }
+            if controls
+                .get("supportsTimestamps")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                properties.insert("timestamps".into(), json!({"type":"boolean"}));
+            }
+        }
+        _ => {}
+    }
+    json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":properties,"additionalProperties":false})
+}
+
+fn validate_operation_model_controls_for_admission(
+    app: &AppHandle,
+    capability_id: &str,
+    input: &Value,
+) -> Result<(), String> {
+    let Some(model_id) = input.get("model").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let cache = read_model_cache(app);
+    if cache.last_fetched.trim().is_empty() {
+        return Err(
+            "CAPABILITY_NOT_AVAILABLE: live or cached model catalog is required".to_string(),
+        );
+    }
+    let models = match capability_id {
+        "media.image.generate" => &cache.image_models,
+        "media.image.edit" => &cache.edit_models,
+        "media.video.generate" => &cache.video_models,
+        "media.audio.music.generate" => &cache.music_models,
+        "media.audio.sfx.generate" => &cache.sfx_models,
+        "media.voice.generate" => &cache.voice_models,
+        "media.transcribe" => &cache.transcribe_models,
+        _ => return Ok(()),
+    };
+    let model = models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            format!("MODEL_NOT_FOUND: model {model_id} is not in the selected catalog")
+        })?;
+    let controls = &model.controls;
+    let check_option = |input_key: &str, controls_key: &str| -> Result<(), String> {
+        let Some(value) = input.get(input_key).and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(options) = controls.get(controls_key).and_then(Value::as_array) else {
+            return Err(format!(
+                "CONTROL_NOT_SUPPORTED: {input_key} is not supported by {model_id}"
+            ));
+        };
+        if options.iter().any(|option| option.as_str() == Some(value)) {
+            Ok(())
+        } else {
+            Err(format!(
+                "CONTROL_NOT_SUPPORTED: {input_key} is not supported by {model_id}"
+            ))
+        }
+    };
+    check_option("resolution", "resolutionOptions")?;
+    if controls.get("aspectRatioOptions").is_some() {
+        check_option("aspectRatio", "aspectRatioOptions")?;
+    } else {
+        check_option("aspectRatio", "sizeOptions")?;
+    }
+    check_option("duration", "durationOptions")?;
+    check_option("responseFormat", "responseFormats")?;
+
+    for (input_key, support_key) in [
+        ("durationSeconds", "supportsDurationSeconds"),
+        ("lyricsPrompt", "supportsLyrics"),
+        ("forceInstrumental", "supportsInstrumental"),
+        ("lyricsOptimizer", "supportsLyricsOptimizer"),
+        ("voice", "supportsVoice"),
+        ("speed", "supportsSpeed"),
+        ("language", "supportsLanguage"),
+        ("stylePrompt", "supportsStylePrompt"),
+        ("timestamps", "supportsTimestamps"),
+        ("temperature", "supportsTemperature"),
+        ("topP", "supportsTopP"),
+        ("negativePrompt", "negativePrompt"),
+        ("steps", "steps"),
+        ("cfgScale", "cfg"),
+        ("seed", "seed"),
+        ("hideWatermark", "hideWatermark"),
+    ] {
+        if input.get(input_key).is_some()
+            && controls.get(support_key).and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!(
+                "CONTROL_NOT_SUPPORTED: {input_key} is not supported by {model_id}"
+            ));
+        }
+    }
+    if let Some(duration) = input.get("durationSeconds").and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    }) {
+        if let Some(bounds) = controls.get("durationSeconds") {
+            let minimum = bounds.get("min").and_then(Value::as_f64).unwrap_or(0.0);
+            let maximum = bounds
+                .get("max")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::MAX);
+            if duration < minimum || duration > maximum {
+                return Err(format!(
+                    "CONTROL_NOT_SUPPORTED: durationSeconds is outside the model range"
+                ));
+            }
+        }
+    }
+    if let Some(variants) = input.get("variants").and_then(Value::as_u64) {
+        let bounds = controls.get("variantCount").ok_or_else(|| {
+            format!("CONTROL_NOT_SUPPORTED: variants is not supported by {model_id}")
+        })?;
+        let minimum = bounds.get("min").and_then(Value::as_u64).unwrap_or(1);
+        let maximum = bounds.get("max").and_then(Value::as_u64).unwrap_or(1);
+        if variants < minimum || variants > maximum {
+            return Err("CONTROL_NOT_SUPPORTED: variants is outside the model range".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_typed_provider_input(capability: &str, input: &Value) -> Result<(), String> {
+    let invalid = |error: serde_json::Error| format!("CONTROL_NOT_SUPPORTED: {error}");
+    match capability {
+        "media.image.generate" => serde_json::from_value::<ImageGenerationRequest>(input.clone())
+            .map(|_| ())
+            .map_err(invalid),
+        "media.image.edit" => serde_json::from_value::<ImageMultiEditRequest>(input.clone())
+            .map(|_| ())
+            .map_err(invalid),
+        "media.image.background-remove" => {
+            serde_json::from_value::<BackgroundRemoveRequest>(input.clone())
+                .map(|_| ())
+                .map_err(invalid)
+        }
+        "media.image.upscale" => serde_json::from_value::<ImageUpscaleRequest>(input.clone())
+            .map(|_| ())
+            .map_err(invalid),
+        "media.video.generate" | "media.audio.music.generate" | "media.audio.sfx.generate" => {
+            serde_json::from_value::<QueueMediaRequest>(input.clone())
+                .map(|_| ())
+                .map_err(invalid)
+        }
+        "media.voice.generate" => serde_json::from_value::<SpeechRequest>(input.clone())
+            .map(|_| ())
+            .map_err(invalid),
+        "media.transcribe" => serde_json::from_value::<TranscriptionRequest>(input.clone())
+            .map(|_| ())
+            .map_err(invalid),
+        "media.models.list" | "media.models.refresh"
+            if input.as_object().is_some_and(|object| object.is_empty()) =>
+        {
+            Ok(())
+        }
+        "media.models.list" | "media.models.refresh" => {
+            Err("CONTROL_NOT_SUPPORTED: model operations accept no input fields".to_string())
+        }
+        _ => Err("CAPABILITY_NOT_AVAILABLE: capability is unavailable".to_string()),
+    }
+}
+
 // === AI Agent Remote Control HTTP Server ===
 // Supports live toggle: when the user turns "AI Agent Control" on in Settings,
 // the server starts immediately. When turned off, it shuts down gracefully.
@@ -4893,6 +6151,7 @@ async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<Media
 struct AgentControlState {
     app: AppHandle,
     token: String,
+    previous_token: Option<(String, SystemTime)>,
 }
 
 #[derive(Clone, Serialize)]
@@ -4960,7 +6219,16 @@ fn check_agent_token(state: &AgentControlState, headers: &HeaderMap) -> Result<(
     else {
         return Err((StatusCode::UNAUTHORIZED, "Missing bearer token".to_string()));
     };
-    if auth == format!("Bearer {}", state.token) {
+    let presented = auth.strip_prefix("Bearer ").unwrap_or("").as_bytes();
+    let current_matches = provider::constant_time_eq(presented, state.token.as_bytes());
+    let overlap_matches = state
+        .previous_token
+        .as_ref()
+        .is_some_and(|(token, expires_at)| {
+            SystemTime::now() <= *expires_at
+                && provider::constant_time_eq(presented, token.as_bytes())
+        });
+    if current_matches || overlap_matches {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "Invalid bearer token".to_string()))
@@ -5079,7 +6347,12 @@ async fn agent_get_state(
     check_agent_token(&state, &headers)?;
     let setup_sections = state.app.state::<StartupMetricsHandle>().sections();
     let app_state = collect_app_state(state.app.clone(), setup_sections).map_err(agent_error)?;
-    Ok(Json(serde_json::to_value(app_state).unwrap()))
+    let mut value =
+        serde_json::to_value(app_state).map_err(|error| agent_error(error.to_string()))?;
+    if let Some(settings) = value.get_mut("settings").and_then(Value::as_object_mut) {
+        settings.remove("agentControlToken");
+    }
+    Ok(Json(value))
 }
 
 async fn agent_get_capabilities(
@@ -5413,6 +6686,7 @@ async fn agent_burn_folder(
 fn start_agent_control_server(
     app: AppHandle,
     token: String,
+    previous_token: Option<String>,
     port: u16,
     bind_all: bool,
     handle: &AgentControlHandle,
@@ -5463,15 +6737,61 @@ fn start_agent_control_server(
     let state = AgentControlState {
         app: app.clone(),
         token,
+        previous_token: previous_token
+            .map(|token| (token, SystemTime::now() + Duration::from_secs(5 * 60))),
     };
 
+    let server_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+        let app = server_app;
+        // Agent Control is not a browser API. A trusted browser origin can be
+        // added explicitly later without restoring wildcard CORS.
+        let cors = CorsLayer::new();
 
-        let router = Router::new()
+        let core_origin = provider::configured_core_origin(&app).unwrap_or_else(|| {
+            eprintln!("[agent-control] Core callback origin is not configured; revision-2 callback admission remains closed");
+            "http://127.0.0.1:0".to_string()
+        });
+        let manifest_digest = match provider::shared_manifest_digest(&app) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("[agent-control] Provider manifest digest failed: {error}");
+                return;
+            }
+        };
+        let kernel =
+            match venice_provider_kernel::Kernel::open(venice_provider_kernel::KernelConfig {
+                storage: std::sync::Arc::new(venice_provider_kernel::FileStorage::new(
+                    match app_data_dir(&app) {
+                        Ok(path) => path.join("provider-v2"),
+                        Err(error) => {
+                            eprintln!("[agent-control] Provider root failed: {error}");
+                            return;
+                        }
+                    },
+                )),
+                token: state.token.clone(),
+                manifest_digest,
+                trusted_callback_origin: core_origin,
+                executor: std::sync::Arc::new(TauriMediaExecutor { app: app.clone() }),
+                secret_protector: std::sync::Arc::new(provider::TauriSecretProtector::new(
+                    app.clone(),
+                )),
+                callback_retry_base_ms: 2000,
+                terminal_replay_window_ms: 5 * 60 * 1000,
+                maintenance_interval_ms: 60 * 1000,
+            })
+            .await
+            {
+                Ok(kernel) => kernel,
+                Err(error) => {
+                    eprintln!("[agent-control] Provider kernel failed: {error}");
+                    return;
+                }
+            };
+
+        let maintenance_kernel = kernel.clone();
+        let compatibility_router = Router::new()
             .route("/api/v1/state", get(agent_get_state))
             .route("/api/v1/capabilities", get(agent_get_capabilities))
             .route("/api/v1/health", get(agent_get_health))
@@ -5497,9 +6817,11 @@ fn start_agent_control_server(
                 get(agent_get_burn_folder_stats),
             )
             .route("/api/v1/burn-folder", post(agent_burn_folder))
-            .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100 MB — supports 4K image payloads
-            .layer(cors)
             .with_state(state);
+        let router = compatibility_router
+            .merge(kernel.router())
+            .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100 MB — supports 4K image payloads
+            .layer(cors);
 
         println!(
             "[agent-control] Starting HTTP server on {} (for AI agents over Tailscale)",
@@ -5523,7 +6845,10 @@ fn start_agent_control_server(
         if let Err(e) = server.await {
             eprintln!("[agent-control] Server error: {}", e);
         }
+        maintenance_kernel.shutdown().await;
     });
+
+    provider::start_lifecycle(app);
 
     Ok(())
 }
@@ -5537,7 +6862,7 @@ fn stop_agent_control_server(handle: &AgentControlHandle) {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -5553,6 +6878,9 @@ fn main() {
             let started_at = Instant::now();
             if let Err(err) = ensure_output_folders(app.handle()) {
                 eprintln!("Failed to initialize output folders: {err}");
+            }
+            if let Err(err) = recover_media_commits(app.handle()) {
+                eprintln!("Failed to recover media commits: {err}");
             }
             metrics.push("ensure output folders", started_at);
 
@@ -5593,6 +6921,8 @@ fn main() {
             rotate_agent_control_token,
             save_api_key,
             clear_api_key,
+            configure_provider_lifecycle,
+            clear_provider_lifecycle,
             get_models,
             move_media_files_to_burn,
             move_private_session_to_burn,
@@ -5620,8 +6950,13 @@ fn main() {
             generate_speech,
             transcribe_audio,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Venice Media Local");
+        .build(tauri::generate_context!())
+        .expect("error while building Venice Media Local");
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            tauri::async_runtime::block_on(provider::unregister_lifecycle(app_handle));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -5716,5 +7051,18 @@ mod tests {
             retrieve.download_url.as_deref(),
             Some("https://example.com/result")
         );
+    }
+
+    #[test]
+    fn sidecar_schema_requires_complete_recipe_evidence() {
+        let valid = json!({
+            "schema":"nekolegends.media-sidecar","schemaVersion":1,"app":"venice-media-local",
+            "kind":"image","createdAt":"2026-07-12T00:00:00Z",
+            "recipe":{"prompt":"test","model":"model","controlsDigest":"a".repeat(64)}
+        });
+        assert!(validate_media_sidecar_schema(&valid).is_ok());
+        let mut invalid = valid;
+        invalid["recipe"] = json!({"prompt":"test"});
+        assert!(validate_media_sidecar_schema(&invalid).is_err());
     }
 }

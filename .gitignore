@@ -8,6 +8,8 @@ release/
 
 # Tauri/Rust generated output
 src-tauri/target/
+src-tauri/provider-kernel/target/
+src-tauri/provider-kernel-tests/target/
 src-tauri/gen/
 src-tauri/tauri.version.conf.json
 

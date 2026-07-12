@@ -3,7 +3,7 @@
 This captures the working architecture for remote control of the Tauri app so agents can drive it and the human sees live results in the open GUI ("theater mode").
 
 ## Key Design Decisions (user preferences encoded)
-- **Off by default + live toggle** (no restart): The setting `enable_agent_control` + `agent_control_token` live in AppSettings. `save_settings` detects the flip and calls `start_agent_control_server` / `stop_agent_control_server` immediately.
+- **Off by default + live toggle** (no restart): `enable_agent_control` lives in settings; the control credential lives in the OS credential store and is omitted from settings, state, and discovery. `save_settings` detects the flip and calls `start_agent_control_server` / `stop_agent_control_server` immediately.
 - **HTTP inside the Tauri process** (not separate binary or full MCP): This is the only way results appear in the *open* Windows GUI via the existing internal functions. The agent calls over Tailscale; the human watches cards appear.
 - **Exact UI text** (confirmed with user):
   - Section: "AI Agent Control"

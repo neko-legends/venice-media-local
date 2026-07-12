@@ -59,6 +59,60 @@
     "durationSeconds": {
       "type": ["number", "null"]
     },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "byteSize": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "media": {
+      "type": "object",
+      "properties": {
+        "width": { "type": ["integer", "null"], "minimum": 1 },
+        "height": { "type": ["integer", "null"], "minimum": 1 },
+        "durationSeconds": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "providerArtifactId": {
+      "type": "string",
+      "pattern": "^vml-artifact-[a-f0-9]+$"
+    },
+    "providerOperationId": {
+      "type": "string",
+      "pattern": "^vml-op-[a-f0-9]+$"
+    },
+    "modelCatalogRevision": {
+      "type": ["string", "null"]
+    },
+    "controls": {
+      "type": "object"
+    },
+    "sourceArtifacts": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": ["sha256", "relationship"],
+        "properties": {
+          "coreArtifactId": { "type": ["string", "null"] },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "relationship": { "enum": ["source", "mask", "reference", "first-frame", "source-video", "source-audio", "derived-from"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "recipe": {
+      "type": "object",
+      "required": ["controlsDigest"],
+      "properties": {
+        "prompt": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "controlsDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    },
     "sourceFiles": {
       "type": "array",
       "items": {
@@ -72,7 +126,12 @@
       }
     },
     "raw": {
-      "type": ["object", "array", "string", "number", "boolean", "null"]
+      "type": "object",
+      "properties": {
+        "summary": { "type": "object" },
+        "omittedMetadataSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
     }
   }
 }

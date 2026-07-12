@@ -27,7 +27,7 @@ The help text (exact user-preferred wording) is:
 
 "Starts a local HTTP API. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window. A discovery file is written automatically."
 
-When enabled, the app shows the current listening address and the auth token (with copy button) in that settings block.
+When enabled, the app shows the listening address. Provision the bearer credential through the local app; it is stored in the OS credential store and is not returned by the HTTP API.
 
 Then store the target:
 
@@ -37,17 +37,19 @@ Then store the target:
 venice_local:
   target_host: "100.64.x.x"   # Tailscale IP of the Windows machine
   port: 9876                  # default; use the discovery file/settings value
-  token: "vl-xxxxx"            # shown in Settings > AI Agent Control
+  token: "<locally provisioned>" # never read this from discovery or API state
   # output dir on Windows (from /api/v1/state): C:\Users\you\Desktop\VeniceMedia
 ```
 
 Fallback: use the memory tool with the same keys.
 
-The app also writes the discovery file `%APPDATA%\venice-media-local\control-api.json` on startup when the feature is on. Prefer the `address`, `port`, and `token` from that file because the port is configurable.
+The app also writes the discovery file `%APPDATA%\community.venice.media.local\control-api.json` on startup when the feature is on. Use its `address`, `port`, manifest/health URLs, and credential fingerprint. It intentionally contains no bearer credential.
 
 ## Available Control Endpoints (v1)
 
-All endpoints are POST (except state) and live under `http://<host>:<port>/api/v1`
+All endpoints live under `http://<host>:<port>/api/v1`. The routes below are revision-1 compatibility routes; new automation should use revision-2 operations, event replay, sealed uploads, and artifact streaming.
+
+Revision-2 transfers require both `X-Transfer-Grant-ID` and `X-Transfer-Grant`. Never reuse a broad operation secret: each grant is exact-bound to operation/attempt/assignment/capability, method/path/scope, resource identity and media facts, validity interval, and use count. Upload IDs and hashes must already appear in the admitted `inputArtifacts`; completing staging cannot add or alter operation input.
 
 Auth header (required for now):
 `Authorization: Bearer ***
@@ -75,7 +77,7 @@ Auth header (required for now):
 
 - `GET  /api/v1/state`                 → full AppState (models, settings, key status)
 - `POST /api/v1/refresh-models`
-- `GET  /api/v1/models`
+- Model discovery is available through revision-2 `media.models.list` operations. There is no `/api/v1/models` route.
 - `POST /api/v1/navigate`
 - `POST /api/v1/open-output-folder`
 - `POST /api/v1/open-burn-folder`
@@ -209,7 +211,7 @@ See `references/venice-local-gui-request-types.md` for the complete, up-to-date 
 ## Current Status (as of 2026-05-21 verification)
 
 - Live toggle in Settings (off by default, starts/stops HTTP server immediately on flip, no app restart): **done**
-- HTTP server on 0.0.0.0:<port> with Bearer token auth + auto-generated token shown with copy button: **done**
+- HTTP server on the configured Tailscale/loopback bind (or explicit all-interface opt-in) with constant-time bearer authentication and OS-protected credential storage: **done**
 - Discovery file `control-api.json` written to app data dir automatically when enabled: **done**
 - Core endpoints implemented and wired directly to the real internal Rust functions (GUI updates live):
   - GET /api/v1/state — **verified working**
@@ -232,7 +234,7 @@ This delivers the core "theater mode": the Hermes agent (on Linux via Tailscale)
 
 ## Next Steps for the Human
 
-1. Tell the agent the current Tailscale IP of the "ripper" + the port/token once the app has the server running (or let it read the discovery file).
+1. Give the agent the discovery address plus the separately provisioned credential. Never expect discovery or API state to reveal credential material.
 2. The agent will store it in `~/.hermes/config.yaml` under `venice_local`.
 3. Then you can say things like:
    "Use the local app on the ripper to generate 3 variants of a cyberpunk city at night with flux-2-max"
