@@ -20,7 +20,9 @@ Use an official release build or build the app locally, paste in your own Venice
 
 Release safety:
 
-Official GitHub releases may include an unsigned Windows installer and/or direct `.exe` for convenience because Windows is the maintainer's main workstation. If you download a binary, verify that it came from this repo's [Releases page](https://github.com/neko-legends/venice-media-local/releases), compare its SHA256 hash with the release notes, and optionally scan it with [VirusTotal](https://www.virustotal.com/gui/home/upload). Virus scanners are useful, but they are not proof that a binary matches the source code. If you are security-sensitive, build from source instead.
+The source remains publicly available. Future public Windows binaries require the repository's public-distribution signing policy; until that lane is implemented, build from source rather than relying on an unsigned public binary. Hashes and VirusTotal scans can help identify or inspect an artifact, but they do not authenticate its publisher.
+
+Normal Windows builds still use `Build-Windows.ps1`; the specific Phase 5H owner-controlled internal artifacts may be unsigned and follow the [Phase 5H release policy](docs/phase5h-windows-release-policy.md).
 
 Platform note:
 

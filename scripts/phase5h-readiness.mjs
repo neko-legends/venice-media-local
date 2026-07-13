@@ -18,9 +18,59 @@ const BASE_FILES = [
   'provider-v1/lifecycle.json',
   'provider-v2/ledger.json',
 ]
+const RELEASE_POLICY_KEYS = [
+  'schemaVersion', 'lane', 'allowedAuthenticodeState', 'destinationMachines',
+  'stageRoot', 'releaseRoot', 'rollbackRoot', 'publicDistributionAllowed',
+]
 
 function fail(message) {
   throw new Error(message)
+}
+
+export function validateReleasePolicy(value) {
+  if (!value || Array.isArray(value) || typeof value !== 'object') fail('Release policy must be an object')
+  const actualKeys = Object.keys(value).sort()
+  const expectedKeys = [...RELEASE_POLICY_KEYS].sort()
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) {
+    fail('Release policy fields are invalid')
+  }
+  if (value.schemaVersion !== 1) fail('Release policy schemaVersion must be 1')
+  if (value.lane !== 'owner-controlled-internal') fail('Phase 5H lane must be owner-controlled-internal')
+  if (value.allowedAuthenticodeState !== 'NotSigned') fail('Allowed Authenticode state must be exactly NotSigned')
+  if (value.publicDistributionAllowed !== false) fail('Public distribution must be disabled for Phase 5H')
+  if (!Array.isArray(value.destinationMachines) || value.destinationMachines.length === 0) {
+    fail('Destination machines must be a nonempty array')
+  }
+  const machines = new Set()
+  for (const machine of value.destinationMachines) {
+    if (typeof machine !== 'string' || !machine.trim() || machine !== machine.trim() || /[*?]/.test(machine)) {
+      fail('Destination machines must contain explicit names without wildcards')
+    }
+    if (/^(REPLACE|CHANGEME|HUMAN[-_ ]DECISION|JUN[-_ ]CONTROLLED)/i.test(machine)) {
+      fail('Destination machines must replace example placeholders with exact machine names')
+    }
+    const normalized = machine.toUpperCase()
+    if (machines.has(normalized)) fail('Destination machines must be unique')
+    machines.add(normalized)
+  }
+  const roots = ['stageRoot', 'releaseRoot', 'rollbackRoot'].map((key) => {
+    if (typeof value[key] !== 'string' || !/^[A-Za-z]:[\\/]/.test(value[key]) || !path.win32.isAbsolute(value[key])) {
+      fail(`${key} must be an absolute Windows path`)
+    }
+    const normalized = path.win32.normalize(value[key]).replace(/[\\/]+$/, '').toUpperCase()
+    if (/^[A-Z]:$/.test(normalized) || normalized.split('\\').some((part) => [
+      'APPDATA', 'COMMUNITY.VENICE.MEDIA.LOCAL', 'OUTPUT', 'OUTPUTS', 'DIST', 'TARGET',
+      'REPO', 'REPOS', 'REPOSITORY', 'REPOSITORIES', 'VENICE-MEDIA-LOCAL',
+    ].includes(part))) fail(`${key} must be outside app data, repository, build, and output roots`)
+    return normalized
+  })
+  if (new Set(roots).size !== roots.length) fail('Stage, release, and rollback roots must be distinct')
+  for (const root of roots) {
+    if (roots.some((other) => other !== root && (root.startsWith(`${other}\\`) || other.startsWith(`${root}\\`)))) {
+      fail('Stage, release, and rollback roots must not contain one another')
+    }
+  }
+  return value
 }
 
 function assertDirectory(root, label) {
@@ -160,7 +210,10 @@ export function activateReleaseSlot(root, slot, artifactBytes) {
 
 function parseCli(argv) {
   const [command, source, destination, ...flags] = argv
-  if (command === 'backup' && source && destination) {
+  if (command === 'validate-policy' && source && destination === undefined && flags.length === 0) {
+    const policyPath = path.resolve(source)
+    validateReleasePolicy(JSON.parse(fs.readFileSync(policyPath, 'utf8')))
+  } else if (command === 'backup' && source && destination) {
     backupProviderState(path.resolve(source), path.resolve(destination), {
       includeArtifacts: flags.includes('--include-artifacts'),
       includeUploads: flags.includes('--include-uploads'),
@@ -168,7 +221,7 @@ function parseCli(argv) {
   } else if (command === 'restore' && source && destination && flags.length === 0) {
     restoreProviderState(path.resolve(source), path.resolve(destination))
   } else {
-    fail('Usage: phase5h-readiness.mjs backup <synthetic-source> <new-backup> [--include-artifacts] [--include-uploads] | restore <backup> <new-empty-destination>')
+    fail('Usage: phase5h-readiness.mjs validate-policy <policy.json> | backup <synthetic-source> <new-backup> [--include-artifacts] [--include-uploads] | restore <backup> <new-empty-destination>')
   }
 }
 

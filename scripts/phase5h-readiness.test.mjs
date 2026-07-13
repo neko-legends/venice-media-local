@@ -3,7 +3,65 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { activateReleaseSlot, backupProviderState, restoreProviderState } from './phase5h-readiness.mjs'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { activateReleaseSlot, backupProviderState, restoreProviderState, validateReleasePolicy } from './phase5h-readiness.mjs'
+
+function releasePolicy() {
+  return {
+    schemaVersion: 1,
+    lane: 'owner-controlled-internal',
+    allowedAuthenticodeState: 'NotSigned',
+    destinationMachines: ['JUN-WINDOWS-01', 'JUN-WINDOWS-TEST'],
+    stageRoot: 'C:\\VeniceMediaRelease\\stage',
+    releaseRoot: 'C:\\VeniceMediaRelease\\release',
+    rollbackRoot: 'C:\\VeniceMediaRelease\\rollback',
+    publicDistributionAllowed: false,
+  }
+}
+
+test('validates the minimal owner-controlled internal release policy', () => {
+  const policy = releasePolicy()
+  assert.equal(validateReleasePolicy(policy), policy)
+})
+
+test('CLI validates an explicit local policy file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-policy-'))
+  const policyPath = path.join(root, 'policy.json')
+  fs.writeFileSync(policyPath, JSON.stringify(releasePolicy()))
+  const scriptPath = fileURLToPath(new URL('./phase5h-readiness.mjs', import.meta.url))
+  const result = spawnSync(process.execPath, [scriptPath, 'validate-policy', policyPath], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+})
+
+test('rejects signed, missing, wildcard, duplicate, and unapproved policy shapes', () => {
+  const mutations = [
+    [(value) => { value.allowedAuthenticodeState = 'Valid' }, /exactly NotSigned/],
+    [(value) => { delete value.allowedAuthenticodeState }, /fields are invalid/],
+    [(value) => { value.destinationMachines = ['*'] }, /without wildcards/],
+    [(value) => { value.destinationMachines = ['REPLACE-WITH-EXACT-MACHINE-NAME'] }, /replace example placeholders/],
+    [(value) => { value.destinationMachines = ['JUN-PC', 'jun-pc'] }, /must be unique/],
+    [(value) => { value.lane = 'public-distribution' }, /owner-controlled-internal/],
+    [(value) => { value.publicDistributionAllowed = true }, /must be disabled/],
+    [(value) => { value.releaseRoot = value.stageRoot }, /must be distinct/],
+    [(value) => { value.releaseRoot = `${value.stageRoot}\\child` }, /must not contain/],
+    [(value) => { value.stageRoot = 'C:\\repo\\venice-media-local\\stage' }, /outside app data/],
+    [(value) => { value.extra = true }, /fields are invalid/],
+  ]
+  for (const [mutation, pattern] of mutations) {
+    const policy = releasePolicy()
+    mutation(policy)
+    assert.throws(() => validateReleasePolicy(policy), pattern)
+  }
+})
+
+test('documents future public signing and the limits of hashes', () => {
+  const policy = fs.readFileSync(new URL('../docs/phase5h-windows-release-policy.md', import.meta.url), 'utf8')
+  assert.match(policy, /Hashes prove identity against the trusted retained manifest; they do not authenticate the publisher\./)
+  assert.match(policy, /RFC 3161/)
+  assert.match(policy, /Status.*Valid/)
+  assert.match(policy, /Get-AuthenticodeSignature/)
+})
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-5h-'))
