@@ -13,15 +13,15 @@ use futures_util::StreamExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::OnceLock,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::oneshot;
 use venice_provider_kernel as wire_kernel;
 
 use super::app_data_dir;
@@ -32,7 +32,11 @@ use super::provider_kernel::{
 #[cfg(not(test))]
 const SECRET_KEY_ACCOUNT: &str = "provider-ledger-key-v1";
 
-static LIFECYCLE_SHUTDOWN: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
+static LIFECYCLE_SUPERVISOR: OnceLock<wire_kernel::LifecycleSupervisor> = OnceLock::new();
+
+fn lifecycle_supervisor() -> &'static wire_kernel::LifecycleSupervisor {
+    LIFECYCLE_SUPERVISOR.get_or_init(wire_kernel::LifecycleSupervisor::default)
+}
 
 const LIFECYCLE_CREDENTIAL_ACCOUNT: &str = "provider-lifecycle-credential";
 
@@ -65,11 +69,21 @@ fn lifecycle_state_path(app: &tauri::AppHandle) -> Result<PathBuf, ApiError> {
 }
 
 fn read_lifecycle_state(app: &tauri::AppHandle) -> LifecycleState {
-    lifecycle_state_path(app)
+    read_lifecycle_state_fallible(app)
         .ok()
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .flatten()
         .unwrap_or_default()
+}
+
+fn read_lifecycle_state_fallible(
+    app: &tauri::AppHandle,
+) -> Result<Option<LifecycleState>, &'static str> {
+    let path = lifecycle_state_path(app).map_err(|_| "LIFECYCLE_STATE_PATH_UNAVAILABLE")?;
+    wire_kernel::read_optional_json_file(
+        &path,
+        "LIFECYCLE_STATE_UNREADABLE",
+        "LIFECYCLE_STATE_CORRUPT",
+    )
 }
 
 fn write_lifecycle_state(app: &tauri::AppHandle, state: &LifecycleState) -> Result<(), ApiError> {
@@ -122,7 +136,9 @@ pub fn configure_lifecycle(
         return Err("Lifecycle configuration is invalid".to_string());
     }
     let previous = read_lifecycle_credential().map_err(|error| format!("{error:?}"))?;
-    let existing = read_lifecycle_state(app);
+    let existing = read_lifecycle_state_fallible(app)
+        .map_err(str::to_string)?
+        .unwrap_or_default();
     let normalized_origin = core_origin.trim_end_matches('/').to_string();
     let same_provider = existing.core_origin == normalized_origin;
     let entry = lifecycle_credential_entry().map_err(|error| format!("{error:?}"))?;
@@ -166,20 +182,93 @@ pub fn configure_lifecycle(
     Ok(())
 }
 
-pub fn clear_lifecycle(app: &tauri::AppHandle) -> Result<(), String> {
-    match lifecycle_credential_entry()
-        .map_err(|error| format!("{error:?}"))?
-        .delete_credential()
-    {
-        Ok(_) | Err(keyring::Error::NoEntry) => {}
-        Err(_) => return Err("Lifecycle credential store is unavailable".to_string()),
+pub async fn configure_lifecycle_transactional(
+    app: &tauri::AppHandle,
+    generation: u64,
+    core_origin: &str,
+    credential_id: &str,
+    credential: &str,
+) -> Result<(), String> {
+    let previous_state = read_lifecycle_state_fallible(app)
+        .map_err(str::to_string)?
+        .unwrap_or_default();
+    let previous_credential = read_lifecycle_credential().map_err(|error| format!("{error:?}"))?;
+    lifecycle_supervisor()
+        .stop(generation as usize)
+        .await
+        .map_err(str::to_string)?;
+    let changed = configure_lifecycle(app, core_origin, credential_id, credential);
+    if changed.is_ok() {
+        if let Err(code) = start_lifecycle(app.clone(), generation).await {
+            restore_lifecycle_configuration(app, &previous_state, previous_credential.as_deref())?;
+            restore_lifecycle_worker(app, generation, previous_state.enabled).await?;
+            return Err(code.to_string());
+        }
+        return Ok(());
     }
-    let mut state = read_lifecycle_state(app);
-    state.enabled = false;
-    state.registered = false;
-    state.pending_heartbeat = None;
-    state.updated_at = Utc::now().to_rfc3339();
-    write_lifecycle_state(app, &state).map_err(|error| format!("{error:?}"))
+    restore_lifecycle_configuration(app, &previous_state, previous_credential.as_deref())?;
+    restore_lifecycle_worker(app, generation, previous_state.enabled).await?;
+    changed
+}
+
+async fn restore_lifecycle_worker(
+    app: &tauri::AppHandle,
+    generation: u64,
+    should_run: bool,
+) -> Result<(), String> {
+    if !should_run {
+        return Ok(());
+    }
+    start_lifecycle(app.clone(), generation)
+        .await
+        .map_err(|_| "LIFECYCLE_ROLLBACK_WORKER_RESTART_FAILED".to_string())?;
+    if !lifecycle_supervisor().has_worker(generation as usize).await {
+        return Err("LIFECYCLE_ROLLBACK_WORKER_RESTART_FAILED".to_string());
+    }
+    Ok(())
+}
+
+fn restore_lifecycle_configuration(
+    app: &tauri::AppHandle,
+    state: &LifecycleState,
+    credential: Option<&str>,
+) -> Result<(), String> {
+    write_lifecycle_state(app, state).map_err(|_| "LIFECYCLE_CONFIG_ROLLBACK_STATE_FAILED")?;
+    let entry = lifecycle_credential_entry()
+        .map_err(|_| "LIFECYCLE_CONFIG_ROLLBACK_CREDENTIAL_FAILED".to_string())?;
+    match credential {
+        Some(value) => entry
+            .set_password(value)
+            .map_err(|_| "LIFECYCLE_CONFIG_ROLLBACK_CREDENTIAL_FAILED".to_string())?,
+        None => match entry.delete_credential() {
+            Ok(_) | Err(keyring::Error::NoEntry) => {}
+            Err(_) => return Err("LIFECYCLE_CONFIG_ROLLBACK_CREDENTIAL_FAILED".to_string()),
+        },
+    }
+    Ok(())
+}
+
+fn clear_lifecycle_state(app: &tauri::AppHandle) -> Result<(), String> {
+    let previous = read_lifecycle_state_fallible(app)
+        .map_err(str::to_string)?
+        .unwrap_or_default();
+    let mut disabled = previous.clone();
+    disabled.enabled = false;
+    disabled.registered = false;
+    disabled.pending_heartbeat = None;
+    disabled.updated_at = Utc::now().to_rfc3339();
+    wire_kernel::transactional_disable_then_delete(
+        || write_lifecycle_state(app, &disabled).map_err(|_| "LIFECYCLE_DISABLE_PERSIST_FAILED"),
+        || match lifecycle_credential_entry()
+            .map_err(|_| "LIFECYCLE_CREDENTIAL_STORE_UNAVAILABLE")?
+            .delete_credential()
+        {
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("LIFECYCLE_CREDENTIAL_STORE_UNAVAILABLE"),
+        },
+        || write_lifecycle_state(app, &previous).map_err(|_| "LIFECYCLE_CLEAR_ROLLBACK_FAILED"),
+    )
+    .map_err(str::to_string)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -629,12 +718,15 @@ async fn send_lifecycle_heartbeat(
     let instance_id = super::installation_instance_id(app).map_err(ApiError::internal)?;
     if state.pending_heartbeat.is_none() {
         let health = super::capability_health(app).map_err(ApiError::internal)?;
+        let activity = super::combined_activity_projection(app);
         let body = json!({
             "sequence": next_heartbeat_sequence(state.heartbeat_sequence),
             "observedAt": Utc::now().to_rfc3339(),
             "manifestDigest": state.manifest_digest,
             "health": { "state": health.get("status").cloned().unwrap_or(json!("degraded")), "detail": health },
-            "activeOperationCount": operation_health(app).get("activeOperationCount").cloned().unwrap_or(json!(0))
+            "activeOperationCount": activity["activeOperationCount"],
+            "activeProviderOperationCount": activity["activeProviderOperationCount"],
+            "activeCompatibilityDirectCount": activity["activeCompatibilityDirectCount"]
         });
         let digest = sha256_hex(
             &serde_json::to_vec(&canonical_json(&body))
@@ -716,69 +808,128 @@ async fn send_lifecycle_heartbeat(
     write_lifecycle_state(app, state)
 }
 
-pub fn start_lifecycle(app: tauri::AppHandle) {
-    let shutdown = LIFECYCLE_SHUTDOWN.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = shutdown.lock() {
-        if let Some(previous) = guard.take() {
-            let _ = previous.send(());
-        }
-        let (tx, mut rx) = oneshot::channel();
-        *guard = Some(tx);
-        tauri::async_runtime::spawn(async move {
-            let mut state = read_lifecycle_state(&app);
-            if !state.enabled {
-                return;
-            }
-            let credential = match read_lifecycle_credential() {
-                Ok(Some(value)) => value,
-                _ => {
-                    state.last_error_code = Some("LIFECYCLE_CREDENTIAL_UNAVAILABLE".to_string());
-                    let _ = write_lifecycle_state(&app, &state);
+pub fn set_lifecycle_generation(generation: u64) {
+    lifecycle_supervisor().set_generation(generation as usize);
+}
+
+pub async fn start_lifecycle(app: tauri::AppHandle, generation: u64) -> Result<(), &'static str> {
+    let initial_state = read_lifecycle_state_fallible(&app)?.unwrap_or_default();
+    lifecycle_supervisor()
+        .start(generation as usize, |mut rx| {
+            tokio::spawn(async move {
+                let mut state = initial_state;
+                if !state.enabled {
                     return;
                 }
-            };
-            loop {
-                let result = if !state.registered {
-                    register_lifecycle_once(&app, &mut state, &credential).await
-                } else {
-                    send_lifecycle_heartbeat(&app, &mut state, &credential).await
-                };
-                if let Err(error) = result {
-                    state.last_error_code = Some(error.code.to_string());
-                    if error.code == "LIFECYCLE_REGISTRATION_REQUIRED" {
-                        state.registered = false;
+                let credential = match read_lifecycle_credential() {
+                    Ok(Some(value)) => value,
+                    _ => {
+                        state.last_error_code =
+                            Some("LIFECYCLE_CREDENTIAL_UNAVAILABLE".to_string());
+                        let _ = write_lifecycle_state(&app, &state);
+                        return;
                     }
-                    state.updated_at = Utc::now().to_rfc3339();
-                    let _ = write_lifecycle_state(&app, &state);
+                };
+                loop {
+                    let result = if !state.registered {
+                        register_lifecycle_once(&app, &mut state, &credential).await
+                    } else {
+                        send_lifecycle_heartbeat(&app, &mut state, &credential).await
+                    };
+                    if let Err(error) = result {
+                        state.last_error_code = Some(error.code.to_string());
+                        if error.code == "LIFECYCLE_REGISTRATION_REQUIRED" {
+                            state.registered = false;
+                        }
+                        state.updated_at = Utc::now().to_rfc3339();
+                        let _ = write_lifecycle_state(&app, &state);
+                    }
+                    tokio::select! {
+                        _ = &mut rx => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    }
                 }
-                tokio::select! {
-                    _ = &mut rx => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                }
+            })
+        })
+        .await
+}
+
+#[derive(Debug, Clone)]
+pub struct LifecycleUnregisterOutcome {
+    pub outcome: &'static str,
+    pub failure_code: Option<&'static str>,
+}
+
+pub async fn unregister_lifecycle(
+    app: &tauri::AppHandle,
+    generation: u64,
+) -> LifecycleUnregisterOutcome {
+    let app = app.clone();
+    let outcome = lifecycle_supervisor()
+        .unregister(generation as usize, || async move {
+            let outcome = unregister_lifecycle_network(&app).await;
+            wire_kernel::CoordinatedLifecycleOutcome {
+                outcome: outcome.outcome,
+                failure_code: outcome.failure_code,
             }
-        });
+        })
+        .await;
+    LifecycleUnregisterOutcome {
+        outcome: outcome.outcome,
+        failure_code: outcome.failure_code,
     }
 }
 
-pub async fn unregister_lifecycle(app: &tauri::AppHandle) {
-    if let Ok(mut guard) = LIFECYCLE_SHUTDOWN.get_or_init(|| Mutex::new(None)).lock() {
-        if let Some(tx) = guard.take() {
-            let _ = tx.send(());
+pub async fn clear_lifecycle(app: &tauri::AppHandle, generation: u64) -> Result<(), String> {
+    let previous_state = read_lifecycle_state_fallible(app)
+        .map_err(str::to_string)?
+        .unwrap_or_default();
+    lifecycle_supervisor()
+        .stop(generation as usize)
+        .await
+        .map_err(str::to_string)?;
+    match clear_lifecycle_state(app) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            restore_lifecycle_worker(app, generation, previous_state.enabled).await?;
+            Err(error)
         }
     }
-    let mut state = read_lifecycle_state(app);
+}
+
+async fn unregister_lifecycle_network(app: &tauri::AppHandle) -> LifecycleUnregisterOutcome {
+    let mut state = match read_lifecycle_state_fallible(app) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            return LifecycleUnregisterOutcome {
+                outcome: "no_op",
+                failure_code: None,
+            }
+        }
+        Err(code) => {
+            return LifecycleUnregisterOutcome {
+                outcome: "failed",
+                failure_code: Some(code),
+            }
+        }
+    };
     if !state.enabled || !state.registered {
-        return;
+        return LifecycleUnregisterOutcome {
+            outcome: "no_op",
+            failure_code: None,
+        };
     }
     let Ok(Some(credential)) = read_lifecycle_credential() else {
-        return;
+        return lifecycle_unregister_failure(app, &mut state, "LIFECYCLE_CREDENTIAL_UNAVAILABLE");
     };
     let Ok(instance_id) = super::installation_instance_id(app) else {
-        return;
+        return lifecycle_unregister_failure(app, &mut state, "INSTANCE_ID_UNAVAILABLE");
     };
     let response = match secure_http_client() {
         Ok(client) => client,
-        Err(_) => return,
+        Err(_) => {
+            return lifecycle_unregister_failure(app, &mut state, "LIFECYCLE_CLIENT_UNAVAILABLE")
+        }
     }
     .delete(format!(
         "{}{}",
@@ -796,12 +947,52 @@ pub async fn unregister_lifecycle(app: &tauri::AppHandle) {
         state.registered = false;
         state.pending_heartbeat = None;
         state.updated_at = Utc::now().to_rfc3339();
-        let _ = write_lifecycle_state(app, &state);
+        if write_lifecycle_state(app, &state).is_err() {
+            return LifecycleUnregisterOutcome {
+                outcome: "failed",
+                failure_code: Some("LIFECYCLE_STATE_PERSIST_FAILED"),
+            };
+        }
+        LifecycleUnregisterOutcome {
+            outcome: "succeeded",
+            failure_code: None,
+        }
+    } else {
+        lifecycle_unregister_failure(
+            app,
+            &mut state,
+            if response.is_err() {
+                "LIFECYCLE_UNREGISTER_UNAVAILABLE"
+            } else {
+                "LIFECYCLE_UNREGISTER_REJECTED"
+            },
+        )
+    }
+}
+
+fn lifecycle_unregister_failure(
+    app: &tauri::AppHandle,
+    state: &mut LifecycleState,
+    code: &'static str,
+) -> LifecycleUnregisterOutcome {
+    state.last_error_code = Some(code.to_string());
+    state.updated_at = Utc::now().to_rfc3339();
+    let persisted = write_lifecycle_state(app, state).is_ok();
+    LifecycleUnregisterOutcome {
+        outcome: "failed",
+        failure_code: Some(if persisted {
+            code
+        } else {
+            "LIFECYCLE_FAILURE_EVIDENCE_PERSIST_FAILED"
+        }),
     }
 }
 
 pub fn lifecycle_health(app: &tauri::AppHandle) -> Value {
-    let state = read_lifecycle_state(app);
+    let (state, state_error) = match read_lifecycle_state_fallible(app) {
+        Ok(state) => (state.unwrap_or_default(), None),
+        Err(code) => (LifecycleState::default(), Some(code)),
+    };
     json!({
         "enabled": state.enabled,
         "registered": state.registered,
@@ -810,6 +1001,7 @@ pub fn lifecycle_health(app: &tauri::AppHandle) -> Value {
         "pendingHeartbeatSequence": state.pending_heartbeat.as_ref().map(|pending| pending.sequence),
         "pendingHeartbeatDigest": state.pending_heartbeat.as_ref().map(|pending| pending.digest.clone()),
         "lastErrorCode": state.last_error_code,
+        "stateErrorCode": state_error,
         "fallbackActive": !state.enabled || !state.registered
     })
 }

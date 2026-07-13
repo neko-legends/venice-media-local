@@ -2,8 +2,10 @@
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -29,7 +31,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size, WebviewWindow, WindowEvent};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
 mod provider;
@@ -450,13 +452,22 @@ struct GithubReleaseAsset {
 // Handle for dynamically starting/stopping the agent control HTTP server
 // when the user toggles the setting in the UI (no app restart needed).
 struct AgentControlHandle {
-    shutdown_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    control: venice_provider_kernel::LatchedAgentControlOwnership<AgentControlOwner>,
+    transaction: venice_provider_kernel::SettingsTransaction,
+    admission: venice_provider_kernel::AdmissionController,
+}
+
+struct AgentControlOwner {
+    shutdown: oneshot::Sender<()>,
+    completion: oneshot::Receiver<Result<(), String>>,
 }
 
 impl Default for AgentControlHandle {
     fn default() -> Self {
         Self {
-            shutdown_tx: std::sync::Mutex::new(None),
+            control: Default::default(),
+            transaction: Default::default(),
+            admission: Default::default(),
         }
     }
 }
@@ -528,6 +539,7 @@ struct TailscaleLookupCache {
 
 static TAILSCALE_IPV4_CACHE: OnceLock<Mutex<Option<TailscaleLookupCache>>> = OnceLock::new();
 static INSTALLATION_INSTANCE_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SETTINGS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn default_agent_control_port() -> u16 {
     DEFAULT_AGENT_CONTROL_PORT
@@ -796,6 +808,14 @@ fn capability_health(app: &AppHandle) -> Result<Value, String> {
         })
         .unwrap_or("fallback");
     let operation_health = provider::operation_health(app);
+    let activity = combined_activity_projection(app);
+    let direct_compatibility_count = activity["activeCompatibilityDirectCount"]
+        .as_u64()
+        .unwrap_or(0);
+    let provider_operation_count = activity["activeProviderOperationCount"]
+        .as_u64()
+        .unwrap_or(0);
+    let total_active_count = activity["activeOperationCount"].as_u64().unwrap_or(0);
     let ledger_ready = operation_health["ready"].as_bool().unwrap_or(false);
     let artifact_writable = operation_health["artifactWritable"]
         .as_bool()
@@ -855,10 +875,27 @@ fn capability_health(app: &AppHandle) -> Result<Value, String> {
             "disk": { "status": "degraded", "availableBytes": null, "reason": "DISK_CAPACITY_UNKNOWN" }
         },
         "lifecycle": provider::lifecycle_health(app),
-        "activeOperationCount": operation_health["activeOperationCount"],
+        "activeOperationCount": total_active_count,
+        "activeProviderOperationCount": provider_operation_count,
+        "activeCompatibilityDirectCount": direct_compatibility_count,
         "degradedReasons": degraded_reasons,
         "version": app.package_info().version.to_string()
     }))
+}
+
+fn combined_activity_projection(app: &AppHandle) -> Value {
+    let provider = provider::operation_health(app)["activeOperationCount"]
+        .as_u64()
+        .unwrap_or(0);
+    let compatibility_direct = app
+        .state::<AgentControlHandle>()
+        .admission
+        .active_work_count() as u64;
+    json!({
+        "activeOperationCount": provider.saturating_add(compatibility_direct),
+        "activeProviderOperationCount": provider,
+        "activeCompatibilityDirectCount": compatibility_direct
+    })
 }
 
 /// Write the control-api.json discovery file so agents / the skill can auto-discover
@@ -868,6 +905,7 @@ fn write_agent_control_discovery(
     token: &str,
     port: u16,
     bind_all: bool,
+    generation: u64,
 ) -> Result<(), String> {
     let dir = app_data_dir(app)?;
     let tailscale_ip = tailscale_ipv4_address();
@@ -893,10 +931,14 @@ fn write_agent_control_discovery(
         "schemaVersions": [CAPABILITY_SCHEMA_VERSION],
         "note": "Connect using the address and a separately provisioned credential. Same Tailscale network recommended."
     });
-    let path = dir.join("control-api.json");
-    std::fs::write(&path, serde_json::to_string_pretty(&discovery).unwrap())
-        .map_err(|e| e.to_string())?;
-    println!("[agent-control] Wrote discovery file: {:?}", path);
+    venice_provider_kernel::GenerationOwnedJsonFile::new(dir, "control-api.json")
+        .publish(generation, discovery)?;
+    Ok(())
+}
+
+fn remove_agent_control_discovery(app: &AppHandle, generation: u64) -> Result<(), String> {
+    venice_provider_kernel::GenerationOwnedJsonFile::new(app_data_dir(app)?, "control-api.json")
+        .remove_if_generation(generation)?;
     Ok(())
 }
 
@@ -951,6 +993,10 @@ where
 
 fn read_settings(app: &AppHandle) -> AppSettings {
     let fallback = default_settings(app);
+    if let Ok(root) = app_data_dir(app) {
+        let storage = venice_provider_kernel::FileStorage::new(root);
+        let _ = venice_provider_kernel::Storage::recover_atomic(&storage, "settings.json");
+    }
     let mut settings = settings_path(app)
         .map(|path| read_json_file(&path, fallback.clone()))
         .unwrap_or_else(|_| fallback.clone());
@@ -963,67 +1009,103 @@ fn read_settings(app: &AppHandle) -> AppSettings {
     settings
 }
 
+fn update_settings_file(
+    app: &AppHandle,
+    update: impl FnOnce(&mut AppSettings),
+) -> Result<AppSettings, String> {
+    let _guard = SETTINGS_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Settings write lock is unavailable".to_string())?;
+    let mut settings = read_settings(app);
+    update(&mut settings);
+    save_settings_file_unlocked(app, &settings)?;
+    Ok(settings)
+}
+
+async fn persist_agent_control_disabled_for_generation(
+    app: &AppHandle,
+    generation: u64,
+) -> Result<(), String> {
+    let handle = app.state::<AgentControlHandle>();
+    // A synchronous Settings caller may still own this barrier and will perform
+    // its own rollback. Detached startup cancellation uses this path once the
+    // caller has released the barrier.
+    let Ok(_transaction) = handle.transaction.try_lock() else {
+        return Ok(());
+    };
+    if !handle
+        .control
+        .ownership
+        .may_persist_stopped_generation(generation)
+    {
+        return Ok(());
+    }
+    update_settings_file(app, |settings| settings.enable_agent_control = false).map(|_| ())
+}
+
 fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
-    let path = settings_path(app)?;
+    let _guard = SETTINGS_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Settings write lock is unavailable".to_string())?;
+    save_settings_file_unlocked(app, settings)
+}
+
+fn save_settings_file_unlocked(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let root = app_data_dir(app)?;
     let mut persisted = settings.clone();
     persisted.agent_control_token = None;
-    write_json_file(&path, &persisted)
+    let bytes = serde_json::to_vec_pretty(&persisted).map_err(|error| error.to_string())?;
+    let storage = venice_provider_kernel::FileStorage::new(root);
+    venice_provider_kernel::Storage::recover_atomic(&storage, "settings.json")?;
+    venice_provider_kernel::Storage::write_atomic(&storage, "settings.json", &bytes)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn force_private_session_off_on_launch(app: &AppHandle) {
-    let mut settings = read_settings(app);
-    if !settings.private_session {
-        return;
-    }
-
-    settings.private_session = false;
-    if let Err(err) = save_settings_file(app, &settings) {
+    if let Err(err) = update_settings_file(app, |settings| settings.private_session = false) {
         eprintln!("[settings] Failed to reset launch state: {err}");
     }
 }
 
-fn start_saved_agent_control_on_launch(app: AppHandle, handle: &AgentControlHandle) {
-    let mut settings = read_settings(&app);
-    if !settings.enable_agent_control {
-        return;
-    }
-
-    let token = match read_control_token(&settings) {
-        Ok(Some(token)) => {
-            if settings.agent_control_token.is_some() {
-                if let Err(err) = store_control_token(&token) {
-                    eprintln!("[agent-control] Credential migration failed: {err}");
-                    return;
-                }
-                settings.agent_control_token = None;
-                let _ = save_settings_file(&app, &settings);
-            }
-            token
-        }
-        Ok(None) => {
-            let token = generate_agent_control_token();
-            if let Err(err) = store_control_token(&token) {
-                eprintln!("[agent-control] Credential store unavailable: {err}");
-                return;
-            }
-            token
-        }
-        Err(err) => {
-            eprintln!("[agent-control] Credential store unavailable: {err}");
+fn start_saved_agent_control_on_launch(app: AppHandle, _handle: &AgentControlHandle) {
+    tauri::async_runtime::spawn(async move {
+        let handle = app.state::<AgentControlHandle>();
+        let _transaction = handle.transaction.lock().await;
+        if handle.control.terminal.ensure_open().is_err() {
             return;
         }
-    };
-
-    if let Err(err) = start_agent_control_server(
-        app,
-        token,
-        None,
-        settings.agent_control_port,
-        settings.agent_control_bind_all,
-        handle,
-    ) {
-        eprintln!("[agent-control] Failed to restore saved Agent Control state: {err}");
-    }
+        let mut settings = read_settings(&app);
+        if !settings.enable_agent_control {
+            return;
+        }
+        let token = match read_control_token(&settings) {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                let token = generate_agent_control_token();
+                if store_control_token(&token).is_err() {
+                    settings.enable_agent_control = false;
+                    let _ = save_settings_file(&app, &settings);
+                    return;
+                }
+                token
+            }
+            Err(_) => {
+                settings.enable_agent_control = false;
+                let _ = save_settings_file(&app, &settings);
+                return;
+            }
+        };
+        let port = settings.agent_control_port;
+        let bind_all = settings.agent_control_bind_all;
+        if let Err(err) = start_agent_control_server(app.clone(), token, None, port, bind_all).await
+        {
+            let _ = update_settings_file(&app, |settings| settings.enable_agent_control = false);
+            eprintln!("[agent-control] Failed to restore saved Agent Control state: {err}");
+        }
+    });
 }
 
 fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
@@ -1074,15 +1156,18 @@ fn apply_initial_window_size(app: &AppHandle, window: &WebviewWindow) -> Result<
     Ok(())
 }
 
-fn persist_window_size(app: &AppHandle, size: PhysicalSize<u32>) -> Result<(), String> {
+async fn persist_window_size(app: &AppHandle, size: PhysicalSize<u32>) -> Result<(), String> {
     if size.width == 0 || size.height == 0 {
         return Ok(());
     }
 
-    let mut settings = read_settings(app);
-    settings.window_width = Some(size.width);
-    settings.window_height = Some(size.height);
-    save_settings_file(app, &settings)
+    let handle = app.state::<AgentControlHandle>();
+    let _transaction = handle.transaction.lock().await;
+    update_settings_file(app, |settings| {
+        settings.window_width = Some(size.width);
+        settings.window_height = Some(size.height);
+    })
+    .map(|_| ())
 }
 
 fn fallback_model_cache() -> ModelCache {
@@ -3570,6 +3655,7 @@ fn unique_burn_path(dir: &Path, original_name: &str, index: usize) -> PathBuf {
 
 #[tauri::command]
 fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<String>, String> {
+    let _permit = claim_direct_work(&app)?;
     let mut moved = Vec::new();
     let burn_dir = ensure_burn_dir(&app)?;
 
@@ -3639,6 +3725,7 @@ fn move_media_files_to_burn(app: AppHandle, paths: Vec<String>) -> Result<Vec<St
 
 #[tauri::command]
 fn move_private_session_to_burn(app: AppHandle) -> Result<BurnFolderStats, String> {
+    let _permit = claim_direct_work(&app)?;
     let settings = read_settings(&app);
     let root = output_root(&app, &settings)?;
     let private_root = root.join("private");
@@ -3662,6 +3749,7 @@ fn copy_media_file(
     source_path: String,
     destination_path: String,
 ) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     let source = PathBuf::from(source_path.trim());
     let destination = PathBuf::from(destination_path.trim());
 
@@ -3722,7 +3810,8 @@ fn copy_media_file(
 }
 
 #[tauri::command]
-fn save_data_url_file(request: SaveDataUrlRequest) -> Result<String, String> {
+fn save_data_url_file(app: AppHandle, request: SaveDataUrlRequest) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     let destination = PathBuf::from(request.destination_path.trim());
     if destination.as_os_str().is_empty() {
         return Err("Save location is empty".to_string());
@@ -4057,6 +4146,7 @@ fn run_file(path: &Path) -> Result<(), String> {
 
 #[tauri::command]
 fn open_output_folder(app: AppHandle) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     let root = ensure_output_folders(&app)?;
     open_folder_path(&root)?;
     Ok(root.to_string_lossy().to_string())
@@ -4064,13 +4154,15 @@ fn open_output_folder(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn open_burn_folder(app: AppHandle) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     let dir = ensure_burn_dir(&app)?;
     open_folder_path(&dir)?;
     Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn open_file_folder(path: String) -> Result<String, String> {
+fn open_file_folder(app: AppHandle, path: String) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     let file_path = PathBuf::from(path.trim());
     let folder = file_path
         .parent()
@@ -4082,6 +4174,7 @@ fn open_file_folder(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn burn_folder(app: AppHandle, seed: Option<String>) -> Result<BurnFolderStats, String> {
+    let _permit = claim_direct_work(&app)?;
     let dir = ensure_burn_dir(&app)?;
     let burn_seed = seed
         .as_deref()
@@ -4339,11 +4432,18 @@ fn get_agent_control_address(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn save_settings(
+async fn save_settings(
     app: AppHandle,
     request: SaveSettingsRequest,
-    handle: tauri::State<AgentControlHandle>,
+    handle: tauri::State<'_, AgentControlHandle>,
 ) -> Result<AppSettings, String> {
+    let transaction = handle.transaction.clone();
+    let transaction_guard = transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
     let mut settings = read_settings(&app);
     if let Some(theme) = request.theme {
         settings.theme = theme;
@@ -4388,6 +4488,8 @@ fn save_settings(
         settings.agent_control_bind_all = bind_all;
     }
 
+    let mut stop_ownership = None;
+    let mut restart_after_stop = false;
     if let Some(enable) = request.enable_agent_control {
         settings.enable_agent_control = enable;
         // Live start / stop when the user toggles in Settings (no restart needed)
@@ -4395,20 +4497,25 @@ fn save_settings(
             let token = read_control_token(&settings)?.unwrap_or_else(generate_agent_control_token);
             store_control_token(&token)?;
             settings.agent_control_token = Some(token.clone());
-            start_agent_control_server(
+            save_settings_file(&app, &settings)?;
+            if let Err(error) = start_agent_control_server(
                 app.clone(),
                 token,
                 None,
                 settings.agent_control_port,
                 settings.agent_control_bind_all,
-                &handle,
-            )?;
+            )
+            .await
+            {
+                settings.enable_agent_control = false;
+                save_settings_file(&app, &settings)?;
+                return Err(format!(
+                    "Agent Control startup failed and enable was rolled back: {error}"
+                ));
+            }
         } else if !enable && was_enabled {
-            let lifecycle_app = app.clone();
-            tauri::async_runtime::spawn(async move {
-                provider::unregister_lifecycle(&lifecycle_app).await;
-            });
-            stop_agent_control_server(&handle);
+            save_settings_file(&app, &settings)?;
+            stop_ownership = capture_agent_control_stop(&handle)?;
         }
     }
 
@@ -4417,57 +4524,56 @@ fn save_settings(
         && (settings.agent_control_port != previous_port
             || settings.agent_control_bind_all != previous_bind_all)
     {
-        stop_agent_control_server(&handle);
+        save_settings_file(&app, &settings)?;
+        stop_ownership = capture_agent_control_stop(&handle)?;
+        restart_after_stop = true;
+    }
+
+    let stopped_generation = stop_ownership.as_ref().map(|(generation, _)| *generation);
+    drop(transaction_guard);
+    if let Err(error) = await_agent_control_stop(stop_ownership).await {
+        let _guard = transaction.lock().await;
+        handle
+            .control
+            .terminal
+            .ensure_open()
+            .map_err(str::to_string)?;
+        settings.enable_agent_control = false;
+        save_settings_file(&app, &settings)?;
+        return Err(format!(
+            "Agent Control stop failed; persisted disabled: {error}"
+        ));
+    }
+    let _transaction_guard = transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
+    if let Some(generation) = stopped_generation {
+        let (_, current_generation, _) = handle.control.ownership.snapshot();
+        if current_generation != generation || handle.control.terminal.is_set() {
+            return Err("APPLICATION_SHUTTING_DOWN".to_string());
+        }
+    }
+    if restart_after_stop {
         let token = read_control_token(&settings)?
             .ok_or_else(|| "Agent Control credential is unavailable".to_string())?;
         settings.agent_control_token = Some(token.clone());
-        start_agent_control_server(
+        if let Err(error) = start_agent_control_server(
             app.clone(),
             token,
             None,
             settings.agent_control_port,
             settings.agent_control_bind_all,
-            &handle,
-        )?;
-    }
-
-    ensure_output_folders_for_settings(&app, &settings)?;
-    save_settings_file(&app, &settings)?;
-    Ok(settings)
-}
-
-#[tauri::command]
-fn rotate_agent_control_token(
-    app: AppHandle,
-    handle: tauri::State<AgentControlHandle>,
-) -> Result<AppSettings, String> {
-    let mut settings = read_settings(&app);
-    let previous_token = read_control_token(&settings)?
-        .ok_or_else(|| "Agent Control credential is unavailable".to_string())?;
-    let token = generate_agent_control_token();
-    store_control_token(&token)?;
-    settings.agent_control_token = Some(token.clone());
-
-    if settings.enable_agent_control {
-        stop_agent_control_server(&handle);
-        if let Err(error) = start_agent_control_server(
-            app.clone(),
-            token.clone(),
-            Some(previous_token.clone()),
-            settings.agent_control_port,
-            settings.agent_control_bind_all,
-            &handle,
-        ) {
-            store_control_token(&previous_token)?;
-            let _ = start_agent_control_server(
-                app.clone(),
-                previous_token,
-                None,
-                settings.agent_control_port,
-                settings.agent_control_bind_all,
-                &handle,
-            );
-            return Err(format!("Credential rotation was rolled back: {error}"));
+        )
+        .await
+        {
+            settings.enable_agent_control = false;
+            save_settings_file(&app, &settings)?;
+            return Err(format!(
+                "Agent Control restart failed and enable was rolled back: {error}"
+            ));
         }
     }
 
@@ -4477,7 +4583,91 @@ fn rotate_agent_control_token(
 }
 
 #[tauri::command]
-fn save_api_key(api_key: String) -> Result<bool, String> {
+async fn rotate_agent_control_token(
+    app: AppHandle,
+    handle: tauri::State<'_, AgentControlHandle>,
+) -> Result<AppSettings, String> {
+    let transaction = handle.transaction.clone();
+    let transaction_guard = transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
+    let mut settings = read_settings(&app);
+    let previous_token = read_control_token(&settings)?
+        .ok_or_else(|| "Agent Control credential is unavailable".to_string())?;
+    let token = generate_agent_control_token();
+    store_control_token(&token)?;
+    settings.agent_control_token = Some(token.clone());
+
+    if settings.enable_agent_control {
+        let stop = capture_agent_control_stop(&handle)?;
+        let stopped_generation = stop.as_ref().map(|(generation, _)| *generation);
+        drop(transaction_guard);
+        if let Err(error) = await_agent_control_stop(stop).await {
+            let _guard = transaction.lock().await;
+            handle
+                .control
+                .terminal
+                .ensure_open()
+                .map_err(str::to_string)?;
+            settings.enable_agent_control = false;
+            save_settings_file(&app, &settings)?;
+            store_control_token(&previous_token)?;
+            return Err(format!(
+                "Credential rotation stop failed; persisted disabled: {error}"
+            ));
+        }
+        let _guard = transaction.lock().await;
+        if stopped_generation.is_some_and(|generation| {
+            handle.control.ownership.snapshot().1 != generation || handle.control.terminal.is_set()
+        }) {
+            store_control_token(&previous_token)?;
+            return Err("APPLICATION_SHUTTING_DOWN".to_string());
+        }
+        if let Err(error) = start_agent_control_server(
+            app.clone(),
+            token.clone(),
+            Some(previous_token.clone()),
+            settings.agent_control_port,
+            settings.agent_control_bind_all,
+        )
+        .await
+        {
+            store_control_token(&previous_token)?;
+            let restored = start_agent_control_server(
+                app.clone(),
+                previous_token,
+                None,
+                settings.agent_control_port,
+                settings.agent_control_bind_all,
+            )
+            .await;
+            if restored.is_err() {
+                settings.enable_agent_control = false;
+                save_settings_file(&app, &settings)?;
+            }
+            return Err(format!("Credential rotation was rolled back: {error}"));
+        }
+    } else {
+        drop(transaction_guard);
+    }
+
+    let _transaction_guard = transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
+    ensure_output_folders_for_settings(&app, &settings)?;
+    save_settings_file(&app, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn save_api_key(app: AppHandle, api_key: String) -> Result<bool, String> {
+    let _permit = claim_direct_work(&app)?;
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
         return Err("API key cannot be empty".to_string());
@@ -4488,7 +4678,8 @@ fn save_api_key(api_key: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn clear_api_key() -> Result<bool, String> {
+fn clear_api_key(app: AppHandle) -> Result<bool, String> {
+    let _permit = claim_direct_work(&app)?;
     let entry = keyring_entry()?;
     match entry.delete_credential() {
         Ok(_) => Ok(true),
@@ -4497,25 +4688,52 @@ fn clear_api_key() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn configure_provider_lifecycle(
+async fn configure_provider_lifecycle(
     app: AppHandle,
+    handle: tauri::State<'_, AgentControlHandle>,
     core_origin: String,
     credential_id: String,
     credential: String,
 ) -> Result<bool, String> {
-    provider::configure_lifecycle(&app, &core_origin, &credential_id, &credential)?;
-    provider::start_lifecycle(app);
+    let _transaction = handle.transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
+    let (phase, generation, _) = handle.control.ownership.snapshot();
+    if phase != venice_provider_kernel::AgentControlPhase::Running {
+        return Err("Agent Control must be running before lifecycle starts".to_string());
+    }
+    provider::configure_lifecycle_transactional(
+        &app,
+        generation,
+        &core_origin,
+        &credential_id,
+        &credential,
+    )
+    .await?;
     Ok(true)
 }
 
 #[tauri::command]
-fn clear_provider_lifecycle(app: AppHandle) -> Result<bool, String> {
-    provider::clear_lifecycle(&app)?;
+async fn clear_provider_lifecycle(
+    app: AppHandle,
+    handle: tauri::State<'_, AgentControlHandle>,
+) -> Result<bool, String> {
+    let _transaction = handle.transaction.lock().await;
+    handle
+        .control
+        .terminal
+        .ensure_open()
+        .map_err(str::to_string)?;
+    provider::clear_lifecycle(&app, handle.control.ownership.snapshot().1).await?;
     Ok(true)
 }
 
 #[tauri::command]
 async fn refresh_models(app: AppHandle) -> Result<ModelCache, String> {
+    let _permit = claim_direct_work(&app)?;
     refresh_models_inner(&app).await
 }
 
@@ -4600,7 +4818,8 @@ async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, String> {
 }
 
 #[tauri::command]
-fn open_update_release(url: String) -> Result<bool, String> {
+fn open_update_release(app: AppHandle, url: String) -> Result<bool, String> {
+    let _permit = claim_direct_work(&app)?;
     open_url(&url)?;
     Ok(true)
 }
@@ -4641,6 +4860,7 @@ fn update_download_dirs(app: &AppHandle, asset: &UpdateAsset) -> Result<Vec<Path
 
 #[tauri::command]
 async fn download_update_installer(app: AppHandle, asset: UpdateAsset) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
     if !asset.url.starts_with("https://github.com/") {
         return Err("Update asset URL did not come from GitHub releases".to_string());
     }
@@ -4674,7 +4894,8 @@ async fn download_update_installer(app: AppHandle, asset: UpdateAsset) -> Result
 }
 
 #[tauri::command]
-fn run_update_installer(path: String) -> Result<bool, String> {
+fn run_update_installer(app: AppHandle, path: String) -> Result<bool, String> {
+    let _permit = claim_direct_work(&app)?;
     run_file(Path::new(path.trim()))?;
     Ok(true)
 }
@@ -4684,6 +4905,7 @@ async fn generate_image(
     app: AppHandle,
     request: ImageGenerationRequest,
 ) -> Result<Vec<MediaResult>, String> {
+    let _permit = claim_direct_work(&app)?;
     let variant_count = request.variants.unwrap_or(1).clamp(1, 4);
     let format = normalize_image_format(request.format.as_deref().unwrap_or("webp"));
     let title = request
@@ -4790,6 +5012,7 @@ async fn remove_background(
     app: AppHandle,
     request: BackgroundRemoveRequest,
 ) -> Result<MediaResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let body = image_input_body(&request.source_image)?;
     let response = venice_post_json("/image/background-remove", body.clone()).await?;
     save_binary_response(
@@ -4807,6 +5030,7 @@ async fn upscale_image(
     app: AppHandle,
     request: ImageUpscaleRequest,
 ) -> Result<MediaResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let scale = match request.scale {
         2 | 4 => request.scale,
         _ => return Err("Scale must be 2x or 4x".to_string()),
@@ -4834,6 +5058,7 @@ async fn multi_edit_image(
     app: AppHandle,
     request: ImageMultiEditRequest,
 ) -> Result<MediaResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let prompt = request.prompt.trim().to_string();
     if prompt.is_empty() {
         return Err("Enter an edit prompt first".to_string());
@@ -4903,6 +5128,7 @@ fn video_control_option_supported(controls: Option<&Value>, key: &str, value: &s
 
 #[tauri::command]
 async fn queue_video(app: AppHandle, request: QueueMediaRequest) -> Result<QueueResult, String> {
+    let _permit = claim_direct_work(&app)?;
     queue_video_inner(&app, request).await
 }
 
@@ -5007,11 +5233,13 @@ async fn retrieve_video(
     app: AppHandle,
     request: RetrieveRequest,
 ) -> Result<RetrieveResult, String> {
+    let _permit = claim_direct_work(&app)?;
     retrieve_queued_media(app, request, "/video/retrieve", "videos").await
 }
 
 #[tauri::command]
 async fn queue_audio(app: AppHandle, request: QueueMediaRequest) -> Result<QueueResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let (
         supports_duration_seconds,
         supports_lyrics,
@@ -5111,6 +5339,7 @@ async fn retrieve_audio(
     app: AppHandle,
     request: RetrieveRequest,
 ) -> Result<RetrieveResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let default_kind = if matches!(request.kind.as_deref(), Some("sfx")) {
         "sfx"
     } else {
@@ -5232,6 +5461,7 @@ async fn transcribe_audio(
     app: AppHandle,
     request: TranscriptionRequest,
 ) -> Result<MediaResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let key = read_api_key().map_err(|_| "Venice API key is not configured".to_string())?;
     let (bytes, detected_mime) = decode_data_url(&request.audio)?;
     let file_name = request
@@ -5317,6 +5547,7 @@ async fn transcribe_audio(
 
 #[tauri::command]
 async fn generate_speech(app: AppHandle, request: SpeechRequest) -> Result<MediaResult, String> {
+    let _permit = claim_direct_work(&app)?;
     let response_format = request
         .response_format
         .clone()
@@ -5535,99 +5766,107 @@ impl venice_provider_kernel::Executor for TauriMediaExecutor {
         execution: venice_provider_kernel::ExecutionInput,
         provider_request_id: &str,
     ) -> Result<venice_provider_kernel::SubmissionReceipt, String> {
-        let input = shared_execution_input(&execution)?;
-        validate_typed_provider_input(&execution.operation.capability.id, &input)?;
-        let (results, result, upstream_id) = match execution.operation.capability.id.as_str() {
-            "media.models.list" => (
-                vec![],
-                model_catalog(&self.app),
-                provider_request_id.to_string(),
-            ),
-            "media.models.refresh" => {
-                refresh_models_inner(&self.app).await?;
-                (
-                    vec![],
-                    model_catalog(&self.app),
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.image.generate" => {
-                let request: ImageGenerationRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    generate_image(self.app.clone(), request).await?,
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.image.edit" => {
-                let request: ImageMultiEditRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    vec![multi_edit_image(self.app.clone(), request).await?],
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.image.background-remove" => {
-                let request: BackgroundRemoveRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    vec![remove_background(self.app.clone(), request).await?],
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.image.upscale" => {
-                let request: ImageUpscaleRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    vec![upscale_image(self.app.clone(), request).await?],
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.voice.generate" => {
-                let request: SpeechRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    vec![generate_speech(self.app.clone(), request).await?],
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.transcribe" => {
-                let request: TranscriptionRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                (
-                    vec![transcribe_audio(self.app.clone(), request).await?],
-                    Value::Null,
-                    provider_request_id.to_string(),
-                )
-            }
-            "media.video.generate" | "media.audio.music.generate" | "media.audio.sfx.generate" => {
-                let request: QueueMediaRequest =
-                    serde_json::from_value(input).map_err(|error| error.to_string())?;
-                let queued = if execution.operation.capability.id == "media.video.generate" {
-                    queue_video_inner(&self.app, request).await?
-                } else {
-                    queue_audio(self.app.clone(), request).await?
-                };
-                (vec![], Value::Null, queued.queue_id)
-            }
-            _ => return Err("Capability is unavailable".into()),
-        };
-        if !results.is_empty() || !result.is_null() {
-            let cache = SharedExecutionCache { results, result };
-            atomic_write_bytes(
-                &shared_execution_cache_path(&self.app, provider_request_id)?,
-                &serde_json::to_vec(&cache).map_err(|error| error.to_string())?,
-            )?;
-        }
-        Ok(venice_provider_kernel::SubmissionReceipt {
-            upstream_id,
-            certainty: "submitted_confirmed".into(),
-        })
+        WORK_ALREADY_ADMITTED
+            .scope(true, async {
+                let input = shared_execution_input(&execution)?;
+                validate_typed_provider_input(&execution.operation.capability.id, &input)?;
+                let (results, result, upstream_id) =
+                    match execution.operation.capability.id.as_str() {
+                        "media.models.list" => (
+                            vec![],
+                            model_catalog(&self.app),
+                            provider_request_id.to_string(),
+                        ),
+                        "media.models.refresh" => {
+                            refresh_models_inner(&self.app).await?;
+                            (
+                                vec![],
+                                model_catalog(&self.app),
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.image.generate" => {
+                            let request: ImageGenerationRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                generate_image(self.app.clone(), request).await?,
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.image.edit" => {
+                            let request: ImageMultiEditRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                vec![multi_edit_image(self.app.clone(), request).await?],
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.image.background-remove" => {
+                            let request: BackgroundRemoveRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                vec![remove_background(self.app.clone(), request).await?],
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.image.upscale" => {
+                            let request: ImageUpscaleRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                vec![upscale_image(self.app.clone(), request).await?],
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.voice.generate" => {
+                            let request: SpeechRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                vec![generate_speech(self.app.clone(), request).await?],
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.transcribe" => {
+                            let request: TranscriptionRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            (
+                                vec![transcribe_audio(self.app.clone(), request).await?],
+                                Value::Null,
+                                provider_request_id.to_string(),
+                            )
+                        }
+                        "media.video.generate"
+                        | "media.audio.music.generate"
+                        | "media.audio.sfx.generate" => {
+                            let request: QueueMediaRequest =
+                                serde_json::from_value(input).map_err(|error| error.to_string())?;
+                            let queued =
+                                if execution.operation.capability.id == "media.video.generate" {
+                                    queue_video_inner(&self.app, request).await?
+                                } else {
+                                    queue_audio(self.app.clone(), request).await?
+                                };
+                            (vec![], Value::Null, queued.queue_id)
+                        }
+                        _ => return Err("Capability is unavailable".into()),
+                    };
+                if !results.is_empty() || !result.is_null() {
+                    let cache = SharedExecutionCache { results, result };
+                    atomic_write_bytes(
+                        &shared_execution_cache_path(&self.app, provider_request_id)?,
+                        &serde_json::to_vec(&cache).map_err(|error| error.to_string())?,
+                    )?;
+                }
+                Ok(venice_provider_kernel::SubmissionReceipt {
+                    upstream_id,
+                    certainty: "submitted_confirmed".into(),
+                })
+            })
+            .await
     }
 
     async fn resume(
@@ -5635,66 +5874,77 @@ impl venice_provider_kernel::Executor for TauriMediaExecutor {
         execution: venice_provider_kernel::ExecutionInput,
         upstream_id: &str,
     ) -> Result<venice_provider_kernel::ExecutionResult, String> {
-        if matches!(
-            execution.operation.capability.id.as_str(),
-            "media.video.generate" | "media.audio.music.generate" | "media.audio.sfx.generate"
-        ) {
-            loop {
-                tokio::time::sleep(Duration::from_secs(7)).await;
-                let kind = execution.operation.capability.id.as_str();
-                let request = RetrieveRequest {
-                    queue_id: upstream_id.to_string(),
-                    model: execution
-                        .operation
-                        .input
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    kind: if kind == "media.audio.sfx.generate" {
-                        Some("sfx".into())
-                    } else {
-                        None
-                    },
-                    download_url: None,
-                };
-                let retrieved = if kind == "media.video.generate" {
-                    retrieve_queued_media(self.app.clone(), request, "/video/retrieve", "videos")
-                        .await?
-                } else {
-                    retrieve_queued_media(
-                        self.app.clone(),
-                        request,
-                        "/audio/retrieve",
-                        if kind == "media.audio.sfx.generate" {
-                            "sfx"
+        WORK_ALREADY_ADMITTED
+            .scope(true, async {
+                if matches!(
+                    execution.operation.capability.id.as_str(),
+                    "media.video.generate"
+                        | "media.audio.music.generate"
+                        | "media.audio.sfx.generate"
+                ) {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(7)).await;
+                        let kind = execution.operation.capability.id.as_str();
+                        let request = RetrieveRequest {
+                            queue_id: upstream_id.to_string(),
+                            model: execution
+                                .operation
+                                .input
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            kind: if kind == "media.audio.sfx.generate" {
+                                Some("sfx".into())
+                            } else {
+                                None
+                            },
+                            download_url: None,
+                        };
+                        let retrieved = if kind == "media.video.generate" {
+                            retrieve_queued_media(
+                                self.app.clone(),
+                                request,
+                                "/video/retrieve",
+                                "videos",
+                            )
+                            .await?
                         } else {
-                            "audio"
-                        },
-                    )
-                    .await?
-                };
-                if let Some(result) = retrieved.result {
-                    return shared_execution_result(
-                        &execution,
-                        SharedExecutionCache {
-                            results: vec![result],
-                            result: Value::Null,
-                        },
-                    );
+                            retrieve_queued_media(
+                                self.app.clone(),
+                                request,
+                                "/audio/retrieve",
+                                if kind == "media.audio.sfx.generate" {
+                                    "sfx"
+                                } else {
+                                    "audio"
+                                },
+                            )
+                            .await?
+                        };
+                        if let Some(result) = retrieved.result {
+                            return shared_execution_result(
+                                &execution,
+                                SharedExecutionCache {
+                                    results: vec![result],
+                                    result: Value::Null,
+                                },
+                            );
+                        }
+                    }
                 }
-            }
-        }
-        let request_id = execution
-            .operation
-            .provider_request_id
-            .as_deref()
-            .ok_or_else(|| "Provider request identity is missing".to_string())?;
-        let cache: SharedExecutionCache = serde_json::from_slice(
-            &fs::read(shared_execution_cache_path(&self.app, request_id)?)
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
-        shared_execution_result(&execution, cache)
+                let request_id = execution
+                    .operation
+                    .provider_request_id
+                    .as_deref()
+                    .ok_or_else(|| "Provider request identity is missing".to_string())?;
+                let cache: SharedExecutionCache = serde_json::from_slice(
+                    &fs::read(shared_execution_cache_path(&self.app, request_id)?)
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                shared_execution_result(&execution, cache)
+            })
+            .await
     }
 
     async fn finalize_artifact(
@@ -6212,6 +6462,55 @@ struct AgentRemoveResultPathsPayload {
 
 type AgentApiError = (StatusCode, String);
 
+tokio::task_local! {
+    static WORK_ALREADY_ADMITTED: bool;
+}
+
+fn claim_direct_work(
+    app: &AppHandle,
+) -> Result<Option<venice_provider_kernel::CompatibilityPermit>, String> {
+    if WORK_ALREADY_ADMITTED
+        .try_with(|value| *value)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    app.state::<AgentControlHandle>()
+        .admission
+        .claim_compatibility()
+        .map(Some)
+        .map_err(str::to_string)
+}
+
+async fn reject_mutation_while_shutting_down(
+    State(admission): State<venice_provider_kernel::AdmissionController>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.method() == axum::http::Method::GET {
+        return next.run(request).await;
+    }
+    let _permit = match admission.claim_compatibility() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": {
+                        "code": "APPLICATION_SHUTTING_DOWN",
+                        "message": "Application shutdown has already been accepted",
+                        "retryable": false,
+                        "submissionCertainty": "not_submitted",
+                        "details": {}
+                    }
+                })),
+            )
+                .into_response()
+        }
+    };
+    WORK_ALREADY_ADMITTED.scope(true, next.run(request)).await
+}
+
 fn check_agent_token(state: &AgentControlState, headers: &HeaderMap) -> Result<(), AgentApiError> {
     let Some(auth) = headers
         .get(AUTHORIZATION)
@@ -6683,57 +6982,113 @@ async fn agent_burn_folder(
     Ok(Json(stats))
 }
 
-fn start_agent_control_server(
+struct TauriShutdownHooks {
+    app: AppHandle,
+    kernel: venice_provider_kernel::Kernel,
+    generation: u64,
+}
+
+async fn rollback_agent_control_startup(
+    app: &AppHandle,
+    kernel: &venice_provider_kernel::Kernel,
+    generation: u64,
+    server_task: Option<tokio::task::JoinHandle<Result<(), &'static str>>>,
+) {
+    if let Some(task) = server_task {
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+    let _ = kernel.shutdown_resources().await;
+    let _ = provider::unregister_lifecycle(app, generation).await;
+    let _ = remove_agent_control_discovery(app, generation);
+    let handle = app.state::<AgentControlHandle>();
+    match handle.control.ownership.snapshot().0 {
+        venice_provider_kernel::AgentControlPhase::Starting => {
+            handle.control.ownership.fail_start(generation);
+        }
+        venice_provider_kernel::AgentControlPhase::Running => {
+            let _ = handle.control.ownership.begin_stop();
+            handle.control.ownership.finish_stop(generation);
+        }
+        venice_provider_kernel::AgentControlPhase::Stopping => {
+            handle.control.ownership.finish_stop(generation);
+        }
+        venice_provider_kernel::AgentControlPhase::Stopped => {}
+    }
+    let _ = persist_agent_control_disabled_for_generation(app, generation).await;
+}
+
+#[async_trait::async_trait]
+impl venice_provider_kernel::ShutdownHooks for TauriShutdownHooks {
+    async fn release_resources(&self) -> Result<(), &'static str> {
+        self.kernel.shutdown_resources().await
+    }
+    async fn unregister_lifecycle(&self) -> Result<&'static str, &'static str> {
+        let outcome = provider::unregister_lifecycle(&self.app, self.generation).await;
+        outcome.failure_code.map_or(Ok(outcome.outcome), Err)
+    }
+    async fn request_exit(&self) {
+        self.app.exit(0);
+    }
+}
+
+async fn start_agent_control_server(
     app: AppHandle,
     token: String,
     previous_token: Option<String>,
     port: u16,
     bind_all: bool,
-    handle: &AgentControlHandle,
 ) -> Result<(), String> {
     if token.is_empty() {
         return Err("No token configured".to_string());
     }
     let port = validate_agent_control_port(port)?;
-
-    // If already running, do nothing
-    {
-        let guard = handle.shutdown_tx.lock().unwrap();
-        if guard.is_some() {
-            return Ok(());
-        }
-    }
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (stopped_tx, stopped_rx) = oneshot::channel::<Result<(), String>>();
+    let generation = app
+        .state::<AgentControlHandle>()
+        .control
+        .reserve_start(
+            port,
+            AgentControlOwner {
+                shutdown: shutdown_tx,
+                completion: stopped_rx,
+            },
+        )
+        .map_err(str::to_string)?;
+    provider::set_lifecycle_generation(generation);
 
     let bind_host = agent_control_bind_host(bind_all);
     let addr: SocketAddr = format!("{bind_host}:{port}")
         .parse()
         .map_err(|error| format!("Invalid agent control bind address: {error}"))?;
-    let std_listener = StdTcpListener::bind(addr).map_err(|error| {
-        if error.kind() == ErrorKind::AddrInUse {
-            format!(
+    let std_listener = match StdTcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            app.state::<AgentControlHandle>()
+                .control
+                .ownership
+                .fail_start(generation);
+            return Err(if error.kind() == ErrorKind::AddrInUse {
+                format!(
                 "AI Agent Remote Control is already running on {addr}. Close the other Venice Media Local window or disable AI Agent Control there, then try again."
-            )
-        } else {
-            format!("Failed to bind agent control server on {addr}: {error}")
+                )
+            } else {
+                format!("Failed to bind agent control server on {addr}: {error}")
+            });
         }
-    })?;
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Failed to configure agent control listener: {error}"))?;
-
-    // Write discovery only after bind succeeds, so agents never pick up a dead token.
-    if let Err(e) = write_agent_control_discovery(&app, &token, port, bind_all) {
-        eprintln!("[agent-control] Could not write discovery file: {}", e);
+    };
+    if let Err(error) = std_listener.set_nonblocking(true) {
+        app.state::<AgentControlHandle>()
+            .control
+            .ownership
+            .fail_start(generation);
+        return Err(format!(
+            "Failed to configure agent control listener: {error}"
+        ));
     }
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    // Store the sender so we can shut down later when the toggle is turned off
-    {
-        let mut guard = handle.shutdown_tx.lock().unwrap();
-        *guard = Some(shutdown_tx);
-    }
-
+    let discovery_token = token.clone();
     let state = AgentControlState {
         app: app.clone(),
         token,
@@ -6742,8 +7097,10 @@ fn start_agent_control_server(
     };
 
     let server_app = app.clone();
+    let (startup_tx, startup_rx) = oneshot::channel::<Result<(), String>>();
     tauri::async_runtime::spawn(async move {
         let app = server_app;
+        let handle = app.state::<AgentControlHandle>();
         // Agent Control is not a browser API. A trusted browser origin can be
         // added explicitly later without restoring wildcard CORS.
         let cors = CorsLayer::new();
@@ -6755,17 +7112,22 @@ fn start_agent_control_server(
         let manifest_digest = match provider::shared_manifest_digest(&app) {
             Ok(value) => value,
             Err(error) => {
+                let _ = startup_tx.send(Err(format!("Provider manifest digest failed: {error}")));
                 eprintln!("[agent-control] Provider manifest digest failed: {error}");
+                handle.control.ownership.fail_start(generation);
                 return;
             }
         };
+        let (shutdown_action_tx, mut shutdown_action_rx) = mpsc::unbounded_channel();
         let kernel =
             match venice_provider_kernel::Kernel::open(venice_provider_kernel::KernelConfig {
                 storage: std::sync::Arc::new(venice_provider_kernel::FileStorage::new(
                     match app_data_dir(&app) {
                         Ok(path) => path.join("provider-v2"),
                         Err(error) => {
+                            let _ = startup_tx.send(Err(format!("Provider root failed: {error}")));
                             eprintln!("[agent-control] Provider root failed: {error}");
+                            handle.control.ownership.fail_start(generation);
                             return;
                         }
                     },
@@ -6780,12 +7142,33 @@ fn start_agent_control_server(
                 callback_retry_base_ms: 2000,
                 terminal_replay_window_ms: 5 * 60 * 1000,
                 maintenance_interval_ms: 60 * 1000,
+                provider_id: "venice-media-local".into(),
+                instance_id: match installation_instance_id(&app) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = startup_tx
+                            .send(Err(format!("Provider instance identity failed: {error}")));
+                        eprintln!("[agent-control] Provider instance identity failed: {error}");
+                        handle.control.ownership.fail_start(generation);
+                        return;
+                    }
+                },
+                shutdown_tx: Some(shutdown_action_tx),
+                token_scopes: std::collections::BTreeSet::from([
+                    venice_provider_kernel::SHUTDOWN_SCOPE.to_string(),
+                ]),
+                admission: handle.admission.clone(),
+                ownership_generation: generation,
+                terminal_shutdown: handle.control.terminal.clone(),
+                shutdown_transaction: handle.transaction.clone(),
             })
             .await
             {
                 Ok(kernel) => kernel,
                 Err(error) => {
+                    let _ = startup_tx.send(Err(format!("Provider kernel failed: {error}")));
                     eprintln!("[agent-control] Provider kernel failed: {error}");
+                    handle.control.ownership.fail_start(generation);
                     return;
                 }
             };
@@ -6817,9 +7200,13 @@ fn start_agent_control_server(
                 get(agent_get_burn_folder_stats),
             )
             .route("/api/v1/burn-folder", post(agent_burn_folder))
-            .with_state(state);
+            .with_state(state)
+            .layer(middleware::from_fn_with_state(
+                kernel.admission(),
+                reject_mutation_while_shutting_down,
+            ));
         let router = compatibility_router
-            .merge(kernel.router())
+            .merge(kernel.clone().router())
             .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100 MB — supports 4K image payloads
             .layer(cors);
 
@@ -6828,37 +7215,191 @@ fn start_agent_control_server(
             addr
         );
 
-        let listener = match TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[agent-control] Failed to create async listener: {}", e);
+        let listener_result = TcpListener::from_std(std_listener)
+            .map_err(|error| format!("Async listener failed: {error}"));
+        let listener = match listener_result {
+            Ok(listener) => listener,
+            Err(error) => {
+                let reported = error.clone();
+                let app_for_rollback = app.clone();
+                let kernel_for_rollback = maintenance_kernel.clone();
+                let _ = venice_provider_kernel::run_post_kernel_startup(
+                    || async { Err("LISTENER_CONVERSION_FAILED") },
+                    || async move {
+                        rollback_agent_control_startup(
+                            &app_for_rollback,
+                            &kernel_for_rollback,
+                            generation,
+                            None,
+                        )
+                        .await;
+                    },
+                )
+                .await;
+                let _ = startup_tx.send(Err(reported));
                 return;
             }
         };
 
-        // Graceful shutdown when the user turns the toggle off
-        let server = axum::serve(listener, router).with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-            println!("[agent-control] Shutdown signal received, stopping HTTP server");
-        });
-
-        if let Err(e) = server.await {
-            eprintln!("[agent-control] Server error: {}", e);
+        if handle.control.ownership.snapshot().0
+            != venice_provider_kernel::AgentControlPhase::Starting
+            || handle.control.ownership.snapshot().1 != generation
+        {
+            let _ = startup_tx.send(Err("Agent Control startup ownership became stale".into()));
+            rollback_agent_control_startup(&app, &maintenance_kernel, generation, None).await;
+            return;
         }
-        maintenance_kernel.shutdown().await;
+        if let Err(code) = provider::start_lifecycle(app.clone(), generation).await {
+            let _ = startup_tx.send(Err(format!("Lifecycle worker start failed: {code}")));
+            eprintln!("[agent-control] Lifecycle worker start failed: {code}");
+            rollback_agent_control_startup(&app, &maintenance_kernel, generation, None).await;
+            return;
+        }
+        // Graceful shutdown when the user turns the toggle off
+        let (drain_tx, drain_rx) = oneshot::channel::<()>();
+        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+            let _ = drain_rx.await;
+        });
+        let signal = async move {
+            tokio::select! {
+                _ = shutdown_rx => {
+                    println!("[agent-control] Settings shutdown signal received, stopping HTTP server");
+                }
+                receipt = shutdown_action_rx.recv() => {
+                    if let Some(receipt) = receipt {
+                        let _ = receipt;
+                        println!("[agent-control] Authenticated application shutdown accepted");
+                    }
+                }
+            }
+            let _ = drain_tx.send(());
+        };
+
+        let server_task =
+            tokio::spawn(async move { server.await.map_err(|_| "SERVER_DRAIN_FAILED") });
+        if let Err(error) = handle.control.ownership.publish_running(generation) {
+            let _ = startup_tx.send(Err(error.to_string()));
+            rollback_agent_control_startup(
+                &app,
+                &maintenance_kernel,
+                generation,
+                Some(server_task),
+            )
+            .await;
+            return;
+        }
+        if let Err(error) = handle
+            .control
+            .terminal
+            .ensure_open()
+            .map_err(str::to_string)
+            .and_then(|_| {
+                write_agent_control_discovery(&app, &discovery_token, port, bind_all, generation)
+            })
+        {
+            let _ = startup_tx.send(Err(format!("Discovery publication failed: {error}")));
+            rollback_agent_control_startup(
+                &app,
+                &maintenance_kernel,
+                generation,
+                Some(server_task),
+            )
+            .await;
+            return;
+        }
+        if startup_tx.send(Ok(())).is_err() {
+            rollback_agent_control_startup(
+                &app,
+                &maintenance_kernel,
+                generation,
+                Some(server_task),
+            )
+            .await;
+            return;
+        }
+        let server_result = venice_provider_kernel::run_until_shutdown_then_drain(
+            signal,
+            server_task,
+            Duration::from_secs(20),
+        )
+        .await;
+        let owned_generation = handle.control.ownership.snapshot().1 == generation;
+        let completion = if maintenance_kernel.accepted_shutdown().is_some() {
+            let hooks = TauriShutdownHooks {
+                app: app.clone(),
+                kernel: maintenance_kernel.clone(),
+                generation: maintenance_kernel
+                    .accepted_shutdown()
+                    .map(|receipt| receipt.ownership_generation)
+                    .unwrap_or(generation),
+            };
+            match maintenance_kernel
+                .orchestrate_shutdown(server_result, &hooks)
+                .await
+            {
+                venice_provider_kernel::TeardownOutcome::Exited => Ok(()),
+                outcome => Err(format!("Authenticated shutdown did not exit: {outcome:?}")),
+            }
+        } else {
+            match maintenance_kernel.shutdown_resources().await {
+                Ok(()) => {
+                    if owned_generation {
+                        let outcome = provider::unregister_lifecycle(&app, generation).await;
+                        if let Some(code) = outcome.failure_code {
+                            Err(format!("Lifecycle unregister failed: {code}"))
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(code) => Err(format!("Agent Control resource stop failed: {code}")),
+            }
+        };
+        let _ = remove_agent_control_discovery(&app, generation);
+        handle.control.ownership.finish_stop(generation);
+        let _ = stopped_tx.send(completion);
     });
-
-    provider::start_lifecycle(app);
-
-    Ok(())
+    match tokio::time::timeout(Duration::from_secs(20), startup_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Agent Control startup owner exited before acknowledgment".into()),
+        Err(_) => {
+            let handle = app.state::<AgentControlHandle>();
+            let _ = stop_agent_control_server(&handle).await;
+            Err("Agent Control startup acknowledgment timed out".into())
+        }
+    }
 }
 
-fn stop_agent_control_server(handle: &AgentControlHandle) {
-    let mut guard = handle.shutdown_tx.lock().unwrap();
-    if let Some(tx) = guard.take() {
-        let _ = tx.send(());
+async fn stop_agent_control_server(handle: &AgentControlHandle) -> Result<(), String> {
+    let ownership = capture_agent_control_stop(handle)?;
+    await_agent_control_stop(ownership).await
+}
+
+fn capture_agent_control_stop(
+    handle: &AgentControlHandle,
+) -> Result<Option<(u64, AgentControlOwner)>, String> {
+    handle
+        .control
+        .ownership
+        .begin_stop()
+        .map_err(str::to_string)
+}
+
+async fn await_agent_control_stop(
+    ownership: Option<(u64, AgentControlOwner)>,
+) -> Result<(), String> {
+    if let Some((_generation, owner)) = ownership {
+        let _ = owner.shutdown.send(());
         println!("[agent-control] Shutdown requested for agent control server");
+        return match tokio::time::timeout(Duration::from_secs(24), owner.completion).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("Agent Control stop owner exited without completion".into()),
+            Err(_) => Err("Agent Control stop completion timed out".into()),
+        };
     }
+    Ok(())
 }
 
 fn main() {
@@ -6903,9 +7444,13 @@ fn main() {
                 let resize_app = app_handle.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::Resized(size) = event {
-                        if let Err(err) = persist_window_size(&resize_app, *size) {
-                            eprintln!("Failed to save window size: {err}");
-                        }
+                        let resize_app = resize_app.clone();
+                        let size = *size;
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(err) = persist_window_size(&resize_app, size).await {
+                                eprintln!("Failed to save window size: {err}");
+                            }
+                        });
                     }
                 });
             }
@@ -6954,7 +7499,13 @@ fn main() {
         .expect("error while building Venice Media Local");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            tauri::async_runtime::block_on(provider::unregister_lifecycle(app_handle));
+            let generation = app_handle
+                .state::<AgentControlHandle>()
+                .control
+                .ownership
+                .snapshot()
+                .1;
+            tauri::async_runtime::block_on(provider::unregister_lifecycle(app_handle, generation));
         }
     });
 }

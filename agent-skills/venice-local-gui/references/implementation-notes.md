@@ -33,8 +33,11 @@ The router now includes a wide surface (as of the May 2026 update):
 .route("/api/v1/refresh-models", post(agent_refresh_models))
 .route("/api/v1/burn-folder", post(agent_burn_folder))
 .route("/api/v1/move-to-burn", post(agent_move_to_burn))
+.route("/api/v1/actions/shutdown", post(shutdown_application)) // strict authenticated whole-app release action
 ... (additional management endpoints)
 ```
+
+The shutdown route belongs to the revision-2 provider kernel. The authenticated principal receives server-held permissions at Agent Control startup; the handler requires `application:shutdown` independently of the envelope scope. A shared admission controller atomically covers revision-2 submit, compatibility in-flight permits, and shutdown closure. Server ownership recovers the accepted receipt from that controller after Axum drains, then an exactly-once orchestrator stops all tracked kernel background ownership. One lifecycle coordinator serializes Settings disable, lifecycle restart, and accepted teardown: prior workers are stopped/joined before replacement, and concurrent unregister callers share the same actual outcome. The orchestrator persists `exit_requested` and makes one Tauri `AppHandle::exit(0)` call. Failed stages withhold exit; primary-ledger persistence failure falls back to a non-secret atomic emergency record under `provider-v2/emergency-audit/`. It has no shell/process-kill fallback and is not used by the ordinary Settings disable toggle.
 
 Many handlers now call `emit_agent_navigate()` and `emit_agent_results()` so the GUI can auto-switch tabs and display live result cards.
 

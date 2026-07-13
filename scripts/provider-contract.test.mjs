@@ -61,9 +61,81 @@ test('async operation, upload, artifact, event, and cancel routes are all wired'
       assert.match(provider, new RegExp(`\\.route\\(\\s*"${path.replaceAll('/', '\\/')}"[\\s\\S]*?${method}\\(`), path)
     }
   }
-  assert.match(main, /\.merge\(kernel\.router\(\)\)/)
+  assert.match(main, /\.merge\(kernel(?:\.clone\(\))?\.router\(\)\)/)
   assert.doesNotMatch(main, /\.merge\(provider::routes\(\)\)/)
   assert.doesNotMatch(main, /provider::recover\(/)
+})
+
+test('authenticated whole-application shutdown is narrow, response-first, and has no forced fallback', () => {
+  assert.match(kernel, /pub const SHUTDOWN_PATH: &str = "\/api\/v1\/actions\/shutdown"/)
+  assert.match(kernel, /pub const SHUTDOWN_SCOPE: &str = "application:shutdown"/)
+  assert.match(kernel, /veniceMediaApplicationShutdown\.v1/)
+  assert.match(kernel, /gate\.accepting = false/)
+  assert.match(kernel, /SHUTDOWN_RECONCILIATION_REQUIRED/)
+  assert.match(kernel, /SHUTDOWN_PERMISSION_DENIED/)
+  assert.match(kernel, /token_scopes\.contains\(SHUTDOWN_SCOPE\)/)
+  assert.match(kernel, /claim_compatibility/)
+  assert.match(kernel, /active_work_count/)
+  assert.match(kernel, /compatibility_in_flight/)
+  assert.match(kernel, /REQUEST_ID_CONFLICT/)
+  assert.match(kernel, /orchestrate_shutdown/)
+  assert.match(kernel, /shutdown_resources/)
+  assert.match(kernel, /LifecycleSupervisor/)
+  assert.match(kernel, /TerminalShutdownLatch/)
+  assert.match(kernel, /Global order: Settings\/lifecycle transaction barrier, then provider ledger/)
+  assert.match(kernel, /shutdown_transaction\.lock\(\)\.await/)
+  assert.match(kernel, /run_until_shutdown_then_drain/)
+  assert.match(kernel, /run_post_kernel_startup/)
+  assert.match(kernel, /transactional_disable_then_delete/)
+  assert.match(kernel, /AgentControlOwnership/)
+  assert.match(kernel, /GenerationOwnedJsonFile/)
+  assert.match(kernel, /emergency-audit/)
+  assert.match(kernel, /veniceMediaShutdownEmergencyAudit\.v1/)
+  assert.match(kernel, /CommittedWithDurabilityWarning/)
+  assert.match(kernel, /CommitStateUnknown/)
+  assert.match(kernel, /LIFECYCLE_START_STALE/)
+  assert.match(main, /save_settings_file\(&app, &settings\)[\s\S]*?start_agent_control_server/)
+  assert.match(main, /settings\.enable_agent_control = false;[\s\S]*?save_settings_file\(&app, &settings\)/)
+  assert.match(main, /else if !enable && was_enabled \{[\s\S]*?save_settings_file\(&app, &settings\)[\s\S]*?stop_agent_control_server[\s\S]*?unregister_lifecycle/)
+  assert.match(main, /reserve_start[\s\S]*?StdTcpListener::bind/)
+  assert.match(main, /tokio::spawn\(async move \{ server\.await[\s\S]*?publish_running/)
+  assert.match(main, /GenerationOwnedJsonFile/)
+  assert.match(main, /terminal[\s\S]*?ensure_open[\s\S]*?write_agent_control_discovery/)
+  assert.match(main, /Storage::write_atomic\(&storage, "settings\.json"/)
+  assert.match(provider, /pub async fn clear_lifecycle[\s\S]*?lifecycle_supervisor\(\)[\s\S]*?\.stop/)
+  assert.match(provider, /configure_lifecycle_transactional/)
+  assert.match(provider, /restore_lifecycle_worker/)
+  assert.match(main, /transaction: venice_provider_kernel::SettingsTransaction/)
+  assert.match(main, /persist_window_size[\s\S]*?transaction\.lock\(\)\.await/)
+  assert.match(main, /rollback_agent_control_startup/)
+  assert.match(main, /claim_direct_work/)
+  assert.match(main, /activeCompatibilityDirectCount/)
+  for (const controlPlaneCommand of [
+    'save_settings',
+    'rotate_agent_control_token',
+    'configure_provider_lifecycle',
+    'clear_provider_lifecycle',
+  ]) {
+    const body = main.match(new RegExp(`async fn ${controlPlaneCommand}\\([\\s\\S]*?\\n\\}`))?.[0] || ''
+    assert.doesNotMatch(body, /claim_direct_work/, `${controlPlaneCommand} must not block an overlapping authenticated shutdown`)
+  }
+  const stopControl = main.match(/async fn stop_agent_control_server[\s\S]*?\n\}/)?.[0] || ''
+  assert.doesNotMatch(stopControl, /set_lifecycle_generation/)
+  assert.match(kernel, /SERVER_DRAIN_TIMEOUT/)
+  assert.match(kernel, /Duration::from_secs\(20\)/)
+  assert.match(kernel, /StatusCode::UNPROCESSABLE_ENTITY,\s*"ARTIFACT_INTEGRITY_MISMATCH"/)
+  assert.match(main, /server\.await/)
+  assert.match(kernel, /record_shutdown_stage\(&digest, "response_drained"/)
+  assert.match(kernel, /record_shutdown_stage\(&digest, "exit_requested"/)
+  assert.match(main, /app\.exit\(0\)/)
+  const shutdownPath = kernel.match(/async fn shutdown_application[\s\S]*?\n\}/)?.[0] || ''
+  assert.doesNotMatch(shutdownPath, /std::process|Command::new|taskkill|Stop-Process|kill\(/i)
+  const orchestration = kernel.match(/pub async fn orchestrate_shutdown[\s\S]*?TeardownOutcome::Exited/)?.[0] || ''
+  assert.ok(orchestration.indexOf('response_drained') < orchestration.indexOf('release_resources'))
+  assert.ok(orchestration.indexOf('release_resources') < orchestration.indexOf('unregister_lifecycle'))
+  assert.ok(orchestration.indexOf('unregister_lifecycle') < orchestration.indexOf('exit_requested'))
+  assert.ok(orchestration.indexOf('exit_requested') < orchestration.indexOf('request_exit'))
+  assert.match(main, /self\.app\.exit\(0\)/)
 })
 
 test('the executable provider uses the canonical Core wire ordering and field names', () => {
@@ -124,7 +196,7 @@ test('provider ledger records admission before execution and never blindly resub
   assert.match(kernel, /Started submission cannot be invoked again/)
   assert.match(kernel, /SUBMISSION_OUTCOME_UNKNOWN/)
   assert.match(main, /TauriMediaExecutor/)
-  assert.match(main, /\.merge\(kernel\.router\(\)\)/)
+  assert.match(main, /\.merge\(kernel(?:\.clone\(\))?\.router\(\)\)/)
   assert.doesNotMatch(main, /\.merge\(provider::routes\(\)\)/)
 })
 

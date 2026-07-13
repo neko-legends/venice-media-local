@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, env, fs, path::PathBuf, sync::Arc, time::Duration};
 use venice_provider_kernel::{
     canonical_digest, EncryptedSecret, ExecutionArtifact, ExecutionInput, ExecutionResult,
     Executor, FileStorage, Kernel, KernelConfig, SecretProtector, SubmissionReceipt,
@@ -168,6 +168,14 @@ async fn main() {
         callback_retry_base_ms: 100,
         terminal_replay_window_ms: 500,
         maintenance_interval_ms: 100,
+        provider_id: "venice-media-local".into(),
+        instance_id: "vml-headless-test".into(),
+        shutdown_tx: None,
+        token_scopes: BTreeSet::new(),
+        admission: Default::default(),
+        ownership_generation: 0,
+        terminal_shutdown: Default::default(),
+        shutdown_transaction: Default::default(),
     })
     .await
     .unwrap();

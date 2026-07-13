@@ -85,6 +85,7 @@ Auth header (required for now):
 - `POST /api/v1/burn-folder`           { seed?: string }
 - `GET  /api/v1/burn-folder-stats`
 - `POST /api/v1/move-to-burn`          { paths: string[] }
+- `POST /api/v1/actions/shutdown`       dedicated release action; requires the server-assigned `application:shutdown` permission independently of the body scope, exact instance/manifest binding, <=60 second validity, no successful replay or forced fallback
 
 ### Types (authoritative, kept current)
 

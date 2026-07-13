@@ -182,6 +182,7 @@ POST   /api/v1/artifact-uploads/:uploadId/complete
 DELETE /api/v1/artifact-uploads/:uploadId
 GET    /api/v1/artifacts/:providerArtifactId
 GET    /api/v1/artifacts/:providerArtifactId/content
+POST   /api/v1/actions/shutdown
 ```
 
 Revision 2 is descriptor-first: it stores durable operation/event evidence, streams sealed inputs and artifact downloads, bounds upstream output buffering, and does not persist inline media. Callback credentials are encrypted with a key protected by the OS credential store. If protected storage is unavailable or an existing ledger key is missing, operation admission fails closed and never replaces the key.
@@ -189,6 +190,28 @@ Revision 2 is descriptor-first: it stores durable operation/event evidence, stre
 Every transfer requires `X-Transfer-Grant-ID` plus `X-Transfer-Grant`. Grants are durable, consumable, and exact-bound to the operation, attempt, assignment revision, capability, HTTP method/path/scope, artifact or upload identity, SHA-256, byte size, MIME type, validity interval, and maximum uses. Core first admits the operation with exact expected input artifacts, then registers grants through the operation-bound route, creates/writes/seals those uploads, and finally calls `execute`. Text-to-video declares no input artifact; image-to-video declares and seals its first-frame artifact before execution.
 
 Provider lifecycle credentials are separate from the invocation token and Venice API key. The protected local `configure_provider_lifecycle` command stores the scoped credential only in the OS credential store; lifecycle credentials are never imported from environment variables. Non-secret Core origin/credential metadata is written atomically. When configured, the provider self-registers, persists each exact heartbeat body/sequence/digest before delivery, replays ambiguous heartbeats unchanged, and unregisters on Agent Control shutdown or application exit. Discovery-file/manual handoff remains available while lifecycle configuration is absent or degraded.
+
+The whole-application shutdown route is a dedicated release-control action, not a general command facility. `POST /api/v1/actions/shutdown` uses the same constant-time Agent Control bearer authentication. Authentication resolves a server-held principal whose permissions are assigned when Agent Control starts; production assigns the current Agent Control credential the dedicated `application:shutdown` permission. The handler checks that server-held permission independently of the body and returns `403 SHUTDOWN_PERMISSION_DENIED` for an authenticated credential without it. The body must still declare the same fixed scope as an integrity/intent binding and uses this strict camelCase shape (unknown fields are rejected):
+
+```json
+{
+  "schemaVersion": "1.0",
+  "type": "veniceMediaApplicationShutdown.v1",
+  "requestId": "release-request-1",
+  "idempotencyKey": "release-transition-1",
+  "scope": "application:shutdown",
+  "providerId": "venice-media-local",
+  "instanceId": "vml-...",
+  "manifestDigest": "<64 lowercase hex>",
+  "requestedAt": "2026-07-12T22:00:00Z",
+  "expiresAt": "2026-07-12T22:00:30Z",
+  "reason": "phase5h-release-slot-transition"
+}
+```
+
+The instance ID and manifest digest must exactly match the running provider. The request interval is rechecked inside the shared atomic admission boundary, must be valid then, no longer than 60 seconds, and not materially future-dated. Shutdown is rejected while any revision-2 operation is nonterminal, any HTTP compatibility mutation or direct Tauri media/provider command holds an in-flight permit, or any `lost`/`submitted_ambiguous` evidence still requires reconciliation. Health `activeOperationCount` includes provider operations plus compatibility/direct permits and also exposes those component counts. Reused request IDs, reused idempotency keys, exact repeats, stale requests, and digest conflicts are rejected and audited rather than replayed successfully.
+
+Acceptance returns `202 Accepted` with `schemaVersion`, `accepted=true`, `action="shutdown"`, the fixed scope and provider binding, request and idempotency IDs, canonical request digest, admission-boundary `acceptedAt`, `state="shutting_down"`, and `replayed=false`. Atomic ledger writes distinguish definite pre-commit failure, committed success, committed-with-durability-warning, and uncertain commit state. Admission reopens only after a definite not-committed result; any committed or uncertain acceptance keeps admission closed and records emergency evidence where possible. New mutating provider work is then unavailable. One async Settings transaction lock serializes the complete read/persist/start/stop/restart/rollback flow. Agent Control enable persists intended settings before startup, waits for listener/kernel/lifecycle/server-task ownership acknowledgment, and rolls persisted enable back to false if ownership cannot be established. Disable persists false first, then the matching generation remains owner through bounded server drain and lifecycle unregister; the next generation is created only by the next start reservation. Unregister failure is returned without undoing persisted false. Healthy Axum service runs indefinitely: the 20-second bound starts only after Settings or authenticated shutdown signals graceful drain. Accepted shutdown retains its immutable ownership generation, so overlapping Settings disable and authenticated teardown share the same actual unregister result and stale generations cannot touch replacements. Only successful `server.await` is recorded as `response_drained=succeeded`; this proves server-side response completion, not remote semantic consumption. Drain timeout records `response_drained=failed`, aborts and joins only the owned server task, keeps admission closed, and withholds resource teardown, lifecycle unregister, and exit. Lifecycle clear stops the matching worker first, durably persists disabled state while retaining the credential, then deletes the credential; deletion failure restores prior state. The exactly-once orchestrator records resource/lifecycle/exit stages and invokes only Tauri `AppHandle::exit(0)`. Emergency audit remains the independent fail-closed sink. There is no process-kill or forced fallback.
 
 Queued work can be canceled only during `pre_submission` while `submission_not_started`; cancellation after Venice submission truthfully reports `unsupported`.
 
