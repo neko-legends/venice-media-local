@@ -1,6 +1,15 @@
 use async_trait::async_trait;
+use axum::{
+    extract::State,
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, env, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet, env, fs, io::Read, path::PathBuf, sync::Arc, thread, time::Duration,
+};
+use tokio::sync::{oneshot, Mutex};
 use venice_provider_kernel::{
     canonical_digest, EncryptedSecret, ExecutionArtifact, ExecutionInput, ExecutionResult,
     Executor, FileStorage, Kernel, KernelConfig, SecretProtector, SubmissionReceipt,
@@ -11,6 +20,66 @@ const PNG: &[u8] = &[
     0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5, 1, 1,
     39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+
+#[derive(Clone)]
+struct HarnessControl {
+    token: String,
+    manifest_digest: String,
+    shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+fn harness_authorized(control: &HarnessControl, headers: &HeaderMap) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {}", control.token))
+}
+
+async fn harness_ready(
+    State(control): State<HarnessControl>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    if !harness_authorized(&control, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code":"HARNESS_UNAUTHORIZED"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ready": true,
+            "providerId": "venice-media-local",
+            "instanceId": "vml-headless-test",
+            "manifestDigest": control.manifest_digest,
+            "activeOperationCount": 0,
+            "unsettledOperationCount": 0
+        })),
+    )
+}
+
+async fn harness_shutdown(
+    State(control): State<HarnessControl>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    if !harness_authorized(&control, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"code":"HARNESS_UNAUTHORIZED"})),
+        );
+    }
+    let Some(shutdown) = control.shutdown.lock().await.take() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"code":"HARNESS_SHUTDOWN_ALREADY_REQUESTED"})),
+        );
+    };
+    let _ = shutdown.send(());
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"accepted":true,"state":"shutting_down"})),
+    )
+}
 
 struct FakeUpstream {
     root: PathBuf,
@@ -158,10 +227,11 @@ async fn main() {
     }
     let root = PathBuf::from(&args[0]);
     let token = "headless-provider-test-token-00000000".to_string();
+    let manifest_digest = args[2].clone();
     let kernel = Kernel::open(KernelConfig {
         storage: Arc::new(FileStorage::new(root.clone())),
         token: token.clone(),
-        manifest_digest: args[2].clone(),
+        manifest_digest: manifest_digest.clone(),
         trusted_callback_origin: args[1].clone(),
         executor: Arc::new(FakeUpstream { root }),
         secret_protector: Arc::new(DeterministicProtector),
@@ -184,9 +254,40 @@ async fn main() {
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown = Arc::new(Mutex::new(Some(shutdown_tx)));
+    let parent_shutdown = shutdown.clone();
+    let _parent_watchdog = thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(0) | Err(_) => {
+                    if let Some(sender) = parent_shutdown.blocking_lock().take() {
+                        let _ = sender.send(());
+                    }
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+    let harness = Router::new()
+        .route("/__harness/ready", get(harness_ready))
+        .route("/__harness/shutdown", post(harness_shutdown))
+        .with_state(HarnessControl {
+            token: token.clone(),
+            manifest_digest,
+            shutdown,
+        });
     println!(
         "{}",
         json!({"baseUrl":format!("http://{address}"),"token":token})
     );
-    axum::serve(listener, kernel.router()).await.unwrap();
+    axum::serve(listener, kernel.router().merge(harness))
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
 }
