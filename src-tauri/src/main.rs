@@ -695,7 +695,10 @@ async fn run_phase5h_legacy_token_migration(
     io::stdin()
         .read_line(&mut authorization)
         .map_err(|error| error.to_string())?;
-    let authorization = authorization.trim();
+    let authorization = authorization
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .trim_start();
     if authorization.is_empty() {
         return Err("Runtime verification input is required".to_string());
     }
@@ -7828,6 +7831,15 @@ mod tests {
         let mut expired = valid;
         expired["trust"]["expiresAt"] = json!("2000-01-01T00:00:00Z");
         assert!(validate_phase5h_migration_session(&expired).is_err());
+    }
+
+    #[test]
+    fn migration_authorization_accepts_only_transport_bom_and_whitespace_prefix() {
+        let authorization = "\u{feff}  synthetic-bearer\r\n"
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .trim_start();
+        assert_eq!(authorization, "synthetic-bearer");
     }
 
     #[test]

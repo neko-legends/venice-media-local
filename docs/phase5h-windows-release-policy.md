@@ -34,6 +34,8 @@ For a Windows browser with the MetaMask extension, the operator opens Core's `co
 
 Before launching the candidate, the operator uses the in-memory bearer once against Core's authenticated session endpoint and requires Jun, human authentication, current `verified_action` trust, the exact migration action, and a future expiry. A rejection reports only the HTTP status. The candidate independently repeats that proof before reading or changing settings; its rejection diagnostics likewise contain only the HTTP status and no response body or credential material.
 
+Redirected standard input is explicitly UTF-8 without a byte-order mark. The candidate defensively removes only a leading UTF-8 BOM plus transport whitespace before constructing the authorization header; this prevents Windows PowerShell's stream encoding marker from turning an otherwise valid bearer into a false 401 without creating any credential fallback.
+
 The candidate applies this replacement-first sequence:
 
 1. If a non-empty Windows credential-store entry already exists, prove it can be read and treat the JSON entry as obsolete without overwriting the replacement.

@@ -147,6 +147,7 @@ test('legacy credential migration is replacement-first and keeps authorization o
   assert.match(operator, /api\/auth\/session[^\n]*-Headers @\{ Authorization = "Bearer \$authorization" \}/)
   assert.match(operator, /Core rejected the in-memory migration authorization during session preflight \(HTTP \$statusCode\)/)
   assert.doesNotMatch(operator, /Write-(?:Host|Output)[^\n]*\$authorization/i)
+  assert.match(operator, /StandardInputEncoding = New-Object Text\.UTF8Encoding\(\$false\)/)
 })
 
 test('hash mismatch, nonempty restore, and linked source paths fail closed', () => {
