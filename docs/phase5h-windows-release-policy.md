@@ -24,6 +24,27 @@ node scripts/phase5h-readiness.mjs validate-policy <policy.json>
 
 ## Deployment gates
 
+### Legacy Agent Control credential migration
+
+An older installation can contain a non-empty `agentControlToken` property in `settings.json`. It remains a live compatibility source until a replacement in the Windows credential store has been proven, so ordinary startup and settings writes must not delete it merely because the current build prefers secure storage.
+
+Use `scripts/Invoke-Phase5HLegacyControlTokenMigration.ps1` with the exact staged candidate. The foreground operator requests the exact `venice-media-local:migrate-legacy-agent-control-token` verified action immediately before the change and supplies the short-lived Core session to the candidate through redirected standard input. The session must identify `user-jun`, human authentication, current `verified_action` trust, the exact action key, and a future expiry. It is never accepted from an argument, environment variable, file, log, evidence object, or hash.
+
+The candidate applies this replacement-first sequence:
+
+1. If a non-empty Windows credential-store entry already exists, prove it can be read and treat the JSON entry as obsolete without overwriting the replacement.
+2. Otherwise copy the legacy value internally to the existing `venice-media-local` / `agent-control-token` credential-store entry and read it back for exact in-memory equality.
+3. Only after either proof succeeds, atomically remove `agentControlToken` from `settings.json`, preserving unrelated JSON properties, and reread the file to prove sanitization.
+4. Any authorization, store, read-back, serialization, atomic-write, or reread failure leaves the legacy JSON source in place. A replacement written before a later failure is safe rollback state; retry proves it before removal.
+
+Retained evidence records only the action key, UTC transition times, candidate identity, settings path, non-secret result (`existing-replacement-proven`, `replacement-migrated`, or `already-sanitized`), and the sanitized-backup result. Never retain the credential, a derivative, a fingerprint, or a before-image containing it.
+
+### npm audit disposition (2026-07-13)
+
+The locked Phase 5H tree reports `@babel/core` 7.29.0 (low, GHSA-4x5r-pxfx-6jf8), `esbuild` 0.21.5 (moderate, GHSA-67mh-4wv8-2f99), and the direct development dependency Vite 5.4.21 (aggregate high: GHSA-4w7w-66w2-5vf9, GHSA-v6wh-96g9-6wx3, GHSA-fx2h-pf6j-xcff, plus the esbuild advisory). The exact paths are `@vitejs/plugin-react -> @babel/core`, direct `vite`, and `vite -> esbuild`.
+
+These packages are development/build-server tooling only: all are in `devDependencies`; Vite runs only as `beforeDevCommand` or `beforeBuildCommand`; and the Tauri package embeds the already-built `../dist` static frontend. The packaged Rust/WebView runtime has no Node, Vite dev/preview server, Babel transform, esbuild service, launch-editor endpoint, or `server.fs` route. Consequently the cited request/path traversal and dev-server behaviors are unreachable in the packaged production runtime. npm's suggested remediation is Vite 8.1.4, a semver-major build-tool change, so Phase 5H does not apply it. Reassess before exposing a development/preview server or changing the packaging model.
+
 1. Require authenticated health to identify the expected provider instance and report ready, with `activeOperationCount = 0` in two samples at least five seconds apart. Require the running `instanceId` and `manifestDigest` to match the active pointer and trusted retained release evidence before shutdown.
 2. Bind shutdown to that exact running `instanceId` and `manifestDigest`. The Agent Control credential must have server-assigned `application:shutdown`; body scope alone is not authorization.
 3. Send the strict `POST /api/v1/actions/shutdown` request with fresh request/idempotency identities, a validity interval no longer than 60 seconds, and reason `phase5h-release-slot-transition`. Require `202 Accepted`, `state = shutting_down`, and `replayed = false`. Allow at most 20 seconds for response drain and 30 seconds for external process absence. A permission/owner rejection, drain timeout, teardown failure, or process-exit timeout leaves the old pointer unchanged. Drain timeout keeps admission closed and withholds teardown/exit. Never use forced termination.

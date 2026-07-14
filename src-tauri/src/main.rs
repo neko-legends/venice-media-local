@@ -22,7 +22,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
-    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Mutex, OnceLock},
@@ -46,6 +46,9 @@ const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/neko-legends/venice-media-local/releases/latest";
 const KEYRING_SERVICE: &str = "venice-media-local";
 const KEYRING_ACCOUNT: &str = "venice-api-key";
+const AGENT_CONTROL_KEYRING_ACCOUNT: &str = "agent-control-token";
+const PHASE5H_LEGACY_TOKEN_MIGRATION_ACTION: &str =
+    "venice-media-local:migrate-legacy-agent-control-token";
 const CAPABILITY_SCHEMA_VERSION: &str = "1.0";
 const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 540;
@@ -560,7 +563,8 @@ fn generate_agent_control_token() -> String {
 }
 
 fn control_token_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYRING_SERVICE, "agent-control-token").map_err(|err| err.to_string())
+    keyring::Entry::new(KEYRING_SERVICE, AGENT_CONTROL_KEYRING_ACCOUNT)
+        .map_err(|err| err.to_string())
 }
 
 fn read_control_token(settings: &AppSettings) -> Result<Option<String>, String> {
@@ -579,6 +583,180 @@ fn store_control_token(token: &str) -> Result<(), String> {
     control_token_entry()?
         .set_password(token)
         .map_err(|err| err.to_string())
+}
+
+fn keyring_has_control_token() -> bool {
+    control_token_entry()
+        .and_then(|entry| entry.get_password().map_err(|error| error.to_string()))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+#[derive(Debug, PartialEq)]
+enum LegacyControlTokenMigration {
+    AlreadySanitized,
+    ExistingReplacementProven,
+    ReplacementMigrated,
+}
+
+trait ControlTokenStore {
+    fn read(&self) -> Result<Option<String>, String>;
+    fn write(&self, value: &str) -> Result<(), String>;
+}
+
+struct WindowsControlTokenStore;
+
+impl ControlTokenStore for WindowsControlTokenStore {
+    fn read(&self) -> Result<Option<String>, String> {
+        match control_token_entry()?.get_password() {
+            Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn write(&self, value: &str) -> Result<(), String> {
+        store_control_token(value)
+    }
+}
+
+fn migrate_legacy_control_token(
+    settings_path: &Path,
+    store: &impl ControlTokenStore,
+) -> Result<LegacyControlTokenMigration, String> {
+    let bytes = fs::read(settings_path).map_err(|error| error.to_string())?;
+    let mut settings: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| "settings.json must contain a JSON object".to_string())?;
+    let legacy = object
+        .get("agentControlToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(legacy) = legacy else {
+        return Ok(LegacyControlTokenMigration::AlreadySanitized);
+    };
+
+    let outcome = match store.read()? {
+        Some(_) => LegacyControlTokenMigration::ExistingReplacementProven,
+        None => {
+            store.write(&legacy)?;
+            match store.read()? {
+                Some(replacement) if replacement == legacy => {
+                    LegacyControlTokenMigration::ReplacementMigrated
+                }
+                _ => return Err("Secure-store replacement verification failed".to_string()),
+            }
+        }
+    };
+
+    object.remove("agentControlToken");
+    let sanitized = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
+    atomic_write_bytes(settings_path, &sanitized)?;
+    let verified: Value =
+        serde_json::from_slice(&fs::read(settings_path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    if verified.get("agentControlToken").is_some() {
+        return Err("Sanitized settings verification failed".to_string());
+    }
+    Ok(outcome)
+}
+
+fn validate_phase5h_migration_session(payload: &Value) -> Result<(), String> {
+    let trust = payload
+        .get("trust")
+        .ok_or_else(|| "Verified-action trust is missing".to_string())?;
+    let expires_at = trust
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Verified-action expiry is missing".to_string())?;
+    let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|_| "Verified-action expiry is malformed".to_string())?;
+    let valid = payload.pointer("/user/id").and_then(Value::as_str) == Some("user-jun")
+        && payload.pointer("/user/type").and_then(Value::as_str) == Some("human")
+        && trust.get("level").and_then(Value::as_str) == Some("verified_action")
+        && trust.get("needsReverification").and_then(Value::as_bool) != Some(true)
+        && trust.pointer("/action/key").and_then(Value::as_str)
+            == Some(PHASE5H_LEGACY_TOKEN_MIGRATION_ACTION)
+        && expiry.with_timezone(&Utc) > Utc::now();
+    if !valid {
+        return Err("Exact current Jun migration authorization is required".to_string());
+    }
+    Ok(())
+}
+
+async fn run_phase5h_legacy_token_migration(
+    core_url: &str,
+    settings_path: &Path,
+) -> Result<LegacyControlTokenMigration, String> {
+    let mut authorization = String::new();
+    io::stdin()
+        .read_line(&mut authorization)
+        .map_err(|error| error.to_string())?;
+    let authorization = authorization.trim();
+    if authorization.is_empty() {
+        return Err("Runtime verification input is required".to_string());
+    }
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/api/auth/session",
+            core_url.trim_end_matches('/')
+        ))
+        .bearer_auth(authorization)
+        .send()
+        .await
+        .map_err(|error| format!("Runtime authorization check failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err("Runtime authorization was rejected".to_string());
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Runtime authorization response was invalid: {error}"))?;
+    validate_phase5h_migration_session(&payload)?;
+    migrate_legacy_control_token(settings_path, &WindowsControlTokenStore)
+}
+
+fn try_run_phase5h_migration_cli() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let position = args
+        .iter()
+        .position(|arg| arg == "--phase5h-migrate-legacy-agent-control-token")?;
+    let core_url = args.get(position + 1).map(String::as_str).unwrap_or("");
+    let settings_path = args.get(position + 2).map(PathBuf::from);
+    if core_url.is_empty() || settings_path.is_none() {
+        eprintln!("Migration requires a Core URL and settings path");
+        return Some(2);
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return Some(2),
+    };
+    match runtime.block_on(run_phase5h_legacy_token_migration(
+        core_url,
+        settings_path.as_deref().expect("checked above"),
+    )) {
+        Ok(outcome) => {
+            let state = match outcome {
+                LegacyControlTokenMigration::AlreadySanitized => "already-sanitized",
+                LegacyControlTokenMigration::ExistingReplacementProven => {
+                    "existing-replacement-proven"
+                }
+                LegacyControlTokenMigration::ReplacementMigrated => "replacement-migrated",
+            };
+            println!("{{\"status\":\"ok\",\"migration\":\"{state}\"}}");
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("Legacy control credential migration failed: {error}");
+            Some(1)
+        }
+    }
 }
 
 fn tailscale_cache_ttl(value: &Option<String>) -> Duration {
@@ -1055,7 +1233,9 @@ fn save_settings_file(app: &AppHandle, settings: &AppSettings) -> Result<(), Str
 fn save_settings_file_unlocked(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let root = app_data_dir(app)?;
     let mut persisted = settings.clone();
-    persisted.agent_control_token = None;
+    if keyring_has_control_token() {
+        persisted.agent_control_token = None;
+    }
     let bytes = serde_json::to_vec_pretty(&persisted).map_err(|error| error.to_string())?;
     let storage = venice_provider_kernel::FileStorage::new(root);
     venice_provider_kernel::Storage::recover_atomic(&storage, "settings.json")?;
@@ -7403,6 +7583,9 @@ async fn await_agent_control_stop(
 }
 
 fn main() {
+    if let Some(exit_code) = try_run_phase5h_migration_cli() {
+        std::process::exit(exit_code);
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -7513,6 +7696,136 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    struct TestControlTokenStore {
+        value: RefCell<Option<String>>,
+        fail_write: bool,
+        fail_read_after_write: bool,
+        wrote: RefCell<bool>,
+    }
+
+    impl TestControlTokenStore {
+        fn empty() -> Self {
+            Self {
+                value: RefCell::new(None),
+                fail_write: false,
+                fail_read_after_write: false,
+                wrote: RefCell::new(false),
+            }
+        }
+    }
+
+    impl ControlTokenStore for TestControlTokenStore {
+        fn read(&self) -> Result<Option<String>, String> {
+            if self.fail_read_after_write && *self.wrote.borrow() {
+                return Err("injected read failure".to_string());
+            }
+            Ok(self.value.borrow().clone())
+        }
+
+        fn write(&self, value: &str) -> Result<(), String> {
+            if self.fail_write {
+                return Err("injected write failure".to_string());
+            }
+            *self.wrote.borrow_mut() = true;
+            *self.value.borrow_mut() = Some(value.to_string());
+            Ok(())
+        }
+    }
+
+    fn migration_settings(contents: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "venice-phase5h-migration-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&root).expect("create temp migration root");
+        let path = root.join("settings.json");
+        fs::write(&path, contents).expect("write migration settings");
+        (root, path)
+    }
+
+    #[test]
+    fn legacy_control_token_migrates_before_json_removal_without_disclosure() {
+        let secret = "legacy-secret-value-that-must-not-leak";
+        let (root, path) = migration_settings(&format!(
+            "{{\"theme\":\"eva-dark\",\"agentControlToken\":\"{secret}\",\"future\":7}}"
+        ));
+        let store = TestControlTokenStore::empty();
+        let outcome = migrate_legacy_control_token(&path, &store).expect("migration succeeds");
+        assert_eq!(outcome, LegacyControlTokenMigration::ReplacementMigrated);
+        assert_eq!(store.value.borrow().as_deref(), Some(secret));
+        let sanitized = fs::read_to_string(&path).expect("read sanitized settings");
+        assert!(!sanitized.contains(secret));
+        assert!(!sanitized.contains("agentControlToken"));
+        assert!(sanitized.contains("\"future\": 7"));
+        fs::remove_dir_all(root).expect("remove temp migration root");
+    }
+
+    #[test]
+    fn existing_secure_replacement_removes_obsolete_legacy_without_overwrite() {
+        let (root, path) = migration_settings(
+            "{\"agentControlToken\":\"obsolete-legacy\",\"theme\":\"eva-dark\"}",
+        );
+        let store = TestControlTokenStore {
+            value: RefCell::new(Some("existing-replacement".to_string())),
+            ..TestControlTokenStore::empty()
+        };
+        let outcome = migrate_legacy_control_token(&path, &store).expect("migration succeeds");
+        assert_eq!(
+            outcome,
+            LegacyControlTokenMigration::ExistingReplacementProven
+        );
+        assert_eq!(
+            store.value.borrow().as_deref(),
+            Some("existing-replacement")
+        );
+        assert!(!*store.wrote.borrow());
+        fs::remove_dir_all(root).expect("remove temp migration root");
+    }
+
+    #[test]
+    fn failed_secure_replacement_preserves_legacy_settings_exactly() {
+        let original = b"{\"agentControlToken\":\"still-needed\",\"theme\":\"eva-dark\"}";
+        for store in [
+            TestControlTokenStore {
+                fail_write: true,
+                ..TestControlTokenStore::empty()
+            },
+            TestControlTokenStore {
+                fail_read_after_write: true,
+                ..TestControlTokenStore::empty()
+            },
+        ] {
+            let (root, path) = migration_settings(std::str::from_utf8(original).unwrap());
+            assert!(migrate_legacy_control_token(&path, &store).is_err());
+            assert_eq!(fs::read(&path).expect("read preserved settings"), original);
+            fs::remove_dir_all(root).expect("remove temp migration root");
+        }
+    }
+
+    #[test]
+    fn migration_authorization_is_exact_current_jun_action() {
+        let valid = json!({
+            "user": {"id": "user-jun", "type": "human"},
+            "trust": {
+                "level": "verified_action",
+                "needsReverification": false,
+                "expiresAt": (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                "action": {"key": PHASE5H_LEGACY_TOKEN_MIGRATION_ACTION}
+            }
+        });
+        assert!(validate_phase5h_migration_session(&valid).is_ok());
+        for pointer in ["/user/id", "/trust/level", "/trust/action/key"] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).expect("test pointer") = json!("wrong");
+            assert!(validate_phase5h_migration_session(&invalid).is_err());
+        }
+        let mut expired = valid;
+        expired["trust"]["expiresAt"] = json!("2000-01-01T00:00:00Z");
+        assert!(validate_phase5h_migration_session(&expired).is_err());
+    }
 
     #[test]
     fn generic_file_stem_uses_timestamp_and_seed_only() {

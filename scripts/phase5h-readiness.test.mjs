@@ -129,6 +129,20 @@ test('settings secret rejection never emits the secret value', () => {
   })
 })
 
+test('legacy credential migration is replacement-first and keeps authorization off command lines and environment', () => {
+  const main = fs.readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8')
+  const operator = fs.readFileSync(new URL('./Invoke-Phase5HLegacyControlTokenMigration.ps1', import.meta.url), 'utf8')
+  assert.match(main, /store\.write\(&legacy\)\?[\s\S]*store\.read\(\)\?[\s\S]*object\.remove\("agentControlToken"\)/)
+  assert.match(main, /read_line\(&mut authorization\)/)
+  assert.match(main, /bearer_auth\(authorization\)/)
+  assert.match(main, /PHASE5H_LEGACY_TOKEN_MIGRATION_ACTION/)
+  assert.match(operator, /RedirectStandardInput = \$true/)
+  assert.match(operator, /StandardInput\.WriteLine\(\$authorization\)/)
+  assert.doesNotMatch(operator, /SetEnvironmentVariable\([^\n]*authorization/i)
+  assert.doesNotMatch(operator, /Arguments\s*=.*authorization/i)
+  assert.doesNotMatch(operator, /Get-FileHash[^\n]*(token|credential)/i)
+})
+
 test('hash mismatch, nonempty restore, and linked source paths fail closed', () => {
   const data = fixture()
   backupProviderState(data.source, data.backup)
