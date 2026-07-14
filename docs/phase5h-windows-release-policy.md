@@ -30,6 +30,10 @@ An older installation can contain a non-empty `agentControlToken` property in `s
 
 Use `scripts/Invoke-Phase5HLegacyControlTokenMigration.ps1` with the exact staged candidate. The foreground operator requests the exact `venice-media-local:migrate-legacy-agent-control-token` verified action immediately before the change and supplies the short-lived Core session to the candidate through redirected standard input. The session must identify `user-jun`, human authentication, current `verified_action` trust, the exact action key, and a future expiry. It is never accepted from an argument, environment variable, file, log, evidence object, or hash.
 
+For a Windows browser with the MetaMask extension, the operator opens Core's `connectorUrl` in the configured default browser. It must not open the mobile-only `walletUrl`, which can fall back to `metamask.io/download` instead of invoking the installed extension. The connector URL and identifier remain in process memory and are never printed or retained.
+
+Before launching the candidate, the operator uses the in-memory bearer once against Core's authenticated session endpoint and requires Jun, human authentication, current `verified_action` trust, the exact migration action, and a future expiry. A rejection reports only the HTTP status. The candidate independently repeats that proof before reading or changing settings; its rejection diagnostics likewise contain only the HTTP status and no response body or credential material.
+
 The candidate applies this replacement-first sequence:
 
 1. If a non-empty Windows credential-store entry already exists, prove it can be read and treat the JSON entry as obsolete without overwriting the replacement.

@@ -709,7 +709,10 @@ async fn run_phase5h_legacy_token_migration(
         .await
         .map_err(|error| format!("Runtime authorization check failed: {error}"))?;
     if !response.status().is_success() {
-        return Err("Runtime authorization was rejected".to_string());
+        return Err(format!(
+            "Runtime authorization was rejected (HTTP {})",
+            response.status().as_u16()
+        ));
     }
     let payload: Value = response
         .json()

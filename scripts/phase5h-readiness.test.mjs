@@ -141,6 +141,12 @@ test('legacy credential migration is replacement-first and keeps authorization o
   assert.doesNotMatch(operator, /SetEnvironmentVariable\([^\n]*authorization/i)
   assert.doesNotMatch(operator, /Arguments\s*=.*authorization/i)
   assert.doesNotMatch(operator, /Get-FileHash[^\n]*(token|credential)/i)
+  assert.match(operator, /Start-Process \(\[string\]\$connector\.connectorUrl\)/)
+  assert.doesNotMatch(operator, /Start-Process \(\[string\]\$connector\.walletUrl\)/)
+  assert.doesNotMatch(operator, /verificationUrl/)
+  assert.match(operator, /api\/auth\/session[^\n]*-Headers @\{ Authorization = "Bearer \$authorization" \}/)
+  assert.match(operator, /Core rejected the in-memory migration authorization during session preflight \(HTTP \$statusCode\)/)
+  assert.doesNotMatch(operator, /Write-(?:Host|Output)[^\n]*\$authorization/i)
 })
 
 test('hash mismatch, nonempty restore, and linked source paths fail closed', () => {

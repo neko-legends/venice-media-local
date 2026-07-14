@@ -58,11 +58,11 @@ try {
     verificationDurationMs = 300000
   }
   $connector = Invoke-RestMethod -Method Post -Uri "$($CoreBaseUrl.TrimEnd('/'))/api/auth/desktop-connector" -ContentType 'application/json' -Body ($request | ConvertTo-Json -Depth 5 -Compress)
-  if ([string]::IsNullOrWhiteSpace([string]$connector.connectorToken) -or [string]::IsNullOrWhiteSpace([string]$connector.walletUrl)) {
+  if ([string]::IsNullOrWhiteSpace([string]$connector.connectorToken) -or [string]::IsNullOrWhiteSpace([string]$connector.connectorUrl)) {
     throw 'Core did not return a usable verified-action connector.'
   }
-  Write-Output ([ordered]@{ status = 'verification-required'; action = $actionKey; verificationUrl = [string]$connector.walletUrl } | ConvertTo-Json -Compress)
-  if ($OpenVerificationBrowser) { Start-Process ([string]$connector.walletUrl) }
+  Write-Output ([ordered]@{ status = 'verification-required'; action = $actionKey; handoff = 'desktop-browser' } | ConvertTo-Json -Compress)
+  if ($OpenVerificationBrowser) { Start-Process ([string]$connector.connectorUrl) }
 
   $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
   do {
@@ -81,6 +81,21 @@ try {
   }
 
   $authorization = [string]$status.token
+  $session = $null
+  try {
+    $session = Invoke-RestMethod -Method Get -Uri "$($CoreBaseUrl.TrimEnd('/'))/api/auth/session" -Headers @{ Authorization = "Bearer $authorization" }
+  } catch {
+    $statusCode = [int]$_.Exception.Response.StatusCode
+    throw "Core rejected the in-memory migration authorization during session preflight (HTTP $statusCode)."
+  }
+  $expiry = [DateTimeOffset]::MinValue
+  $expiryValid = [DateTimeOffset]::TryParse([string]$session.trust.expiresAt, [ref]$expiry) -and $expiry -gt [DateTimeOffset]::UtcNow
+  if ([string]$session.user.id -ne 'user-jun' -or [string]$session.user.type -ne 'human' -or
+      [string]$session.trust.level -ne 'verified_action' -or [bool]$session.trust.needsReverification -or
+      [string]$session.trust.action.key -ne $actionKey -or -not $expiryValid) {
+    throw 'Core returned mismatched migration authorization claims during session preflight.'
+  }
+  $session = $null
   $start = New-Object Diagnostics.ProcessStartInfo
   $start.FileName = $CandidateExecutable
   $start.Arguments = "--phase5h-migrate-legacy-agent-control-token `"$CoreBaseUrl`" `"$SettingsPath`""
@@ -95,6 +110,7 @@ try {
   $process.StandardInput.WriteLine($authorization)
   $process.StandardInput.Close()
   $authorization = $null
+  $session = $null
   $status = $null
   $connector = $null
   if (-not $process.WaitForExit(60000)) { throw 'Migration candidate did not exit within 60 seconds.' }
