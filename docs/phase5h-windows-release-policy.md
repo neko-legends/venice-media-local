@@ -59,6 +59,16 @@ These packages are development/build-server tooling only: all are in `devDepende
 6. Launch only the exact path named by the new pointer. Within 60 seconds require authenticated ready health, the expected instance/version/manifest identity, and `activeOperationCount = 0`. Only after those checks pass, retain the prior pointer and manifest as immutable rollback evidence.
 7. On any failure, shut down through the same authenticated action, atomically restore the prior pointer, launch the exact retained prior artifact, and require the same identity, health, and idle gates. Preserve the failed slot and evidence. If rollback health fails, stop and report both slot identities; do not recurse automatically.
 
+### Already-stopped legacy cold activation
+
+The live-instance sequence above remains mandatory whenever the expected process or listener exists. An already-stopped retained legacy package may use the cold path specified in `docs/specs/phase5h-cold-activation-remediation-2026-07-14.md` only when all live-instance facts are absent and independently proven.
+
+Use `scripts/Invoke-Phase5HColdActivation.ps1` from foreground 64-bit Windows PowerShell 5.1. It requests the exact Core verified action `venice-media-local:activate-release-slot`; keeps the Core session and Agent Control credential solely in memory; and supplies them to the Node engine through redirected standard input. Core persists two authoritative zero-work samples at least five seconds apart, issues one exact authorization valid for no more than 60 seconds, and consumes it once after the Windows operator owns the exclusive transition lock and completes its final recheck.
+
+Cold activation requires all retained/staged hashes, process and listener absence, stale-discovery evidence, zero local nonterminal/ambiguous provider work, zero authoritative Core active operations/unsettled jobs, and no other transition. Stale discovery is evidence only. It is neither overwritten during preflight nor accepted as health, routing, installed-version, or manifest proof. A live process/listener, changed byte, changed work state, expired or replayed authorization, wrong action, or lock contention fails before mutation and returns to the normal authenticated shutdown path.
+
+After mutation, start or authenticated post-health failure automatically invokes rollback. The new package is shut down only through `application:shutdown`; the prior pointer and preserved discovery bytes are restored atomically; and the retained package must re-establish its exact configured identity, manifest, routing, and zero-work state. Rollback failure is a hard failure and is never activation success.
+
 ## Windows checklist
 
 ```powershell
@@ -79,4 +89,4 @@ Get-AuthenticodeSignature <artifact> | Select-Object Status
 
 Public binary distribution is not part of Phase 5H. A future public lane must use one approved publisher certificate, pin the exact signer identity and certificate thumbprint, use an RFC 3161 timestamp, and require `Get-AuthenticodeSignature` to report `Status` exactly as `Valid`. Those requirements belong here as future policy, not as placeholder fields in the Phase 5H configuration.
 
-The existing backup, restore, immutable-slot, authenticated shutdown, rollback, pointer, and health behavior remains authoritative. `npm run test:phase5h` exercises the local policy validator and the previously committed synthetic backup/restore/slot harness; it does not build, sign, deploy, activate, or access live systems.
+The existing backup, restore, immutable-slot, authenticated shutdown, rollback, pointer, and health behavior remains authoritative. `npm run test:phase5h` exercises the local policy validator, synthetic backup/restore/slot harness, and adversarial cold-activation engine. It does not build, sign, deploy, activate, or access live systems.
