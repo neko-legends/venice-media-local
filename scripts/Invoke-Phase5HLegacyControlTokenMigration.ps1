@@ -104,7 +104,6 @@ try {
   $start.RedirectStandardInput = $true
   $start.RedirectStandardOutput = $true
   $start.RedirectStandardError = $true
-  $start.StandardInputEncoding = New-Object Text.UTF8Encoding($false)
   $process = New-Object Diagnostics.Process
   $process.StartInfo = $start
   if (-not $process.Start()) { throw 'Failed to start the migration candidate.' }
