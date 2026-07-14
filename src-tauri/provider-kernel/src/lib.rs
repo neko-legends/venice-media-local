@@ -1026,18 +1026,23 @@ impl Storage for FileStorage {
                 warnings.push(format!("backup_cleanup:{error}"));
             }
         }
+        #[cfg(test)]
+        let injected_directory_sync =
+            inject && matches!(self.fault, Some(AtomicWriteFault::DirectorySync));
+        #[cfg(test)]
+        if injected_directory_sync {
+            warnings.push("directory_sync:injected_directory_sync".into());
+        }
         #[cfg(unix)]
         {
-            #[cfg(test)]
-            let sync = if inject && matches!(self.fault, Some(AtomicWriteFault::DirectorySync)) {
-                Err(std::io::Error::other("injected_directory_sync"))
-            } else {
-                fs::File::open(parent).and_then(|directory| directory.sync_all())
-            };
             #[cfg(not(test))]
-            let sync = fs::File::open(parent).and_then(|directory| directory.sync_all());
-            if let Err(error) = sync {
-                warnings.push(format!("directory_sync:{error}"));
+            let injected_directory_sync = false;
+            if !injected_directory_sync {
+                if let Err(error) =
+                    fs::File::open(parent).and_then(|directory| directory.sync_all())
+                {
+                    warnings.push(format!("directory_sync:{error}"));
+                }
             }
         }
         if warnings.is_empty() {
@@ -1606,7 +1611,10 @@ impl Kernel {
             error.to_string()
         })?;
         fs::remove_file(&temporary).map_err(|error| error.to_string())?;
-        fs::File::open(&final_path)
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&final_path)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
         #[cfg(unix)]
