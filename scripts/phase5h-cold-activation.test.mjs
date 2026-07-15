@@ -1,19 +1,46 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { createColdActivationEngine, COLD_ACTIVATION_ACTION, authorizationBinding, canonicalJson, sha256 } from './phase5h-cold-activation.mjs'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  createColdActivationEngine,
+  COLD_ACTIVATION_ACTION,
+  LEGACY_PRE_LEDGER_RETAINED,
+  LOCAL_WORK_MODE_LEDGER,
+  LOCAL_WORK_MODE_LEGACY_PRE_LEDGER,
+  authorizationBinding,
+  canonicalJson,
+  evaluateLocalWorkState,
+  sha256,
+} from './phase5h-cold-activation.mjs'
 
-function expected() {
+function expected(overrides = {}) {
   return {
-    retained: { path: 'C:\\legacy\\venice-media-local.exe', version: '26.6.5', sizeBytes: 10, sha256: 'a'.repeat(64) },
+    retained: { path: 'C:\\legacy\\venice-media-local.exe', version: '26.7.0', sizeBytes: 10, sha256: 'a'.repeat(64) },
     staged: { slot: 'D:\\stage\\slot', portable: { filename: 'venice-media-local.exe', sizeBytes: 20, sha256: 'b'.repeat(64) }, installer: { filename: 'setup.exe', sizeBytes: 30, sha256: 'c'.repeat(64) }, manifest: { filename: 'manifest.json', sizeBytes: 40, sha256: 'd'.repeat(64) } },
     expectedHost: { processName: 'venice-media-local.exe', port: 9876 },
     replacement: { version: '26.7.6', sourceCommit: 'e'.repeat(40), providerId: 'venice-media-local', instanceId: 'vml-test', machineId: 'ripper', manifestDigest: 'f'.repeat(64) },
     validitySeconds: 60,
+    ...overrides,
   }
 }
 
+function expectedLegacy() {
+  return expected({
+    retained: {
+      path: 'C:\\Users\\flash\\AppData\\Local\\Venice Media Local\\venice-media-local.exe',
+      version: LEGACY_PRE_LEDGER_RETAINED.version,
+      sizeBytes: LEGACY_PRE_LEDGER_RETAINED.sizeBytes,
+      sha256: LEGACY_PRE_LEDGER_RETAINED.sha256,
+    },
+  })
+}
+
 function sample(config, time, changes = {}) {
+  const legacy = config.retained.version === LEGACY_PRE_LEDGER_RETAINED.version
+    && config.retained.sha256.toLowerCase() === LEGACY_PRE_LEDGER_RETAINED.sha256
+  const inventoryDigest = changes.appDataInventoryDigest || '3'.repeat(64)
   const value = {
     observedAt: new Date(time).toISOString(), processCount: 0, listenerCount: 0,
     activeProviderOperationCount: 0, unsettledJobCount: 0, transitionInProgress: false,
@@ -21,21 +48,38 @@ function sample(config, time, changes = {}) {
     staged: Object.fromEntries(['portable', 'installer', 'manifest'].map((key) => [key, { sizeBytes: config.staged[key].sizeBytes, sha256: config.staged[key].sha256 }])),
     expectedProcessName: config.expectedHost.processName, expectedPort: config.expectedHost.port,
     staleDiscovery: { present: true, sizeBytes: 12, sha256: '1'.repeat(64), lastWriteUtc: '2026-07-12T08:02:06.228Z' },
-    persistedWorkDigest: '2'.repeat(64), ...changes,
+    localWorkMode: legacy ? LOCAL_WORK_MODE_LEGACY_PRE_LEDGER : LOCAL_WORK_MODE_LEDGER,
+    ledgerPresent: !legacy,
+    appDataInventoryDigest: inventoryDigest,
+    persistedWorkDigest: legacy ? inventoryDigest : '2'.repeat(64),
+    ...changes,
+  }
+  if (Object.hasOwn(changes, 'persistedWorkDigest') === false && value.localWorkMode === LOCAL_WORK_MODE_LEGACY_PRE_LEDGER) {
+    value.persistedWorkDigest = value.appDataInventoryDigest
   }
   value.digest = sha256(canonicalJson(value))
   return value
 }
 
-function harness(hooks = {}) {
-  const config = expected(); let now = Date.parse('2026-07-14T18:00:00.000Z'); let calls = 0; let locked = false; let cleaned = false
+function harness(hooks = {}, configFactory = expected) {
+  const config = configFactory(); let now = Date.parse('2026-07-14T18:00:00.000Z'); let calls = 0; let locked = false; let cleaned = false
+  let ledgerPresentAfter = hooks.ledgerPresentAfter !== false
   const host = {
     sample: async (_expected, phase) => { calls += 1; return sample(config, now + (calls - 1) * 5000, hooks.samples?.[phase] || {}) },
     acquireTransitionLock: async () => { if (hooks.locked) return null; locked = true; return { id: 1 } },
     releaseTransitionLock: async () => { locked = false },
     activate: async () => { if (hooks.startFailure) throw Object.assign(new Error('start'), { code: 'START_FAILED' }) },
-    verifyActivated: async () => hooks.health || ({ ready: true, identityMatched: true, manifestMatched: true, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0, runningExecutableHash: config.staged.portable.sha256, runningManifestHash: config.staged.manifest.sha256 }),
-    rollback: async () => hooks.rollback || ({ passed: true, version: config.retained.version, sha256: config.retained.sha256, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0 }),
+    verifyActivated: async () => hooks.health || ({
+      ready: true, identityMatched: true, manifestMatched: true, routingEligible: true,
+      activeProviderOperationCount: 0, unsettledJobCount: 0,
+      runningExecutableHash: config.staged.portable.sha256, runningManifestHash: config.staged.manifest.sha256,
+      ledgerPresent: ledgerPresentAfter, localLedgerActiveCount: 0, localLedgerUnsettledCount: 0,
+    }),
+    rollback: async () => hooks.rollback || ({
+      passed: true, version: config.retained.version, sha256: config.retained.sha256,
+      routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0,
+      ledgerPresent: hooks.rollbackLedgerPresent === true,
+    }),
     cleanup: async () => { cleaned = true },
   }
   let issued = null; let consumed = false
@@ -56,17 +100,120 @@ function harness(hooks = {}) {
   return { config, engine, state: () => ({ locked, cleaned, issued, consumed }) }
 }
 
+function writeLegacyAppData(root, { unexpected, lifecycle, ledger, extraFile } = {}) {
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'settings.json'), `${JSON.stringify({ theme: 'dark', enableAgentControl: true }, null, 2)}\n`)
+  fs.writeFileSync(path.join(root, 'venice-models.json'), '{}\n')
+  fs.writeFileSync(path.join(root, 'control-api.json'), '{"port":9876}\n')
+  fs.writeFileSync(path.join(root, 'capability-provider-instance-id'), 'vml-34be0eed4fadff09\n')
+  if (extraFile) fs.writeFileSync(path.join(root, extraFile), 'x')
+  if (unexpected) fs.mkdirSync(path.join(root, unexpected), { recursive: true })
+  if (lifecycle) {
+    fs.mkdirSync(path.join(root, 'provider-v1'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'provider-v1', 'lifecycle.json'), lifecycle)
+  }
+  if (ledger) {
+    fs.mkdirSync(path.join(root, 'provider-v2'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'provider-v2', 'ledger.json'), ledger)
+  }
+  return {
+    appDataRoot: root,
+    providerLedgerPath: path.join(root, 'provider-v2', 'ledger.json'),
+    retained: { ...LEGACY_PRE_LEDGER_RETAINED },
+  }
+}
+
 test('valid stopped legacy cold activation passes and cleans ownership', async () => {
   const h = harness(); const result = await h.engine.execute(h.config)
   assert.equal(result.disposition, 'activation-passed'); assert.equal(result.rollback, 'no-rollback-required')
   assert.deepEqual(h.state(), { locked: false, cleaned: true, issued: h.state().issued, consumed: true })
 })
 
+test('exact stopped 26.6.5 pre-ledger installation with authoritative zero work passes', async () => {
+  const h = harness({}, expectedLegacy)
+  const result = await h.engine.execute(h.config)
+  assert.equal(result.disposition, 'activation-passed')
+  assert.equal(h.state().issued.localWork.mode, LOCAL_WORK_MODE_LEGACY_PRE_LEDGER)
+  assert.equal(h.state().issued.localWork.ledgerPresent, false)
+  assert.equal(h.state().issued.localWork.appDataInventoryDigest, '3'.repeat(64))
+})
+
+test('evaluateLocalWorkState accepts exact pre-ledger 26.6.5 inventory and rejects ledger absence alone without identity', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-preledger-'))
+  try {
+    const ok = writeLegacyAppData(root)
+    const state = evaluateLocalWorkState(ok)
+    assert.equal(state.mode, LOCAL_WORK_MODE_LEGACY_PRE_LEDGER)
+    assert.equal(state.ledgerPresent, false)
+    assert.equal(state.activeProviderOperationCount, 0)
+    assert.equal(state.unsettledJobCount, 0)
+    assert.match(state.appDataInventoryDigest, /^[a-f0-9]{64}$/)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('ambiguous or nonzero legacy work is rejected', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-preledger-work-'))
+  try {
+    const withLifecycle = writeLegacyAppData(root, { lifecycle: '{"state":"running"}' })
+    assert.throws(() => evaluateLocalWorkState(withLifecycle), { code: 'COLD_UNEXPECTED_WORK_STATE' })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+
+  const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-preledger-nonzero-'))
+  try {
+    const withLedgerWork = writeLegacyAppData(root2, { ledger: JSON.stringify({ operations: { a: { state: 'running' } } }) })
+    assert.throws(() => evaluateLocalWorkState({ ...withLedgerWork, retained: { version: '26.7.6', sizeBytes: 20, sha256: 'b'.repeat(64) } }), { code: 'COLD_PROVIDER_WORK_ACTIVE' })
+  } finally { fs.rmSync(root2, { recursive: true, force: true }) }
+})
+
+test('wrong version or executable hash is rejected for pre-ledger mode', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-preledger-hash-'))
+  try {
+    const base = writeLegacyAppData(root)
+    assert.throws(() => evaluateLocalWorkState({ ...base, retained: { ...LEGACY_PRE_LEDGER_RETAINED, version: '26.7.6' } }), { code: 'COLD_LEDGER_REQUIRED' })
+    assert.throws(() => evaluateLocalWorkState({ ...base, retained: { ...LEGACY_PRE_LEDGER_RETAINED, sha256: '9'.repeat(64) } }), { code: 'COLD_LEDGER_REQUIRED' })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('process and listener appearance is rejected', async () => {
+  for (const [phase, change, code] of [
+    ['second', { processCount: 1 }, 'COLD_PROCESS_PRESENT'],
+    ['second', { listenerCount: 1 }, 'COLD_LISTENER_PRESENT'],
+    ['final', { processCount: 1 }, 'COLD_PROCESS_PRESENT'],
+    ['final', { listenerCount: 1 }, 'COLD_LISTENER_PRESENT'],
+  ]) {
+    const h = harness({ samples: { [phase]: change } }, expectedLegacy)
+    await assert.rejects(() => h.engine.execute(h.config), { code })
+  }
+})
+
+test('app-data inventory change is rejected', async () => {
+  const h = harness({ samples: { second: { appDataInventoryDigest: '4'.repeat(64) } } }, expectedLegacy)
+  await assert.rejects(() => h.engine.execute(h.config), { code: 'COLD_LOCAL_WORK_CHANGED' })
+})
+
+test('unexpected malformed ledger is rejected', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vml-bad-ledger-'))
+  try {
+    const base = writeLegacyAppData(root, { ledger: '{not-json' })
+    assert.throws(() => evaluateLocalWorkState({ ...base, retained: { version: '26.7.6', sizeBytes: 20, sha256: 'b'.repeat(64) } }), { code: 'COLD_LEDGER_INVALID' })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('successful 26.7.6 start must create a valid zero-work ledger', async () => {
+  const h = harness({ ledgerPresentAfter: false }, expectedLegacy)
+  await assert.rejects(() => h.engine.execute(h.config), { code: 'COLD_POST_ACTIVATION_INVALID' })
+})
+
+test('failed activation restores legacy pre-ledger state exactly', async () => {
+  const h = harness({ startFailure: true, rollbackLedgerPresent: false }, expectedLegacy)
+  await assert.rejects(() => h.engine.execute(h.config), (error) => error.details.rollback === 'rollback-required-passed')
+  const leftLedger = harness({ startFailure: true, rollbackLedgerPresent: true }, expectedLegacy)
+  await assert.rejects(() => leftLedger.engine.execute(leftLedger.config), (error) => (
+    error.code === 'COLD_ROLLBACK_HARD_FAILURE' && error.details.rollbackCode === 'COLD_ROLLBACK_FAILED'
+  ))
+})
+
 for (const [name, phase, change, code] of [
-  ['process between samples', 'second', { processCount: 1 }, 'COLD_PROCESS_PRESENT'],
-  ['listener between samples', 'second', { listenerCount: 1 }, 'COLD_LISTENER_PRESENT'],
-  ['process after authorization', 'final', { processCount: 1 }, 'COLD_PROCESS_PRESENT'],
-  ['listener after authorization', 'final', { listenerCount: 1 }, 'COLD_LISTENER_PRESENT'],
   ['active operation before mutation', 'final', { activeProviderOperationCount: 1 }, 'COLD_PROVIDER_WORK_ACTIVE'],
   ['unsettled job before mutation', 'final', { unsettledJobCount: 1 }, 'COLD_JOB_UNSETTLED'],
   ['retained hash mismatch', 'first', { retained: { sizeBytes: 10, sha256: '9'.repeat(64) } }, 'COLD_ARTIFACT_MISMATCH'],
@@ -91,7 +238,7 @@ test('transition lock contention fails before consumption', async () => {
 })
 
 test('start and post-health failures roll back successfully', async () => {
-  for (const hooks of [{ startFailure: true }, { health: { ready: false } }]) {
+  for (const hooks of [{ startFailure: true }, { health: { ready: false, ledgerPresent: true, localLedgerActiveCount: 0, localLedgerUnsettledCount: 0 } }]) {
     const h = harness(hooks); await assert.rejects(() => h.engine.execute(h.config), (error) => error.details.rollback === 'rollback-required-passed')
   }
 })
@@ -114,6 +261,8 @@ test('foreground operator keeps both credentials off arguments, environment, log
   assert.doesNotMatch(operator, /Write-(?:Host|Output)[^\n]*(?:authorization|agentCredential)/i)
   assert.doesNotMatch(operator, /Get-FileHash[^\n]*(?:authorization|agentCredential)/i)
   assert.match(runner, /configDigest: sha256\(canonicalJson\(config\)\)/)
+  assert.match(runner, /evaluateLocalWorkState/)
+  assert.match(runner, /appDataRoot/)
   assert.doesNotMatch(runner, /JSON\.stringify\([^\n]*(?:coreAuthorization|agentControlCredential)[^\n]*report/i)
 })
 
@@ -126,4 +275,6 @@ test('authorization binding projects only canonical Core fields and lowercase ha
   assert.deepEqual(Object.keys(binding.retained).sort(), ['path', 'sha256', 'sizeBytes', 'version'])
   assert.equal(binding.retained.sha256, config.retained.sha256.toLowerCase())
   assert.equal(binding.staged.portable.sha256, config.staged.portable.sha256.toLowerCase())
+  assert.equal(binding.localWork.mode, LOCAL_WORK_MODE_LEDGER)
+  assert.equal(binding.localWork.ledgerPresent, true)
 })

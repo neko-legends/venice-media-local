@@ -3,9 +3,15 @@ import path from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { createColdActivationEngine, COLD_ACTIVATION_ACTION, COLD_ACTIVATION_REASON, canonicalJson, sha256 } from './phase5h-cold-activation.mjs'
+import {
+  createColdActivationEngine,
+  COLD_ACTIVATION_ACTION,
+  COLD_ACTIVATION_REASON,
+  evaluateLocalWorkState,
+  canonicalJson,
+  sha256,
+} from './phase5h-cold-activation.mjs'
 
-const TERMINAL = new Set(['succeeded', 'failed', 'canceled', 'lost', 'reconciliation_required'])
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 function fail(message, code = 'WINDOWS_COLD_ACTIVATION_INVALID') { const error = new Error(message); error.code = code; throw error }
 function realFile(target, label) {
@@ -26,13 +32,11 @@ function inspectWindows(processName, port) {
   const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env, windowsHide: true, timeout: 15000 })
   const parsed = JSON.parse(output || '{}'); return { processes: Array.isArray(parsed.processes) ? parsed.processes : (parsed.processes ? [parsed.processes] : []), listenerCount: Number(parsed.listenerCount || 0) }
 }
-function ledgerState(ledgerPath) {
-  const file = realFile(ledgerPath, 'Provider ledger')
-  const value = JSON.parse(fs.readFileSync(file.path, 'utf8'))
-  const operations = Object.values(value?.operations || {})
-  const activeProviderOperationCount = operations.filter((entry) => !TERMINAL.has(String(entry?.state || '').toLowerCase())).length
-  const unsettledJobCount = operations.filter((entry) => ['lost', 'submitted_ambiguous'].includes(String(entry?.state || entry?.submissionCertainty || '').toLowerCase())).length
-  return { activeProviderOperationCount, unsettledJobCount, evidenceDigest: file.sha256 }
+function removePathIfExists(target) {
+  if (!fs.existsSync(target)) return
+  const stat = fs.lstatSync(target)
+  if (stat.isDirectory() && !stat.isSymbolicLink()) fs.rmSync(target, { recursive: true, force: false })
+  else fs.rmSync(target, { force: false })
 }
 async function jsonRequest(url, { method = 'GET', bearer, body, timeoutMs = 10000 } = {}) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -69,17 +73,29 @@ class WindowsColdHost {
   }
   async sample(expected) {
     const inspect = inspectWindows(expected.expectedHost.processName, expected.expectedHost.port)
-    const files = this.files(expected); const ledger = ledgerState(this.config.providerLedgerPath)
+    const files = this.files(expected)
+    const localWork = evaluateLocalWorkState({
+      appDataRoot: this.config.appDataRoot,
+      providerLedgerPath: this.config.providerLedgerPath,
+      retained: {
+        version: expected.retained.version,
+        sizeBytes: files.retained.sizeBytes,
+        sha256: files.retained.sha256,
+      },
+    })
     const discovery = realFile(this.config.discoveryPath, 'Stale discovery')
     const sample = {
       observedAt: new Date().toISOString(), processCount: inspect.processes.length, listenerCount: inspect.listenerCount,
-      activeProviderOperationCount: ledger.activeProviderOperationCount, unsettledJobCount: ledger.unsettledJobCount,
+      activeProviderOperationCount: localWork.activeProviderOperationCount, unsettledJobCount: localWork.unsettledJobCount,
       transitionInProgress: fs.existsSync(this.config.transitionLockPath) && !this.ownedLock,
       retained: { sizeBytes: files.retained.sizeBytes, sha256: files.retained.sha256 },
       staged: Object.fromEntries(Object.entries(files.staged).map(([key, value]) => [key, { sizeBytes: value.sizeBytes, sha256: value.sha256 }])),
       expectedProcessName: expected.expectedHost.processName, expectedPort: expected.expectedHost.port,
       staleDiscovery: { present: true, sizeBytes: discovery.sizeBytes, sha256: discovery.sha256, lastWriteUtc: discovery.lastWriteUtc },
-      persistedWorkDigest: ledger.evidenceDigest,
+      localWorkMode: localWork.mode,
+      ledgerPresent: localWork.ledgerPresent,
+      appDataInventoryDigest: localWork.appDataInventoryDigest,
+      persistedWorkDigest: localWork.evidenceDigest,
     }
     sample.digest = sha256(canonicalJson(sample)); return sample
   }
@@ -90,9 +106,14 @@ class WindowsColdHost {
   async releaseTransitionLock(lock) { fs.closeSync(lock.fd); fs.rmSync(this.config.transitionLockPath, { force: false }); this.ownedLock = null }
   async activate(expected) {
     const pointerPath = this.config.pointerPath
+    const ledgerPath = path.resolve(this.config.providerLedgerPath)
+    const providerRoot = path.dirname(ledgerPath)
     this.saved = {
       pointer: fs.existsSync(pointerPath) ? fs.readFileSync(pointerPath) : null,
       discovery: fs.existsSync(this.config.discoveryPath) ? fs.readFileSync(this.config.discoveryPath) : null,
+      ledgerExisted: fs.existsSync(ledgerPath),
+      ledgerBytes: fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath) : null,
+      providerRootExisted: fs.existsSync(providerRoot),
     }
     const pointer = { schemaVersion: 1, slot: expected.staged.slot, previous: this.config.previousSlot || null, portableSha256: expected.staged.portable.sha256, manifestSha256: expected.staged.manifest.sha256, activatedAt: new Date().toISOString() }
     atomicWrite(pointerPath, Buffer.from(`${JSON.stringify(pointer, null, 2)}\n`))
@@ -109,11 +130,27 @@ class WindowsColdHost {
         const inspect = inspectWindows(expected.expectedHost.processName, expected.expectedHost.port)
         const running = inspect.processes.length === 1 ? realFile(inspect.processes[0].ExecutablePath, 'Running executable') : null
         const releaseManifest = realFile(path.join(expected.staged.slot, expected.staged.manifest.filename), 'Running release manifest')
+        const postLedger = evaluateLocalWorkState({
+          appDataRoot: this.config.appDataRoot,
+          providerLedgerPath: this.config.providerLedgerPath,
+          retained: {
+            version: expected.replacement.version,
+            sizeBytes: expected.staged.portable.sizeBytes,
+            sha256: expected.staged.portable.sha256,
+          },
+        })
         return {
-          ready: health.status === 'ready', identityMatched: health.provider?.id === expected.replacement.providerId && health.provider?.instanceId === expected.replacement.instanceId && health.provider?.machineId === expected.replacement.machineId && health.provider?.version === expected.replacement.version,
-          manifestMatched: provider?.manifestDigest?.toLowerCase() === expected.replacement.manifestDigest.toLowerCase() && manifest?.provider?.id === expected.replacement.providerId, routingEligible: provider?.routingEligible === true,
-          activeProviderOperationCount: Number(health.activeOperationCount), unsettledJobCount: Number(provider?.health?.detail?.unsettledJobCount || 0),
-          runningExecutableHash: running?.sha256, runningManifestHash: releaseManifest.sha256,
+          ready: health.status === 'ready',
+          identityMatched: health.provider?.id === expected.replacement.providerId && health.provider?.instanceId === expected.replacement.instanceId && health.provider?.machineId === expected.replacement.machineId && health.provider?.version === expected.replacement.version,
+          manifestMatched: provider?.manifestDigest?.toLowerCase() === expected.replacement.manifestDigest.toLowerCase() && manifest?.provider?.id === expected.replacement.providerId,
+          routingEligible: provider?.routingEligible === true,
+          activeProviderOperationCount: Number(health.activeOperationCount),
+          unsettledJobCount: Number(provider?.health?.detail?.unsettledJobCount || 0),
+          runningExecutableHash: running?.sha256,
+          runningManifestHash: releaseManifest.sha256,
+          ledgerPresent: postLedger.ledgerPresent === true,
+          localLedgerActiveCount: postLedger.activeProviderOperationCount,
+          localLedgerUnsettledCount: postLedger.unsettledJobCount,
         }
       } catch (error) { last = error; await sleep(1000) }
     }
@@ -132,23 +169,41 @@ class WindowsColdHost {
     }
     if (this.saved.pointer === null) fs.rmSync(this.config.pointerPath, { force: true }); else atomicWrite(this.config.pointerPath, this.saved.pointer)
     if (this.saved.discovery === null) fs.rmSync(this.config.discoveryPath, { force: true }); else atomicWrite(this.config.discoveryPath, this.saved.discovery)
+    const ledgerPath = path.resolve(this.config.providerLedgerPath)
+    const providerRoot = path.dirname(ledgerPath)
+    if (this.saved.ledgerExisted) {
+      atomicWrite(ledgerPath, this.saved.ledgerBytes)
+    } else {
+      removePathIfExists(ledgerPath)
+      if (!this.saved.providerRootExisted) removePathIfExists(providerRoot)
+    }
     const child = spawn(expected.retained.path, [], { cwd: path.dirname(expected.retained.path), detached: true, stdio: 'ignore', windowsHide: true }); child.unref()
     const deadline = Date.now() + 60000
     while (Date.now() < deadline) {
       try {
         const provider = await this.core.provider(expected.retained.providerId, expected.retained.instanceId)
         const running = inspectWindows(expected.expectedHost.processName, expected.expectedHost.port).processes
-        if (running.length === 1 && provider?.routingEligible === true && provider?.manifestDigest === expected.retained.manifestDigest && Number(provider?.health?.activeOperationCount || 0) === 0) return { passed: true, version: expected.retained.version, sha256: realFile(running[0].ExecutablePath, 'Rollback executable').sha256, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: Number(provider?.health?.detail?.unsettledJobCount || 0) }
+        if (running.length === 1 && provider?.routingEligible === true && provider?.manifestDigest === expected.retained.manifestDigest && Number(provider?.health?.activeOperationCount || 0) === 0) {
+          return {
+            passed: true,
+            version: expected.retained.version,
+            sha256: realFile(running[0].ExecutablePath, 'Rollback executable').sha256,
+            routingEligible: true,
+            activeProviderOperationCount: 0,
+            unsettledJobCount: Number(provider?.health?.detail?.unsettledJobCount || 0),
+            ledgerPresent: fs.existsSync(ledgerPath),
+          }
+        }
       } catch (_error) {}
       await sleep(1000)
     }
-    return { passed: false }
+    return { passed: false, ledgerPresent: fs.existsSync(ledgerPath) }
   }
   async cleanup() { this.child = null }
 }
 
 function validateConfig(config) {
-  for (const key of ['coreBaseUrl', 'agentControlBaseUrl', 'providerLedgerPath', 'discoveryPath', 'transitionLockPath', 'pointerPath', 'evidenceDirectory', 'expected']) if (!config?.[key]) fail(`Configuration field ${key} is required`)
+  for (const key of ['coreBaseUrl', 'agentControlBaseUrl', 'appDataRoot', 'providerLedgerPath', 'discoveryPath', 'transitionLockPath', 'pointerPath', 'evidenceDirectory', 'expected']) if (!config?.[key]) fail(`Configuration field ${key} is required`)
   return config
 }
 async function readSecrets() {

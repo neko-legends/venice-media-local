@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { createColdActivationEngine, COLD_ACTIVATION_ACTION, canonicalJson, sha256 } from './phase5h-cold-activation.mjs'
+import { createColdActivationEngine, COLD_ACTIVATION_ACTION, LOCAL_WORK_MODE_LEDGER, canonicalJson, sha256 } from './phase5h-cold-activation.mjs'
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 function expected() {
@@ -14,7 +14,14 @@ function expected() {
   }
 }
 function hostSample(config, now) {
-  const value = { observedAt: new Date(now).toISOString(), processCount: 0, listenerCount: 0, activeProviderOperationCount: 0, unsettledJobCount: 0, transitionInProgress: false, retained: { sizeBytes: config.retained.sizeBytes, sha256: config.retained.sha256 }, staged: Object.fromEntries(['portable', 'installer', 'manifest'].map((key) => [key, { sizeBytes: config.staged[key].sizeBytes, sha256: config.staged[key].sha256 }])), expectedProcessName: config.expectedHost.processName, expectedPort: config.expectedHost.port, staleDiscovery: { present: true, sizeBytes: 2, sha256: '1'.repeat(64), lastWriteUtc: '2026-07-12T00:00:00.000Z' }, persistedWorkDigest: '2'.repeat(64) }
+  const value = {
+    observedAt: new Date(now).toISOString(), processCount: 0, listenerCount: 0, activeProviderOperationCount: 0, unsettledJobCount: 0, transitionInProgress: false,
+    retained: { sizeBytes: config.retained.sizeBytes, sha256: config.retained.sha256 },
+    staged: Object.fromEntries(['portable', 'installer', 'manifest'].map((key) => [key, { sizeBytes: config.staged[key].sizeBytes, sha256: config.staged[key].sha256 }])),
+    expectedProcessName: config.expectedHost.processName, expectedPort: config.expectedHost.port,
+    staleDiscovery: { present: true, sizeBytes: 2, sha256: '1'.repeat(64), lastWriteUtc: '2026-07-12T00:00:00.000Z' },
+    localWorkMode: LOCAL_WORK_MODE_LEDGER, ledgerPresent: true, appDataInventoryDigest: '3'.repeat(64), persistedWorkDigest: '2'.repeat(64),
+  }
   value.digest = sha256(canonicalJson(value)); return value
 }
 async function runOne(index) {
@@ -25,8 +32,8 @@ async function runOne(index) {
     async acquireTransitionLock() { if (fs.existsSync(lockPath)) return null; lock = fs.openSync(lockPath, 'wx'); return { lock } },
     async releaseTransitionLock() { fs.closeSync(lock); lock = null; fs.rmSync(lockPath) },
     async activate() { child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true }) },
-    async verifyActivated() { return { ready: true, identityMatched: true, manifestMatched: true, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0, runningExecutableHash: config.staged.portable.sha256, runningManifestHash: config.staged.manifest.sha256 } },
-    async rollback() { return { passed: true, version: config.retained.version, sha256: config.retained.sha256, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0 } },
+    async verifyActivated() { return { ready: true, identityMatched: true, manifestMatched: true, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0, runningExecutableHash: config.staged.portable.sha256, runningManifestHash: config.staged.manifest.sha256, ledgerPresent: true, localLedgerActiveCount: 0, localLedgerUnsettledCount: 0 } },
+    async rollback() { return { passed: true, version: config.retained.version, sha256: config.retained.sha256, routingEligible: true, activeProviderOperationCount: 0, unsettledJobCount: 0, ledgerPresent: true } },
     async cleanup() { if (child && child.exitCode === null && child.signalCode === null) { const exited = new Promise((resolve) => child.once('exit', resolve)); child.kill(); await Promise.race([exited, pause(5000)]) } },
   }
   const authority = {

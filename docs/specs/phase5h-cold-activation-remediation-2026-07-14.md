@@ -55,7 +55,7 @@ The Node cold-activation engine has a dependency-injected host adapter for deter
 2. Verify exact retained and staged byte lengths and SHA-256 values.
 3. Parse the staged manifest strictly and prove its intended identity and source commit.
 4. Read stale discovery bytes only to record their SHA-256, byte length, and last-write timestamp. Do not use its claimed version, instance, manifest, routing, or health as authority and do not rewrite it during preflight.
-5. Read the Venice persisted provider ledger without decrypting or exposing secrets. Require zero nonterminal operations and zero ambiguous/lost work. Obtain Core's zero-work proof through the authorization endpoint.
+5. Prove local zero work. For ledger-capable releases, read `provider-v2/ledger.json` without decrypting secrets and require zero nonterminal or ambiguous/lost operations. For the exact retained pre-ledger package only (`26.6.5`, SHA-256 `b46d8ee942020ec6fea81db298f4d83e32975177838e2cc0abd24da76001e64d`, 15109632 bytes), require process and listener absence, forbid `provider-v1`/`provider-v2`/`provider-v2-execution`, bind the allowlisted app-data inventory digest, and require Core active provider operations and unsettled work to be zero. File absence alone is never accepted for any other version or hash. The first `provider-v2` ledger may be created only during the authorized activation/start transaction; post-start health must observe a valid zero-work ledger.
 6. Collect two complete cold-state samples at least five seconds apart. Each repeats process absence, listener absence, transition absence, retained hash, all staged hashes, and local persisted-work checks.
 7. Create the server-held authorization bound to the two sample digests and all exact facts.
 8. Acquire the exclusive transition lock. Lock contention or an abandoned/uncertain lock fails closed; it is not silently recovered during activation.
@@ -75,7 +75,7 @@ If rollback is required, the new instance is stopped only through its authentica
 
 No pointer, executable, manifest, discovery, registration, or routing mutation occurs before lock-held final consumption succeeds. After the first mutation, every failed start or post-activation identity, manifest, executable, routing, readiness, or zero-work gate enters rollback.
 
-Rollback restores the exact prior executable selection and manifest/pointer evidence, reconciles discovery as described above, launches the retained 26.6.5 executable, and requires its expected identity, routing, and health contract. Evidence distinguishes:
+Rollback restores the exact prior executable selection and manifest/pointer evidence, reconciles discovery as described above, restores pre-activation app-data ledger absence when the retained package was pre-ledger 26.6.5, launches the retained 26.6.5 executable, and requires its expected identity, routing, and health contract. Evidence distinguishes:
 
 - `no-mutation-rollback-unnecessary`;
 - `rollback-required-passed`;
