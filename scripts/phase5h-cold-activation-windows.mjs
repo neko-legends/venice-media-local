@@ -43,7 +43,10 @@ async function jsonRequest(url, { method = 'GET', bearer, body, timeoutMs = 1000
   try {
     const response = await fetch(url, { method, signal: controller.signal, headers: { Authorization: `Bearer ${bearer}`, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
     const value = await response.json().catch(() => ({}))
-    if (!response.ok) fail(`Authenticated request failed with HTTP ${response.status}`, 'AUTHENTICATED_REQUEST_FAILED')
+    if (!response.ok) {
+      const code = typeof value?.code === 'string' && value.code ? value.code : 'AUTHENTICATED_REQUEST_FAILED'
+      fail(`Authenticated request failed with HTTP ${response.status}${value?.error ? `: ${value.error}` : ''}`, code)
+    }
     return { status: response.status, value }
   } finally { clearTimeout(timer) }
 }
@@ -221,7 +224,15 @@ async function main() {
   const reportBase = { schemaVersion: 1, operation: 'phase5h-venice-cold-activation', startedAt: new Date().toISOString(), configDigest: sha256(canonicalJson(config)) }
   let report
   try { report = { ...reportBase, ...(await createColdActivationEngine({ host, authority: core }).execute(config.expected)), completedAt: new Date().toISOString() } }
-  catch (error) { report = { ...reportBase, disposition: 'failed', code: error.code || 'COLD_ACTIVATION_FAILED', details: error.details || {}, completedAt: new Date().toISOString() } }
+  catch (error) {
+    report = {
+      ...reportBase,
+      disposition: 'failed',
+      code: error.code || 'COLD_ACTIVATION_FAILED',
+      details: { ...(error.details || {}), message: String(error.message || '').slice(0, 500) },
+      completedAt: new Date().toISOString(),
+    }
+  }
   fs.mkdirSync(config.evidenceDirectory, { recursive: true }); const reportPath = path.join(config.evidenceDirectory, `cold-activation-${report.startedAt.replace(/[-:.]/g, '')}.json`); atomicWrite(reportPath, Buffer.from(`${JSON.stringify(report, null, 2)}\n`))
   process.stdout.write(`${JSON.stringify({ disposition: report.disposition, reportPath })}\n`)
   if (report.disposition !== 'activation-passed') process.exitCode = 1
