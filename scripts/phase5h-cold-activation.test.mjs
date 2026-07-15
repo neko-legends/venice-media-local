@@ -133,9 +133,10 @@ test('exact stopped 26.6.5 pre-ledger installation with authoritative zero work 
   const h = harness({}, expectedLegacy)
   const result = await h.engine.execute(h.config)
   assert.equal(result.disposition, 'activation-passed')
-  assert.equal(h.state().issued.localWork.mode, LOCAL_WORK_MODE_LEGACY_PRE_LEDGER)
-  assert.equal(h.state().issued.localWork.ledgerPresent, false)
-  assert.equal(h.state().issued.localWork.appDataInventoryDigest, '3'.repeat(64))
+  assert.deepEqual(Object.keys(h.state().issued).sort(), [
+    'coldSamples', 'expectedHost', 'operationType', 'persistedWork', 'reason',
+    'replacement', 'retained', 'schemaVersion', 'staged', 'staleDiscovery', 'validitySeconds',
+  ].sort())
 })
 
 test('evaluateLocalWorkState accepts exact pre-ledger 26.6.5 inventory and rejects ledger absence alone without identity', () => {
@@ -275,6 +276,5 @@ test('authorization binding projects only canonical Core fields and lowercase ha
   assert.deepEqual(Object.keys(binding.retained).sort(), ['path', 'sha256', 'sizeBytes', 'version'])
   assert.equal(binding.retained.sha256, config.retained.sha256.toLowerCase())
   assert.equal(binding.staged.portable.sha256, config.staged.portable.sha256.toLowerCase())
-  assert.equal(binding.localWork.mode, LOCAL_WORK_MODE_LEDGER)
-  assert.equal(binding.localWork.ledgerPresent, true)
+  assert.equal(Object.prototype.hasOwnProperty.call(binding, 'localWork'), false)
 })
