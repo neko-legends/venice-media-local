@@ -12,6 +12,26 @@ $authorization = $null; $agentCredential = $null
 $process = $null; $mutex = $null; $ownsMutex = $false
 $handoff = $null; $claim = $null
 
+function Test-TransientClaimTransportFailure {
+  param([Management.Automation.ErrorRecord]$ErrorRecord)
+  if ($null -ne $ErrorRecord.Exception.Response) { return $false }
+  $exception = $ErrorRecord.Exception
+  while ($null -ne $exception) {
+    if ($exception -is [Net.WebException]) {
+      return $exception.Status -in @(
+        [Net.WebExceptionStatus]::ConnectFailure,
+        [Net.WebExceptionStatus]::ConnectionClosed,
+        [Net.WebExceptionStatus]::KeepAliveFailure,
+        [Net.WebExceptionStatus]::ReceiveFailure,
+        [Net.WebExceptionStatus]::SendFailure,
+        [Net.WebExceptionStatus]::Timeout
+      )
+    }
+    $exception = $exception.InnerException
+  }
+  return $false
+}
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -61,21 +81,40 @@ try {
     handoff = 'normal-human-web-session'
     userCode = [string]$handoff.userCode
     browserUrl = $browserUrl
-    note = 'Approve exactly venice-media-local:activate-release-slot in the Core web app, then complete the operator handoff with the displayed user code.'
+    note = 'Approve exactly venice-media-local:activate-release-slot in the Core web app, then submit the displayed user code. The handoff is complete only after Core confirms that it recorded completion.'
   } | ConvertTo-Json -Compress)
   if ($OpenVerificationBrowser) { Start-Process $browserUrl }
 
   $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+  $claimTransportFailures = 0
+  $maxConsecutiveClaimTransportFailures = 5
+  $claimBody = @{ handoffId = [string]$handoff.handoffId; pollSecret = [string]$handoff.pollSecret } | ConvertTo-Json -Compress
   do {
-    $claim = Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/phase5h/venice-maintenance-activation/operator-handoff/claim" `
-      -ContentType 'application/json' -Body (@{ handoffId = [string]$handoff.handoffId; pollSecret = [string]$handoff.pollSecret } | ConvertTo-Json -Compress)
+    try {
+      $claim = Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/phase5h/venice-maintenance-activation/operator-handoff/claim" `
+        -ContentType 'application/json' -Body $claimBody
+      $claimTransportFailures = 0
+    } catch {
+      if (-not (Test-TransientClaimTransportFailure $_)) { throw }
+      $claimTransportFailures++
+      if ($claimTransportFailures -ge $maxConsecutiveClaimTransportFailures) {
+        throw "Core claim polling transport failed $claimTransportFailures consecutive times; the existing operator handoff was retained and no replacement handoff or wallet prompt was created."
+      }
+      $remainingMs = ($deadline - [DateTimeOffset]::UtcNow).TotalMilliseconds
+      if ($remainingMs -le 0) { break }
+      $backoffMs = [Math]::Min(4000, 500 * [Math]::Pow(2, $claimTransportFailures - 1))
+      $backoffMs = [int][Math]::Min($backoffMs, $remainingMs)
+      Write-Warning "Core claim polling transport was interrupted; retrying the same handoff after ${backoffMs}ms ($claimTransportFailures/$maxConsecutiveClaimTransportFailures)."
+      Start-Sleep -Milliseconds $backoffMs
+      continue
+    }
     if ([string]$claim.status -eq 'claimed') { break }
     if ([string]$claim.status -notin @('pending')) { throw "Operator handoff ended with status $($claim.status)." }
     Start-Sleep -Seconds 2
   } while ([DateTimeOffset]::UtcNow -lt $deadline)
 
   if ([string]$claim.status -ne 'claimed' -or [string]::IsNullOrWhiteSpace([string]$claim.token)) {
-    throw 'Timed out waiting for the normal human-web operator handoff claim.'
+    throw 'Timed out waiting for Core to record and release the normal human-web operator handoff claim; entering the code alone did not complete the handoff.'
   }
   if ([string]$claim.actionKey -ne $actionKey) { throw 'Claimed operator handoff action mismatch.' }
 
