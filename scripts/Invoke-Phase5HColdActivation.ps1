@@ -50,10 +50,11 @@ try {
   }
   if ([string]$handoff.actionKey -ne $actionKey) { throw 'Core returned a mismatched operator handoff action.' }
   $browserBase = $coreBaseUrl
-  if ($browserBase -match '^https?://[^/]+:\d+$') {
-    # Prefer same origin web app path from handoff when provided.
+  # Chat hosts the handoff modal. /settings is not a SPA route and redirects to login.
+  $browserUrl = "$browserBase/eva-orchestrator/chat?phase5hVeniceActivationHandoff=$([uri]::EscapeDataString([string]$handoff.userCode))"
+  if ([string]$handoff.browserPath -match '/eva-orchestrator/chat\?') {
+    $browserUrl = "$browserBase$($handoff.browserPath)"
   }
-  $browserUrl = if ([string]$handoff.browserPath) { "$browserBase$($handoff.browserPath)" } else { "$browserBase/settings?phase5hVeniceActivationHandoff=$([uri]::EscapeDataString([string]$handoff.userCode))" }
   Write-Output ([ordered]@{
     status = 'verification-required'
     action = $actionKey
