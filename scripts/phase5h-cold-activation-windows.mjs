@@ -38,32 +38,37 @@ function removePathIfExists(target) {
   if (stat.isDirectory() && !stat.isSymbolicLink()) fs.rmSync(target, { recursive: true, force: false })
   else fs.rmSync(target, { force: false })
 }
-async function jsonRequest(url, { method = 'GET', bearer, body, timeoutMs = 10000 } = {}) {
+async function jsonRequest(url, { method = 'GET', bearer, body, timeoutMs = 30000, phase = 'request' } = {}) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(url, { method, signal: controller.signal, headers: { Authorization: `Bearer ${bearer}`, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
     const value = await response.json().catch(() => ({}))
     if (!response.ok) {
       const code = typeof value?.code === 'string' && value.code ? value.code : 'AUTHENTICATED_REQUEST_FAILED'
-      fail(`Authenticated request failed with HTTP ${response.status}${value?.error ? `: ${value.error}` : ''}`, code)
+      fail(`Authenticated ${phase} failed with HTTP ${response.status}${value?.error ? `: ${value.error}` : ''}`, code)
     }
     return { status: response.status, value }
+  } catch (error) {
+    if (error?.name === 'AbortError' || /aborted/i.test(String(error?.message || ''))) {
+      fail(`Authenticated ${phase} timed out after ${timeoutMs}ms`, 'AUTHENTICATED_REQUEST_TIMEOUT')
+    }
+    throw error
   } finally { clearTimeout(timer) }
 }
 
 class CoreAuthority {
   constructor(baseUrl, bearer) { this.base = baseUrl.replace(/\/$/, ''); this.bearer = bearer }
   async sample(hostEvidenceDigest) {
-    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations/samples`, { method: 'POST', bearer: this.bearer, body: { hostEvidenceDigest } })).value
+    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations/samples`, { method: 'POST', bearer: this.bearer, body: { hostEvidenceDigest }, phase: 'cold-sample' })).value
   }
   async issue(binding) {
-    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations`, { method: 'POST', bearer: this.bearer, body: binding })).value
+    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations`, { method: 'POST', bearer: this.bearer, body: binding, phase: 'cold-authorization' })).value
   }
   async consume(id, bindingDigest) {
-    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations/${encodeURIComponent(id)}/consume`, { method: 'POST', bearer: this.bearer, body: { bindingDigest } })).value
+    return (await jsonRequest(`${this.base}/api/phase5h/venice-maintenance-activation/authorizations/${encodeURIComponent(id)}/consume`, { method: 'POST', bearer: this.bearer, body: { bindingDigest }, phase: 'cold-consume' })).value
   }
   async provider(providerId, instanceId) {
-    return (await jsonRequest(`${this.base}/api/capability-providers/v1/providers/${encodeURIComponent(providerId)}/instances/${encodeURIComponent(instanceId)}`, { bearer: this.bearer })).value?.provider
+    return (await jsonRequest(`${this.base}/api/capability-providers/v1/providers/${encodeURIComponent(providerId)}/instances/${encodeURIComponent(instanceId)}`, { bearer: this.bearer, phase: 'provider-read' })).value?.provider
   }
 }
 
