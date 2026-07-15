@@ -125,9 +125,17 @@ try {
   if ($scopes -contains 'eva-desktop' -or [string]$session.authContext.mode -eq 'eva-desktop' -or [string]$session.mode -eq 'eva-desktop') {
     throw 'Claimed session is desktop-scoped; refusing to continue.'
   }
+  $exactActionAccepted = [string]$session.trust.level -eq 'verified_action' -and
+    [string]$session.trust.action.key -eq $actionKey
+  $buildAuthorityExpiry = [DateTimeOffset]::MinValue
+  $buildAuthorityExpiryValid = [DateTimeOffset]::TryParse(
+    [string]$session.trust.buildAuthority.expiresAt,
+    [ref]$buildAuthorityExpiry
+  )
+  $buildAuthorityAccepted = [bool]$session.trust.buildAuthority.active -and
+    $buildAuthorityExpiryValid -and $buildAuthorityExpiry -gt [DateTimeOffset]::UtcNow
   if ([string]$session.user.id -ne 'user-jun' -or [string]$session.user.type -ne 'human' -or
-      [string]$session.trust.level -ne 'verified_action' -or [bool]$session.trust.needsReverification -or
-      [string]$session.trust.action.key -ne $actionKey) {
+      [bool]$session.trust.needsReverification -or (-not $exactActionAccepted -and -not $buildAuthorityAccepted)) {
     throw 'Core returned mismatched normal human-web activation claims after handoff claim.'
   }
 
