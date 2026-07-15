@@ -8,8 +8,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $actionKey = 'venice-media-local:activate-release-slot'
-$connector = $null; $status = $null; $authorization = $null; $agentCredential = $null
+$authorization = $null; $agentCredential = $null
 $process = $null; $mutex = $null; $ownsMutex = $false
+$handoff = $null; $claim = $null
 
 Add-Type -TypeDefinition @'
 using System;
@@ -42,32 +43,91 @@ try {
   try { $ownsMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { throw 'An abandoned cold-activation operator was detected; inspect and clear transition state manually.' }
   if (-not $ownsMutex) { throw 'Another cold-activation operator is running.' }
 
-  $request = [ordered]@{ desktopInstanceId='venice-media-local-phase5h-ripper'; purpose='verify-action'; intent=[ordered]@{ key=$actionKey; label='Authorize one exact Venice Media Local cold release-slot activation'; method='POST'; path='/api/phase5h/venice-maintenance-activation/authorizations' }; verificationDurationMs=300000 }
-  $connector = Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/auth/desktop-connector" -ContentType 'application/json' -Body ($request | ConvertTo-Json -Depth 5 -Compress)
-  if ([string]::IsNullOrWhiteSpace([string]$connector.connectorToken) -or [string]::IsNullOrWhiteSpace([string]$connector.connectorUrl)) { throw 'Core did not return a usable verified-action connector.' }
-  Write-Output ([ordered]@{status='verification-required';action=$actionKey;handoff='default-browser'}|ConvertTo-Json -Compress)
-  if ($OpenVerificationBrowser) { Start-Process ([string]$connector.connectorUrl) }
-  $deadline=[DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
-  do { $status=Invoke-RestMethod -Method Get -Uri "$coreBaseUrl/api/auth/desktop-connector/$($connector.connectorToken)/status"; if([string]$status.status-eq'verified'){break}; if([string]$status.status-in@('expired','denied','cancelled','unavailable')){throw "Verified action ended with status $($status.status)."}; Start-Sleep -Seconds 2 } while([DateTimeOffset]::UtcNow-lt$deadline)
-  if([string]$status.status-ne'verified'-or[string]::IsNullOrWhiteSpace([string]$status.token)-or[string]$status.trust.level-ne'verified_action'-or[string]$status.trust.action.key-ne$actionKey){throw 'Core did not return the exact verified action.'}
-  $authorization=[string]$status.token
-  $session=Invoke-RestMethod -Method Get -Uri "$coreBaseUrl/api/auth/session" -Headers @{Authorization="Bearer $authorization"}
-  if([string]$session.user.id-ne'user-jun'-or[string]$session.user.type-ne'human'-or[string]$session.trust.level-ne'verified_action'-or[bool]$session.trust.needsReverification-or[string]$session.trust.action.key-ne$actionKey){throw 'Core returned mismatched cold-activation claims.'}
-  $agentCredential=[Phase5HCredentialReader]::ReadGeneric('agent-control-token.venice-media-local')
-  $nodeScript=Join-Path $PSScriptRoot 'phase5h-cold-activation-windows.mjs'
-  $start=New-Object Diagnostics.ProcessStartInfo
-  $start.FileName=(Get-Command node).Source; $start.Arguments="`"$nodeScript`" `"$ConfigPath`""; $start.UseShellExecute=$false; $start.CreateNoWindow=$true; $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
-  $process=New-Object Diagnostics.Process; $process.StartInfo=$start
-  if(-not$process.Start()){throw 'Failed to start the cold-activation engine.'}
-  $transport=[ordered]@{coreAuthorization=$authorization;agentControlCredential=$agentCredential}|ConvertTo-Json -Compress
-  $process.StandardInput.WriteLine($transport); $process.StandardInput.Close()
-  $transport=$null; $authorization=$null; $agentCredential=$null; $session=$null; $status=$null; $connector=$null
-  if(-not$process.WaitForExit(180000)){throw 'Cold-activation engine exceeded its bounded runtime.'}
-  $output=$process.StandardOutput.ReadToEnd(); $diagnostic=$process.StandardError.ReadToEnd()
-  if($process.ExitCode-ne0){throw "Cold activation failed closed. $diagnostic"}
+  # Human-web operator handoff only.
+  $handoff = Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/phase5h/venice-maintenance-activation/operator-handoff/begin" -ContentType 'application/json' -Body '{}'
+  if ([string]::IsNullOrWhiteSpace([string]$handoff.handoffId) -or [string]::IsNullOrWhiteSpace([string]$handoff.userCode) -or [string]::IsNullOrWhiteSpace([string]$handoff.pollSecret)) {
+    throw 'Core did not return a usable operator handoff.'
+  }
+  if ([string]$handoff.actionKey -ne $actionKey) { throw 'Core returned a mismatched operator handoff action.' }
+  $browserBase = $coreBaseUrl
+  if ($browserBase -match '^https?://[^/]+:\d+$') {
+    # Prefer same origin web app path from handoff when provided.
+  }
+  $browserUrl = if ([string]$handoff.browserPath) { "$browserBase$($handoff.browserPath)" } else { "$browserBase/settings?phase5hVeniceActivationHandoff=$([uri]::EscapeDataString([string]$handoff.userCode))" }
+  Write-Output ([ordered]@{
+    status = 'verification-required'
+    action = $actionKey
+    handoff = 'normal-human-web-session'
+    userCode = [string]$handoff.userCode
+    browserUrl = $browserUrl
+    note = 'Approve exactly venice-media-local:activate-release-slot in the Core web app, then complete the operator handoff with the displayed user code.'
+  } | ConvertTo-Json -Compress)
+  if ($OpenVerificationBrowser) { Start-Process $browserUrl }
+
+  $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    $claim = Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/phase5h/venice-maintenance-activation/operator-handoff/claim" `
+      -ContentType 'application/json' -Body (@{ handoffId = [string]$handoff.handoffId; pollSecret = [string]$handoff.pollSecret } | ConvertTo-Json -Compress)
+    if ([string]$claim.status -eq 'claimed') { break }
+    if ([string]$claim.status -notin @('pending')) { throw "Operator handoff ended with status $($claim.status)." }
+    Start-Sleep -Seconds 2
+  } while ([DateTimeOffset]::UtcNow -lt $deadline)
+
+  if ([string]$claim.status -ne 'claimed' -or [string]::IsNullOrWhiteSpace([string]$claim.token)) {
+    throw 'Timed out waiting for the normal human-web operator handoff claim.'
+  }
+  if ([string]$claim.actionKey -ne $actionKey) { throw 'Claimed operator handoff action mismatch.' }
+
+  $authorization = [string]$claim.token
+  $session = Invoke-RestMethod -Method Get -Uri "$coreBaseUrl/api/auth/session" -Headers @{ Authorization = "Bearer $authorization" }
+  $scopes = @($session.authContext.scopes)
+  if (-not $scopes) { $scopes = @($session.scopes) }
+  if ($scopes -contains 'eva-desktop' -or [string]$session.authContext.mode -eq 'eva-desktop' -or [string]$session.mode -eq 'eva-desktop') {
+    throw 'Claimed session is desktop-scoped; refusing to continue.'
+  }
+  if ([string]$session.user.id -ne 'user-jun' -or [string]$session.user.type -ne 'human' -or
+      [string]$session.trust.level -ne 'verified_action' -or [bool]$session.trust.needsReverification -or
+      [string]$session.trust.action.key -ne $actionKey) {
+    throw 'Core returned mismatched normal human-web activation claims after handoff claim.'
+  }
+
+  # Preflight: first cold-sample must succeed on the human-web token before host mutation.
+  $preflightDigest = -join ((1..64) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+  try {
+    Invoke-RestMethod -Method Post -Uri "$coreBaseUrl/api/phase5h/venice-maintenance-activation/authorizations/samples" `
+      -Headers @{ Authorization = "Bearer $authorization" } -ContentType 'application/json' `
+      -Body (@{ hostEvidenceDigest = $preflightDigest } | ConvertTo-Json -Compress) | Out-Null
+  } catch {
+    $code = $null
+    try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+    throw "Human-web cold-sample preflight failed before activation (HTTP $code). No host mutation was attempted."
+  }
+
+  $agentCredential = [Phase5HCredentialReader]::ReadGeneric('agent-control-token.venice-media-local')
+  $nodeScript = Join-Path $PSScriptRoot 'phase5h-cold-activation-windows.mjs'
+  $start = New-Object Diagnostics.ProcessStartInfo
+  $start.FileName = (Get-Command node).Source
+  $start.Arguments = "`"$nodeScript`" `"$ConfigPath`""
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardInput = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  $process = New-Object Diagnostics.Process
+  $process.StartInfo = $start
+  if (-not $process.Start()) { throw 'Failed to start the cold-activation engine.' }
+  $transport = [ordered]@{ coreAuthorization = $authorization; agentControlCredential = $agentCredential } | ConvertTo-Json -Compress
+  $process.StandardInput.WriteLine($transport)
+  $process.StandardInput.Close()
+  $transport = $null; $authorization = $null; $agentCredential = $null; $session = $null; $claim = $null; $handoff = $null
+  if (-not $process.WaitForExit(180000)) { throw 'Cold-activation engine exceeded its bounded runtime.' }
+  $output = $process.StandardOutput.ReadToEnd()
+  $diagnostic = $process.StandardError.ReadToEnd()
+  if ($process.ExitCode -ne 0) { throw "Cold activation failed closed. $diagnostic" }
   Write-Output $output.Trim()
 } finally {
-  $authorization=$null; $agentCredential=$null; $status=$null; $connector=$null
-  if($null-ne$process){$process.Dispose()}
-  if($ownsMutex-and$null-ne$mutex){$mutex.ReleaseMutex()}; if($null-ne$mutex){$mutex.Dispose()}
+  $authorization = $null; $agentCredential = $null; $claim = $null; $handoff = $null
+  if ($null -ne $process) { $process.Dispose() }
+  if ($ownsMutex -and $null -ne $mutex) { $mutex.ReleaseMutex() }
+  if ($null -ne $mutex) { $mutex.Dispose() }
 }
