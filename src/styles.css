@@ -758,6 +758,44 @@ button {
   aspect-ratio: auto;
 }
 
+.reference-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.reference-section {
+  display: grid;
+  gap: 8px;
+}
+
+.reference-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.reference-hint {
+  font-weight: 400;
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+}
+
+/* Reference video/audio slots are compact file pickers, not image drop zones:
+   override the image-oriented min-height/aspect-ratio so they read as inputs. */
+.reference-section .edit-source-row .source-input {
+  min-height: 64px;
+  aspect-ratio: auto;
+  padding: 10px;
+}
+
+.reference-section .edit-source-row .source-input.loaded {
+  padding: 10px;
+}
+
 .source-input.dragging {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--surface) 82%, var(--accent) 18%);

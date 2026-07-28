@@ -284,7 +284,18 @@ Generic command:
 npm run tauri -- dev
 ```
 
-## Build Windows Installer
+## Build Windows Release
+
+From Command Prompt, build the Windows installer and portable executable with:
+
+```bat
+Build-Portable.bat
+```
+
+The batch file can be launched from any working directory and returns a nonzero
+exit code if the build fails.
+
+From PowerShell, the underlying build command is:
 
 ```powershell
 .\Build-Windows.ps1
@@ -306,7 +317,7 @@ src-tauri\tauri.version.conf.json
 That file is ignored by git. It currently uses the fixed version from `package.json`, shaped like:
 
 ```text
-26.7.6
+26.7.27
 ```
 
 The build timestamp and git state are recorded in the generated bundle descriptions, not in the version or artifact filename. Commit first for real public release installers so that metadata identifies a commit rather than a dirty tree.

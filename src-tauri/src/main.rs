@@ -300,6 +300,15 @@ struct QueueMediaRequest {
     lyrics_prompt: Option<String>,
     #[serde(alias = "lyrics_optimizer")]
     lyrics_optimizer: Option<bool>,
+    /// Reference-to-video (R2V) multimodal inputs. Each is an ordered list of
+    /// URLs or data-URLs; order maps to the `<Image N>` / `<Video N>` /
+    /// `<Audio N>` prompt tokens. See Seedance 2.0 guide.
+    #[serde(default, alias = "reference_image_urls")]
+    reference_image_urls: Option<Vec<String>>,
+    #[serde(default, alias = "reference_video_urls")]
+    reference_video_urls: Option<Vec<String>>,
+    #[serde(default, alias = "reference_audio_urls")]
+    reference_audio_urls: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2748,6 +2757,15 @@ fn video_controls_from_constraints(
         "rawCapabilities": capabilities
     });
 
+    // Reference-to-video (R2V) detection + per-model reference caps. The catalog
+    // tags R2V models as model_type "image-to-video", so the id is authoritative.
+    let is_r2v = is_reference_to_video_model(id);
+    let (max_ref_images, max_ref_videos, max_ref_audios) = video_reference_limits(id);
+    controls["isReferenceToVideo"] = json!(is_r2v);
+    controls["maxReferenceImages"] = json!(max_ref_images);
+    controls["maxReferenceVideos"] = json!(max_ref_videos);
+    controls["maxReferenceAudios"] = json!(max_ref_audios);
+
     if let Some(default_duration) = video_default_duration(constraints, capabilities) {
         controls["defaultDuration"] = json!(default_duration);
     }
@@ -4443,6 +4461,52 @@ fn multi_edit_image_input(source_image: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Whether a video model id is a reference-to-video (R2V) variant. The Venice
+/// catalog reports `model_type: "image-to-video"` for R2V models, so the id is
+/// the only reliable signal.
+fn is_reference_to_video_model(model_id: &str) -> bool {
+    model_id.contains("reference-to-video")
+}
+
+/// Per-model reference-input caps for reference-to-video models. The Venice
+/// catalog does not expose these counts; they come from the Seedance 2.0 guide
+/// and observed limits for other R2V families. Returns `(images, videos, audio)`.
+/// Non-R2V models return `(0, 0, 0)`.
+fn video_reference_limits(model_id: &str) -> (usize, usize, usize) {
+    if !is_reference_to_video_model(model_id) {
+        return (0, 0, 0);
+    }
+    if model_id.starts_with("seedance-2-0-reference-to-video")
+        || model_id.starts_with("seedance-2-0-fast-reference-to-video")
+    {
+        (9, 3, 3)
+    } else {
+        // wan-2-7-reference-to-video, happyhorse-*-reference-to-video, and any
+        // unknown R2V model default to a conservative 3 images / 1 video / 0 audio.
+        (3, 1, 0)
+    }
+}
+
+/// Trims and de-drops-empty entries from a reference URL list, capping the
+/// length at `max`. Returns `None` if the input was empty/absent or `max == 0`.
+fn collect_reference_urls(raw: Option<Vec<String>>, max: usize) -> Option<Vec<String>> {
+    if max == 0 {
+        return None;
+    }
+    let values = raw?;
+    let cleaned: Vec<String> = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .take(max)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn decode_data_url(value: &str) -> Result<(Vec<u8>, String), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -5350,6 +5414,21 @@ async fn queue_video_inner(
     {
         body["video_url"] = json!(value);
     }
+    {
+        let (max_images, max_videos, max_audios) = video_reference_limits(&request.model);
+        if let Some(images) = collect_reference_urls(request.reference_image_urls.clone(), max_images)
+        {
+            body["reference_image_urls"] = json!(images);
+        }
+        if let Some(videos) = collect_reference_urls(request.reference_video_urls.clone(), max_videos)
+        {
+            body["reference_video_urls"] = json!(videos);
+        }
+        if let Some(audios) = collect_reference_urls(request.reference_audio_urls.clone(), max_audios)
+        {
+            body["reference_audio_urls"] = json!(audios);
+        }
+    }
     if let Some(value) = request
         .duration
         .filter(|value| !value.trim().is_empty())
@@ -5851,7 +5930,17 @@ fn shared_execution_input(input: &venice_provider_kernel::ExecutionInput) -> Res
             );
         }
         "media.video.generate" if !data_urls.is_empty() => {
-            object.insert("sourceImage".into(), json!(data_urls.remove(0)));
+            // Route reference-to-video (R2V) artifacts into the reference-image
+            // array; plain I2V keeps the single first-frame sourceImage path.
+            let model = object
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if is_reference_to_video_model(model) {
+                object.insert("referenceImageUrls".into(), json!(data_urls));
+            } else {
+                object.insert("sourceImage".into(), json!(data_urls.remove(0)));
+            }
         }
         "media.transcribe" => {
             object.insert(
@@ -7930,6 +8019,111 @@ mod tests {
             retrieve.download_url.as_deref(),
             Some("https://example.com/result")
         );
+    }
+
+    #[test]
+    fn video_request_deserializes_reference_arrays_in_camel_and_snake_case() {
+        let camel: QueueMediaRequest = serde_json::from_value(json!({
+            "model": "seedance-2-0-reference-to-video",
+            "prompt": "Refer to <Subject 1> in <Image 1>",
+            "referenceImageUrls": ["data:image/png;base64,aaa", "data:image/png;base64,bbb"],
+            "referenceVideoUrls": ["https://example.com/v.mp4"],
+            "referenceAudioUrls": ["https://example.com/a.mp3"]
+        }))
+        .expect("camelCase reference arrays should deserialize");
+        assert_eq!(
+            camel
+                .reference_image_urls
+                .as_deref()
+                .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["data:image/png;base64,aaa", "data:image/png;base64,bbb"])
+        );
+        assert_eq!(
+            camel
+                .reference_video_urls
+                .as_deref()
+                .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["https://example.com/v.mp4"])
+        );
+        assert_eq!(
+            camel
+                .reference_audio_urls
+                .as_deref()
+                .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["https://example.com/a.mp3"])
+        );
+
+        let snake: QueueMediaRequest = serde_json::from_value(json!({
+            "model": "seedance-2-0-reference-to-video",
+            "prompt": "Refer to <Image 1>",
+            "reference_image_urls": ["https://example.com/a.png"]
+        }))
+        .expect("snake_case reference aliases should deserialize");
+        assert_eq!(
+            snake
+                .reference_image_urls
+                .as_deref()
+                .map(|v| v.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["https://example.com/a.png"])
+        );
+        assert!(snake.reference_video_urls.is_none());
+        assert!(snake.reference_audio_urls.is_none());
+    }
+
+    #[test]
+    fn reference_to_video_detection_and_limits_match_model_family() {
+        // Detection is by id; the catalog tags R2V as model_type "image-to-video".
+        assert!(is_reference_to_video_model("seedance-2-0-reference-to-video"));
+        assert!(is_reference_to_video_model("seedance-2-0-fast-reference-to-video"));
+        assert!(is_reference_to_video_model("wan-2-7-reference-to-video"));
+        assert!(is_reference_to_video_model("happyhorse-1-1-reference-to-video"));
+        assert!(!is_reference_to_video_model("seedance-2-0-image-to-video"));
+        assert!(!is_reference_to_video_model("wan-2-7-text-to-video"));
+
+        // Seedance R2V family: 9 images / 3 videos / 3 audios.
+        assert_eq!(
+            video_reference_limits("seedance-2-0-reference-to-video"),
+            (9, 3, 3)
+        );
+        assert_eq!(
+            video_reference_limits("seedance-2-0-fast-reference-to-video"),
+            (9, 3, 3)
+        );
+        // Other R2V families and unknown R2V models default conservatively.
+        assert_eq!(video_reference_limits("wan-2-7-reference-to-video"), (3, 1, 0));
+        assert_eq!(
+            video_reference_limits("happyhorse-1-1-reference-to-video"),
+            (3, 1, 0)
+        );
+        assert_eq!(
+            video_reference_limits("some-future-reference-to-video"),
+            (3, 1, 0)
+        );
+        // Non-R2V models expose no reference slots.
+        assert_eq!(video_reference_limits("seedance-2-0-image-to-video"), (0, 0, 0));
+        assert_eq!(video_reference_limits("seedance-2-0-text-to-video"), (0, 0, 0));
+    }
+
+    #[test]
+    fn collect_reference_urls_trims_drops_empties_and_caps_to_model_limit() {
+        // Seedance allows 9 images: trimming + empty-drop, then cap at 9.
+        let nine: Vec<String> = (0..12).map(|i| format!("https://e.com/{}.png", i)).collect();
+        let capped = collect_reference_urls(Some(nine), 9).expect("non-empty within cap");
+        assert_eq!(capped.len(), 9);
+
+        // Whitespace-only and empty entries are removed.
+        let messy = collect_reference_urls(
+            Some(vec!["  https://e.com/a.png  ".to_string(), "".to_string(), "   ".to_string()]),
+            9,
+        )
+        .expect("one valid entry remains");
+        assert_eq!(messy, vec!["https://e.com/a.png".to_string()]);
+
+        // All-empty collapses to None so the field is omitted from the request body.
+        assert!(collect_reference_urls(Some(vec!["".to_string(), "  ".to_string()]), 9).is_none());
+        assert!(collect_reference_urls(None, 9).is_none());
+        // max == 0 (non-R2V model) never yields reference arrays.
+        assert!(collect_reference_urls(Some(vec!["https://e.com/a.png".to_string()]), 0).is_none());
     }
 
     #[test]

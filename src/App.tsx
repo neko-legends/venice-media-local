@@ -261,6 +261,12 @@ const STORAGE_THEME = 'veniceMediaLocal:theme:v1'
 const STORAGE_MUSIC_DURATION = 'veniceMediaLocal:musicDurationSeconds:v1'
 const STORAGE_SFX_DURATION = 'veniceMediaLocal:sfxDurationSeconds:v1'
 const EDIT_SOURCE_LIMIT = 3
+// Conservative upper bounds for the reference-to-video (R2V) slot arrays. The
+// actual per-model cap is read from controls.maxReference* and the arrays are
+// resized when the selected model changes; these are just the initial sizes.
+const VIDEO_REFERENCE_IMAGE_LIMIT = 9
+const VIDEO_REFERENCE_VIDEO_LIMIT = 3
+const VIDEO_REFERENCE_AUDIO_LIMIT = 3
 const MAX_RECENT_MODELS = 5
 const DIEM_POLL_MS = 3 * 60 * 1000
 const IMAGE_ASPECT_OPTIONS = ['1:1', '4:3', '3:4', '16:9', '9:16']
@@ -803,6 +809,11 @@ function controlBool(model: ModelRecord | undefined, key: string, fallback: bool
   return typeof value === 'boolean' ? value : fallback
 }
 
+function controlNumber(model: ModelRecord | undefined, key: string, fallback: number): number {
+  const value = numberFromValue(model?.controls?.[key])
+  return value === null ? fallback : value
+}
+
 function durationControlNumber(model: ModelRecord | undefined, key: string, fallback: number): number {
   const duration = model?.controls?.durationSeconds
   const value = duration && typeof duration === 'object'
@@ -1206,6 +1217,12 @@ export function App() {
   const [hideWatermark, setHideWatermark] = useState(true)
 
   const [sourceImage, setSourceImage] = useState('')
+  // Reference-to-video (R2V) multimodal inputs. Order maps to the <Image N>,
+  // <Video N>, <Audio N> prompt tokens consumed by seedance-2-0-reference-to-video
+  // and the other *-reference-to-video models.
+  const [referenceImages, setReferenceImages] = useState<string[]>(() => Array(VIDEO_REFERENCE_IMAGE_LIMIT).fill(''))
+  const [referenceVideos, setReferenceVideos] = useState<string[]>(() => Array(VIDEO_REFERENCE_VIDEO_LIMIT).fill(''))
+  const [referenceAudios, setReferenceAudios] = useState<string[]>(() => Array(VIDEO_REFERENCE_AUDIO_LIMIT).fill(''))
   const [editSourceImages, setEditSourceImages] = useState<string[]>(() => Array(EDIT_SOURCE_LIMIT).fill(''))
   const [editAspectRatio, setEditAspectRatio] = useState('1:1')
   const [editResolution, setEditResolution] = useState('')
@@ -1582,7 +1599,27 @@ export function App() {
   const currentImageModel = imageModels.find((model) => model.id === imageModel)
   const currentEditModel = editModels.find((model) => model.id === editModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
+  const isReferenceToVideo = controlBool(currentVideoModel, 'isReferenceToVideo', false)
+  const maxReferenceImages = controlNumber(currentVideoModel, 'maxReferenceImages', isReferenceToVideo ? 3 : 0)
+  const maxReferenceVideos = controlNumber(currentVideoModel, 'maxReferenceVideos', isReferenceToVideo ? 1 : 0)
+  const maxReferenceAudios = controlNumber(currentVideoModel, 'maxReferenceAudios', 0)
+
+  // Resize the R2V reference arrays to match the selected model's caps when the
+  // model changes. Preserves in-order entries and pads/truncates to the cap.
+  useEffect(() => {
+    const resize = (values: string[], cap: number): string[] => {
+      if (values.length === cap) return values
+      const next = values.slice(0, cap)
+      while (next.length < cap) next.push('')
+      return next
+    }
+    setReferenceImages((existing) => resize(existing, maxReferenceImages))
+    setReferenceVideos((existing) => resize(existing, maxReferenceVideos))
+    setReferenceAudios((existing) => resize(existing, maxReferenceAudios))
+  }, [maxReferenceImages, maxReferenceVideos, maxReferenceAudios])
+
   const currentMusicModel = musicModels.find((model) => model.id === musicModel)
+
   const currentSfxModel = sfxModels.find((model) => model.id === sfxModel)
   const currentVoiceModel = voiceModels.find((model) => model.id === voiceModel)
   const currentTranscribeModel = transcribeModels.find((model) => model.id === transcribeModel)
@@ -2332,7 +2369,6 @@ export function App() {
     if (savedPath) {
       rememberSaveLocation(savedPath)
       setStatus(`Saved ${format.toUpperCase()}: ${savedPath}`)
-      await openSavedFileFolder(savedPath)
     }
   }
 
@@ -2389,6 +2425,50 @@ export function App() {
     }
   }
 
+  function setReferenceImage(index: number, dataUrl: string) {
+    setReferenceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? dataUrl : source)))
+  }
+
+  async function loadReferenceImage(index: number, file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    setReferenceImage(index, dataUrl)
+  }
+
+  function clearReferenceImage(index: number) {
+    setReferenceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? '' : source)))
+  }
+
+  async function flipReferenceImage(index: number) {
+    const source = referenceImages[index]
+    if (!source) return
+    if (!source.startsWith('data:image/')) {
+      setError('Only loaded image data can be flipped')
+      setStatus('Needs attention')
+      setLastActionMs(null)
+      return
+    }
+    const flipped = await runAction('Flipping image', () => flipImageDataUrlHorizontal(source))
+    if (flipped) setReferenceImage(index, flipped)
+  }
+
+  async function loadReferenceVideo(index: number, file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    setReferenceVideos((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? dataUrl : source)))
+  }
+
+  function clearReferenceVideo(index: number) {
+    setReferenceVideos((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? '' : source)))
+  }
+
+  async function loadReferenceAudio(index: number, file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    setReferenceAudios((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? dataUrl : source)))
+  }
+
+  function clearReferenceAudio(index: number) {
+    setReferenceAudios((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? '' : source)))
+  }
+
   function sendResultToEdit(result: MediaResult) {
     setEditSourceImage(0, result.dataUrl)
     setMode('edit')
@@ -2419,14 +2499,33 @@ export function App() {
     const variantCount = clampVariantCount(videoVariants, MAX_VIDEO_VARIANTS)
     const batchId = `video-${Date.now()}-${Math.random().toString(16).slice(2)}`
     const batchTitle = variantCount > 1 ? `Videos · ${variantCount} variants` : 'Video'
-    const request = {
+
+    // Reference-to-video (R2V) models take ordered reference arrays instead of a
+    // single first-frame image. Plain I2V/T2V keeps the sourceImage path.
+    const referenceImageUrls = referenceImages.map((value) => value.trim()).filter(Boolean)
+    const referenceVideoUrls = referenceVideos.map((value) => value.trim()).filter(Boolean)
+    const referenceAudioUrls = referenceAudios.map((value) => value.trim()).filter(Boolean)
+    if (isReferenceToVideo && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0) {
+      setError('Add at least one reference image or video for Reference-to-Video')
+      setStatus('Needs attention')
+      setLastActionMs(null)
+      return
+    }
+
+    const request: Record<string, unknown> = {
       model: videoModel,
       prompt,
       negativePrompt,
-      sourceImage,
       duration: selectedVideoDuration || undefined,
       resolution: selectedVideoResolution || undefined,
       aspectRatio: selectedVideoAspectRatio || undefined,
+    }
+    if (isReferenceToVideo) {
+      if (referenceImageUrls.length > 0) request.referenceImageUrls = referenceImageUrls
+      if (referenceVideoUrls.length > 0) request.referenceVideoUrls = referenceVideoUrls
+      if (referenceAudioUrls.length > 0) request.referenceAudioUrls = referenceAudioUrls
+    } else {
+      request.sourceImage = sourceImage
     }
 
     for (let variantIndex = 1; variantIndex <= variantCount; variantIndex += 1) {
@@ -2434,8 +2533,8 @@ export function App() {
       enqueueJob('video', label, async () => {
         const startedAt = Date.now()
         const queued = await call<QueueResult>('queue_video', { request })
-        rememberModelUse('video', request.model)
-        const result = mediaResultWithMetadata(await waitForQueuedMedia('video', queued, request.model), {
+        rememberModelUse('video', videoModel)
+        const result = mediaResultWithMetadata(await waitForQueuedMedia('video', queued, videoModel), {
           variantIndex,
           variantCount,
         })
@@ -2804,7 +2903,88 @@ export function App() {
             {mode === 'video' && (
               <form onSubmit={queueVideo} className="tool-form">
                 <ModelSelect label="Model" value={videoModel} onChange={setVideoModel} models={videoModels} recentModelIds={recentModels.video} />
-                <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />
+                {isReferenceToVideo ? (
+                  <div className="reference-panel">
+                    {maxReferenceImages > 0 && (
+                      <div className="reference-section">
+                        <div className="reference-section-head">
+                          <span>Reference images (up to {maxReferenceImages})</span>
+                          <small className="reference-hint">Prompt tokens &lt;Image 1&gt; … &lt;Image {maxReferenceImages}&gt; match slot order</small>
+                        </div>
+                        <div className="edit-source-layout">
+                          <SourcePicker
+                            className="edit-source-main"
+                            label="Image 1"
+                            source={referenceImages[0] ?? ''}
+                            onFile={(file) => loadReferenceImage(0, file)}
+                            onSource={(value) => setReferenceImage(0, value)}
+                            onFlip={() => flipReferenceImage(0)}
+                            onClear={() => clearReferenceImage(0)}
+                          />
+                          {maxReferenceImages > 1 && (
+                            <div className="edit-source-row">
+                              {Array.from({ length: maxReferenceImages - 1 }, (_, offset) => offset + 1).map((index) => (
+                                <SourcePicker
+                                  key={index}
+                                  label={`Image ${index + 1}`}
+                                  source={referenceImages[index] ?? ''}
+                                  onFile={(file) => loadReferenceImage(index, file)}
+                                  onSource={(value) => setReferenceImage(index, value)}
+                                  onFlip={() => flipReferenceImage(index)}
+                                  onClear={() => clearReferenceImage(index)}
+                                />
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {maxReferenceVideos > 0 && (
+                      <div className="reference-section">
+                        <div className="reference-section-head">
+                          <span>Reference videos (up to {maxReferenceVideos})</span>
+                          <small className="reference-hint">Use &lt;Video 1&gt; … in the prompt</small>
+                        </div>
+                        <div className="edit-source-row">
+                          {Array.from({ length: maxReferenceVideos }, (_, index) => (
+                            <MediaSlot
+                              key={index}
+                              label={`Video ${index + 1}`}
+                              accept="video/*"
+                              icon={Video}
+                              source={referenceVideos[index] ?? ''}
+                              onFile={(file) => loadReferenceVideo(index, file)}
+                              onClear={() => clearReferenceVideo(index)}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {maxReferenceAudios > 0 && (
+                      <div className="reference-section">
+                        <div className="reference-section-head">
+                          <span>Reference audio (up to {maxReferenceAudios})</span>
+                          <small className="reference-hint">Use &lt;Audio 1&gt; … ; audio cannot be the only reference</small>
+                        </div>
+                        <div className="edit-source-row">
+                          {Array.from({ length: maxReferenceAudios }, (_, index) => (
+                            <MediaSlot
+                              key={index}
+                              label={`Audio ${index + 1}`}
+                              accept="audio/*"
+                              icon={Volume2}
+                              source={referenceAudios[index] ?? ''}
+                              onFile={(file) => loadReferenceAudio(index, file)}
+                              onClear={() => clearReferenceAudio(index)}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />
+                )}
                 <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />
                 <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
                 <div className="control-grid">
@@ -3777,6 +3957,70 @@ function SourcePicker({
       )}
     </div>
   )
+}
+
+function MediaSlot({
+  className,
+  label,
+  accept,
+  icon: Icon,
+  source,
+  onFile,
+  onClear,
+}: {
+  className?: string
+  label: string
+  accept: string
+  icon: LucideIcon
+  source: string
+  onFile: (file: File) => void | Promise<void>
+  onClear?: () => void
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null)
+
+  function handleInput(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (file) void onFile(file)
+    event.currentTarget.value = ''
+  }
+
+  const fileName = deriveMediaFileName(source)
+
+  return (
+    <div className={classNames('source-picker', className)}>
+      <input ref={inputRef} className="source-file-input" type="file" accept={accept} onChange={handleInput} />
+      <div className={classNames('source-input', source && 'loaded')}>
+        <span className={classNames('source-label', source && 'loaded')}>
+          <Icon size={18} />
+          {label}
+          <small>{fileName || 'Drag/Drop/Browse'}</small>
+        </span>
+      </div>
+      <button className="icon-button compact source-browse" type="button" onClick={() => inputRef.current?.click()} title={`Browse for ${label}`}>
+        <FolderOpen size={14} />
+      </button>
+      {source && onClear && (
+        <button className="icon-button compact source-clear" type="button" onClick={onClear} title={`Clear ${label}`}>
+          <Trash2 size={14} />
+        </button>
+      )}
+    </div>
+  )
+}
+
+function deriveMediaFileName(source: string): string {
+  const trimmed = source.trim()
+  if (!trimmed) return ''
+  if (trimmed.startsWith('data:')) {
+    const mime = trimmed.slice(5).split(';')[0] || 'file'
+    return `${mime.split('/')[1] ?? mime} (pasted)`
+  }
+  try {
+    const url = new URL(trimmed)
+    return decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() ?? trimmed)
+  } catch {
+    return trimmed.split(/[\\/]/).pop() ?? trimmed
+  }
 }
 
 function SubmitButton({
