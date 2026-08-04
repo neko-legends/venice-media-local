@@ -5016,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "venice-media-local"
-version = "26.7.27"
+version = "26.8.4"
 dependencies = [
  "aes-gcm",
  "async-trait",

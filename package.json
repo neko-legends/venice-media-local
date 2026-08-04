@@ -1,7 +1,7 @@
 {
   "name": "venice-media-local",
   "private": true,
-  "version": "26.7.28",
+  "version": "26.8.4",
   "license": "MIT",
   "type": "module",
   "scripts": {

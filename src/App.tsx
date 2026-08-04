@@ -657,8 +657,8 @@ function formatDate(value: string): string {
   return parsed.toLocaleString()
 }
 
-function videoModeSuffix(model: ModelRecord): string {
-  if (model.kind !== 'video') return ''
+function videoModeSuffix(model: ModelRecord | undefined): string {
+  if (!model || model.kind !== 'video') return ''
   const controls = model.controls ?? {}
   const haystack = [
     model.id,
@@ -1600,6 +1600,10 @@ export function App() {
   const currentEditModel = editModels.find((model) => model.id === editModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
   const isReferenceToVideo = controlBool(currentVideoModel, 'isReferenceToVideo', false)
+  // Text-to-video models cannot accept a source image; Venice rejects them with
+  // "image_url is not supported for text to video models". Detect via the same
+  // suffix logic used to label the model so the picker hides for T2V models.
+  const isTextToVideo = videoModeSuffix(currentVideoModel) === 'T2V'
   const maxReferenceImages = controlNumber(currentVideoModel, 'maxReferenceImages', isReferenceToVideo ? 3 : 0)
   const maxReferenceVideos = controlNumber(currentVideoModel, 'maxReferenceVideos', isReferenceToVideo ? 1 : 0)
   const maxReferenceAudios = controlNumber(currentVideoModel, 'maxReferenceAudios', 0)
@@ -1617,6 +1621,12 @@ export function App() {
     setReferenceVideos((existing) => resize(existing, maxReferenceVideos))
     setReferenceAudios((existing) => resize(existing, maxReferenceAudios))
   }, [maxReferenceImages, maxReferenceVideos, maxReferenceAudios])
+
+  // Drop any carried-over source image when a text-to-video model is selected:
+  // Venice rejects images on T2V models, so the image would be ignored anyway.
+  useEffect(() => {
+    if (isTextToVideo && sourceImage) setSourceImage('')
+  }, [isTextToVideo, sourceImage])
 
   const currentMusicModel = musicModels.find((model) => model.id === musicModel)
 
@@ -2524,7 +2534,9 @@ export function App() {
       if (referenceImageUrls.length > 0) request.referenceImageUrls = referenceImageUrls
       if (referenceVideoUrls.length > 0) request.referenceVideoUrls = referenceVideoUrls
       if (referenceAudioUrls.length > 0) request.referenceAudioUrls = referenceAudioUrls
-    } else {
+    } else if (!isTextToVideo) {
+      // Plain I2V/V2V models keep the source-image path. Text-to-video models
+      // cannot accept an image, so we omit it entirely.
       request.sourceImage = sourceImage
     }
 
@@ -2981,6 +2993,11 @@ export function App() {
                         </div>
                       </div>
                     )}
+                  </div>
+                ) : isTextToVideo ? (
+                  <div className="notice inline warning" role="note">
+                    <Wand2 size={16} />
+                    <span className="notice-message">This is a text-to-video model — images are not supported and won&apos;t be sent.</span>
                   </div>
                 ) : (
                   <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />

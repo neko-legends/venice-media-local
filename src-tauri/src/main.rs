@@ -4468,6 +4468,45 @@ fn is_reference_to_video_model(model_id: &str) -> bool {
     model_id.contains("reference-to-video")
 }
 
+/// Wan 2.7 Enhanced I2V is cataloged as image-to-video, but its queue schema
+/// accepts the source image only through `reference_image_urls`.
+fn uses_reference_image_urls_for_source(model_id: &str) -> bool {
+    model_id == "wan-2-7-enhanced-image-to-video"
+}
+
+fn add_video_source_image(body: &mut Value, model_id: &str, source_image: String) {
+    if uses_reference_image_urls_for_source(model_id) {
+        body["reference_image_urls"] = json!([source_image]);
+    } else {
+        body["image_url"] = json!(source_image);
+    }
+}
+
+/// Strips any source-image field added by [`add_video_source_image`] from the
+/// request body. Used to retry a video queue after Venice rejects a
+/// text-to-video model with "image_url is not supported for text to video
+/// models". Returns `true` if a field was actually removed.
+fn strip_video_source_image_for_retry(body: &mut Value) -> bool {
+    let removed_url = body.get("image_url").is_some();
+    body.as_object_mut().map(|object| {
+        object.remove("image_url");
+        // A Wan 2.7 Enhanced source image is routed through reference_image_urls;
+        // drop it too so the retry is purely text-driven.
+        if let Some(urls) = object.get_mut("reference_image_urls").and_then(Value::as_array_mut) {
+            urls.clear();
+        }
+    });
+    removed_url || body.get("reference_image_urls").and_then(|v| v.as_array()).is_some_and(|a| a.is_empty())
+}
+
+/// Whether an error string is the Venice rejection that bans source images on
+/// text-to-video models. Matched on a stable substring so future wording tweaks
+/// (e.g. casing) still retry correctly.
+fn is_text_to_video_image_rejection(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("image_url is not supported for text to video models")
+}
+
 /// Per-model reference-input caps for reference-to-video models. The Venice
 /// catalog does not expose these counts; they come from the Seedance 2.0 guide
 /// and observed limits for other R2V families. Returns `(images, videos, audio)`.
@@ -5406,7 +5445,7 @@ async fn queue_video_inner(
         .source_image
         .filter(|value| !value.trim().is_empty())
     {
-        body["image_url"] = json!(value);
+        add_video_source_image(&mut body, &request.model, value);
     }
     if let Some(value) = request
         .source_video
@@ -5460,7 +5499,18 @@ async fn queue_video_inner(
         body["upscale_factor"] = json!(value);
     }
 
-    let response = venice_post_json("/video/queue", body).await?;
+    // Some text-to-video models are cataloged ambiguously, so the source image
+    // can slip through and Venice rejects it with a 400: "image_url is not
+    // supported for text to video models". Retry once with the image stripped so
+    // the text prompt still goes through instead of failing the whole job.
+    let response = match venice_post_json("/video/queue", body.clone()).await {
+        Ok(response) => response,
+        Err(message) if is_text_to_video_image_rejection(&message) => {
+            strip_video_source_image_for_retry(&mut body);
+            venice_post_json("/video/queue", body).await?
+        }
+        Err(message) => return Err(message),
+    };
     let payload: Value = bounded_response_json(response, 8 * 1024 * 1024).await?;
     let queue_id = first_string_field(&payload, &["id", "queue_id", "request_id"])
         .or_else(|| {
@@ -8102,6 +8152,75 @@ mod tests {
         // Non-R2V models expose no reference slots.
         assert_eq!(video_reference_limits("seedance-2-0-image-to-video"), (0, 0, 0));
         assert_eq!(video_reference_limits("seedance-2-0-text-to-video"), (0, 0, 0));
+    }
+
+    #[test]
+    fn enhanced_wan_i2v_uses_reference_image_urls_for_its_source() {
+        let mut enhanced_body = json!({});
+        add_video_source_image(
+            &mut enhanced_body,
+            "wan-2-7-enhanced-image-to-video",
+            "data:image/png;base64,enhanced".to_string(),
+        );
+        assert_eq!(
+            enhanced_body.get("reference_image_urls"),
+            Some(&json!(["data:image/png;base64,enhanced"]))
+        );
+        assert!(enhanced_body.get("image_url").is_none());
+
+        let mut ordinary_body = json!({});
+        add_video_source_image(
+            &mut ordinary_body,
+            "wan-2-7-image-to-video",
+            "data:image/png;base64,ordinary".to_string(),
+        );
+        assert_eq!(
+            ordinary_body.get("image_url"),
+            Some(&json!("data:image/png;base64,ordinary"))
+        );
+        assert!(ordinary_body.get("reference_image_urls").is_none());
+    }
+
+    #[test]
+    fn text_to_video_image_rejection_strips_image_and_resubmits_body() {
+        // Ordinary I2V source image lives under image_url.
+        let mut ordinary_body = json!({
+            "model": "wan-2-7-text-to-video",
+            "prompt": "a cat",
+            "image_url": "data:image/png;base64,leaked"
+        });
+        assert!(strip_video_source_image_for_retry(&mut ordinary_body));
+        assert!(ordinary_body.get("image_url").is_none());
+        assert_eq!(ordinary_body["model"], json!("wan-2-7-text-to-video"));
+        assert_eq!(ordinary_body["prompt"], json!("a cat"));
+
+        // Wan 2.7 Enhanced routes its source through reference_image_urls; the
+        // retry must clear that array too so the body is purely text-driven.
+        let mut enhanced_body = json!({
+            "model": "wan-2-7-enhanced-image-to-video",
+            "prompt": "a dog",
+            "reference_image_urls": ["data:image/png;base64,enhanced"]
+        });
+        assert!(strip_video_source_image_for_retry(&mut enhanced_body));
+        assert_eq!(
+            enhanced_body.get("reference_image_urls"),
+            Some(&json!([]))
+        );
+
+        // A body with no source image reports nothing removed.
+        let mut text_only = json!({ "model": "wan-2-7-text-to-video", "prompt": "a cat" });
+        assert!(!strip_video_source_image_for_retry(&mut text_only));
+
+        // Error-string detection covers the exact Venice message and casing
+        // tweaks, but ignores unrelated failures.
+        assert!(is_text_to_video_image_rejection(
+            "Venice API returned 400 Bad Request: image_url is not supported for text to video models"
+        ));
+        assert!(is_text_to_video_image_rejection(
+            "IMAGE_URL IS NOT SUPPORTED FOR TEXT TO VIDEO MODELS"
+        ));
+        assert!(!is_text_to_video_image_rejection("model not found"));
+        assert!(!is_text_to_video_image_rejection(""));
     }
 
     #[test]

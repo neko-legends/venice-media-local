@@ -468,6 +468,22 @@ button {
   color: var(--text);
 }
 
+.notice.inline {
+  min-height: 0;
+  padding: 8px 12px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-2) 82%, var(--border) 8%);
+  font-size: 12px;
+}
+
+.notice.warning {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--surface-2) 78%, var(--warn) 14%);
+  color: var(--text);
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: minmax(390px, 0.8fr) minmax(420px, 1.2fr);
