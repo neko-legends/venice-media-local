@@ -2881,7 +2881,7 @@ export function App() {
                   <NumberField label="Concurrent" value={concurrency.edit} min={1} max={12} step={1} onChange={(value) => updateConcurrency('edit', value)} />
                 </div>
                 <div className="action-row">
-                  <button className="secondary-action" type="button" onClick={editImage} disabled={!hasEditSource}>
+                  <button className="primary-action" type="button" onClick={editImage} disabled={!hasEditSource}>
                     {jobStats.edit.running > 0 ? <Loader2 className="spin" size={18} /> : <Scissors size={18} />}
                     Edit / Combine
                   </button>
@@ -2903,7 +2903,7 @@ export function App() {
                       Scale Image
                     </button>
                   </div>
-                  <button className="primary-action" type="button" onClick={removeBackground} disabled={!hasEditSource}>
+                  <button className="secondary-action" type="button" onClick={removeBackground} disabled={!hasEditSource}>
                     {jobStats.edit.running > 0 ? <Loader2 className="spin" size={18} /> : <Eraser size={18} />}
                     Remove Background
                   </button>
