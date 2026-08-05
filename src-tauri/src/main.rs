@@ -2759,8 +2759,17 @@ fn video_controls_from_constraints(
 
     // Reference-to-video (R2V) detection + per-model reference caps. The catalog
     // tags R2V models as model_type "image-to-video", so the id is authoritative.
+    // The catalog does not publish reference *counts*, but it does publish the
+    // `video_input` / `audio_input` capability booleans, so we clamp the table's
+    // video/audio caps to 0 unless the model actually accepts that input type.
+    // This matters because every R2V model currently reports `video_input: false`
+    // and only MiniMax reports `audio_input: true`.
     let is_r2v = is_reference_to_video_model(id);
-    let (max_ref_images, max_ref_videos, max_ref_audios) = video_reference_limits(id);
+    let audio_input_opt = bool_from_sources(&sources, &["audio_input", "audioInput"]);
+    let (table_images, table_videos, table_audios) = video_reference_limits(id);
+    let max_ref_images = table_images;
+    let max_ref_videos = if supports_source_video { table_videos } else { 0 };
+    let max_ref_audios = if audio_input_opt.unwrap_or(false) { table_audios } else { 0 };
     controls["isReferenceToVideo"] = json!(is_r2v);
     controls["maxReferenceImages"] = json!(max_ref_images);
     controls["maxReferenceVideos"] = json!(max_ref_videos);
@@ -2792,8 +2801,7 @@ fn video_controls_from_constraints(
     {
         controls["audioConfigurable"] = json!(audio_configurable);
     }
-    if let Some(supports_audio_input) = bool_from_sources(&sources, &["audio_input", "audioInput"])
-    {
+    if let Some(supports_audio_input) = audio_input_opt {
         controls["supportsAudioInput"] = json!(supports_audio_input);
     }
 
@@ -4508,22 +4516,53 @@ fn is_text_to_video_image_rejection(message: &str) -> bool {
 }
 
 /// Per-model reference-input caps for reference-to-video models. The Venice
-/// catalog does not expose these counts; they come from the Seedance 2.0 guide
-/// and observed limits for other R2V families. Returns `(images, videos, audio)`.
-/// Non-R2V models return `(0, 0, 0)`.
+/// `/models` catalog does not expose these counts (only the `video_input` /
+/// `audio_input` capability booleans), so the image maximums here come from the
+/// upstream providers' own documentation: MiniMax H3 (9), Kling O3 (7 total),
+/// Grok Imagine (1-7), Seedance 2.0 (9), and conservative defaults for the
+/// rest. Video/audio counts are upper bounds that are later clamped to 0 by
+/// [`video_controls_from_constraints`] unless the catalog reports the matching
+/// capability. Returns `(images, videos, audio)`. Non-R2V models return
+/// `(0, 0, 0)`.
 fn video_reference_limits(model_id: &str) -> (usize, usize, usize) {
     if !is_reference_to_video_model(model_id) {
         return (0, 0, 0);
     }
+    // Seedance 2.0 R2V family: 9 images / 3 videos / 3 audios.
     if model_id.starts_with("seedance-2-0-reference-to-video")
         || model_id.starts_with("seedance-2-0-fast-reference-to-video")
     {
-        (9, 3, 3)
-    } else {
-        // wan-2-7-reference-to-video, happyhorse-*-reference-to-video, and any
-        // unknown R2V model default to a conservative 3 images / 1 video / 0 audio.
-        (3, 1, 0)
+        return (9, 3, 3);
     }
+    // MiniMax Hailuo 3 R2V (incl. enhanced): 9 images / 3 videos / 3 audios.
+    if model_id.starts_with("minimax-") {
+        return (9, 3, 3);
+    }
+    // Kling O3/V3 R2V: up to 7 total visual references (elements + scene images).
+    if model_id.starts_with("kling-") {
+        return (7, 0, 0);
+    }
+    // Grok Imagine R2V: 1-7 flat reference images.
+    if model_id.starts_with("grok-imagine-") {
+        return (7, 0, 0);
+    }
+    // Gemini Omni R2V: multimodal but exact image cap undocumented; conservative 4.
+    if model_id.starts_with("gemini-omni-") {
+        return (4, 0, 0);
+    }
+    // Pixverse C1 R2V: subject + background (2 references).
+    if model_id.starts_with("pixverse-c1-reference-to-video") {
+        return (2, 0, 0);
+    }
+    // wan-2-7-reference-to-video and happyhorse-*-reference-to-video keep their
+    // existing conservative image cap. Video/audio are gated off by capability.
+    if model_id.starts_with("wan-2-7-reference-to-video")
+        || model_id.starts_with("happyhorse-")
+    {
+        return (3, 1, 0);
+    }
+    // Unknown R2V model: conservative default — 3 images, no video/audio.
+    (3, 0, 0)
 }
 
 /// Trims and de-drops-empty entries from a reference URL list, capping the
@@ -8139,19 +8178,99 @@ mod tests {
             video_reference_limits("seedance-2-0-fast-reference-to-video"),
             (9, 3, 3)
         );
-        // Other R2V families and unknown R2V models default conservatively.
+        // MiniMax Hailuo 3 R2V (incl. enhanced): 9 images / 3 videos / 3 audios.
+        assert_eq!(video_reference_limits("minimax-h3-reference-to-video"), (9, 3, 3));
+        assert_eq!(
+            video_reference_limits("minimax-h3-enhanced-reference-to-video"),
+            (9, 3, 3)
+        );
+        // Kling O3/V3 R2V: up to 7 total visual references; no video/audio refs.
+        assert_eq!(
+            video_reference_limits("kling-o3-pro-reference-to-video"),
+            (7, 0, 0)
+        );
+        assert_eq!(video_reference_limits("kling-v3-4k-reference-to-video"), (7, 0, 0));
+        // Grok Imagine R2V: 1-7 flat reference images; no video/audio refs.
+        assert_eq!(
+            video_reference_limits("grok-imagine-reference-to-video-private"),
+            (7, 0, 0)
+        );
+        // Gemini Omni R2V: conservative 4 images; no video/audio refs.
+        assert_eq!(
+            video_reference_limits("gemini-omni-flash-reference-to-video"),
+            (4, 0, 0)
+        );
+        // Pixverse C1 R2V: subject + background (2 references).
+        assert_eq!(video_reference_limits("pixverse-c1-reference-to-video"), (2, 0, 0));
+        // Known conservative families keep 3 images; video/audio gated elsewhere.
         assert_eq!(video_reference_limits("wan-2-7-reference-to-video"), (3, 1, 0));
         assert_eq!(
             video_reference_limits("happyhorse-1-1-reference-to-video"),
             (3, 1, 0)
         );
+        // Unknown R2V model defaults conservatively — 3 images, no video/audio.
         assert_eq!(
             video_reference_limits("some-future-reference-to-video"),
-            (3, 1, 0)
+            (3, 0, 0)
         );
         // Non-R2V models expose no reference slots.
         assert_eq!(video_reference_limits("seedance-2-0-image-to-video"), (0, 0, 0));
         assert_eq!(video_reference_limits("seedance-2-0-text-to-video"), (0, 0, 0));
+    }
+
+    #[test]
+    fn reference_video_and_audio_caps_gated_by_catalog_capability() {
+        // MiniMax H3 R2V catalog fixture: audio_input=true, video_input=false.
+        // The table says (9, 3, 3) but only 9 images / 3 audios should surface —
+        // video slots are gated off because the model reports video_input=false.
+        let minimax_constraints = json!({
+            "model_type": "image-to-video",
+            "video_input": false,
+            "audio_input": true
+        });
+        let minimax_controls = video_controls_from_constraints(
+            "minimax-h3-reference-to-video",
+            "MiniMax H3 R2V",
+            "minimax-h3-reference-to-video",
+            &minimax_constraints,
+            &Value::Null,
+        );
+        assert_eq!(minimax_controls["isReferenceToVideo"], json!(true));
+        assert_eq!(minimax_controls["maxReferenceImages"], json!(9));
+        assert_eq!(minimax_controls["maxReferenceVideos"], json!(0));
+        assert_eq!(minimax_controls["maxReferenceAudios"], json!(3));
+
+        // Seedance advertises the full 9/3/3 table, but the live catalog reports
+        // video_input=false for every R2V model — so its video slots are gated
+        // off too, and audio slots only appear when audio_input is true.
+        let seedance_no_input = json!({ "model_type": "image-to-video" });
+        let seedance_controls = video_controls_from_constraints(
+            "seedance-2-0-reference-to-video",
+            "Seedance 2.0 R2V",
+            "seedance-2-0-reference-to-video",
+            &seedance_no_input,
+            &Value::Null,
+        );
+        assert_eq!(seedance_controls["maxReferenceImages"], json!(9));
+        assert_eq!(seedance_controls["maxReferenceVideos"], json!(0));
+        assert_eq!(seedance_controls["maxReferenceAudios"], json!(0));
+
+        // A hypothetical future R2V model that DOES accept video input would
+        // surface its full table video count.
+        let seedance_video_input = json!({
+            "model_type": "image-to-video",
+            "video_input": true,
+            "audio_input": true
+        });
+        let seedance_video_controls = video_controls_from_constraints(
+            "seedance-2-0-reference-to-video",
+            "Seedance 2.0 R2V",
+            "seedance-2-0-reference-to-video",
+            &seedance_video_input,
+            &Value::Null,
+        );
+        assert_eq!(seedance_video_controls["maxReferenceVideos"], json!(3));
+        assert_eq!(seedance_video_controls["maxReferenceAudios"], json!(3));
     }
 
     #[test]
