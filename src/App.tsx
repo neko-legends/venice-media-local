@@ -252,6 +252,34 @@ type Overrides = {
 
 type RecentModels = Partial<Record<ModelKind, string[]>>
 type UpscaleScale = 2 | 4
+type VideoUpscaleFactor = 1 | 2 | 4
+
+type MediaControlPreferences = {
+  image: {
+    aspectRatio: string
+    resolution: string
+    format: string
+    variants: number
+    steps: number
+    cfgScale: number
+    seed: string
+    lockSeed: boolean
+    randomSeed: boolean
+    hideWatermark: boolean
+  }
+  edit: {
+    aspectRatio: string
+    resolution: string
+    upscaleScale: UpscaleScale
+  }
+  video: {
+    duration: string
+    resolution: string
+    aspectRatio: string
+    variants: number
+    upscaleFactor: VideoUpscaleFactor
+  }
+}
 
 const STORAGE_OVERRIDES = 'veniceMediaLocal:modelOverrides:v1'
 const STORAGE_CONCURRENCY = 'veniceMediaLocal:concurrency:v1'
@@ -260,6 +288,7 @@ const STORAGE_LAST_SAVE_DIR = 'veniceMediaLocal:lastSaveDir:v1'
 const STORAGE_THEME = 'veniceMediaLocal:theme:v1'
 const STORAGE_MUSIC_DURATION = 'veniceMediaLocal:musicDurationSeconds:v1'
 const STORAGE_SFX_DURATION = 'veniceMediaLocal:sfxDurationSeconds:v1'
+const STORAGE_MEDIA_CONTROLS = 'veniceMediaLocal:mediaControls:v1'
 const EDIT_SOURCE_LIMIT = 3
 // Conservative upper bounds for the reference-to-video (R2V) slot arrays. The
 // actual per-model cap is read from controls.maxReference* and the arrays are
@@ -279,6 +308,32 @@ const DEFAULT_MUSIC_DURATION_SECONDS = 30
 const DEFAULT_SFX_DURATION_SECONDS = 2
 const MAX_IMAGE_SEED = 999_999_999
 const MAX_VIDEO_VARIANTS = 8
+const DEFAULT_MEDIA_CONTROLS: MediaControlPreferences = {
+  image: {
+    aspectRatio: '1:1',
+    resolution: '',
+    format: 'webp',
+    variants: 1,
+    steps: 28,
+    cfgScale: 7.5,
+    seed: '',
+    lockSeed: false,
+    randomSeed: true,
+    hideWatermark: true,
+  },
+  edit: {
+    aspectRatio: '1:1',
+    resolution: '',
+    upscaleScale: 2,
+  },
+  video: {
+    duration: '5s',
+    resolution: '720p',
+    aspectRatio: '16:9',
+    variants: 1,
+    upscaleFactor: 2,
+  },
+}
 const TRANSCRIBE_FILE_ACCEPT = 'audio/*,video/*,.mp3,.m4a,.wav,.webm,.flac,.ogg,.aac,.mp4,.mpeg,.mpg'
 const TRANSCRIBE_FILE_EXTENSION = /\.(mp3|m4a|wav|webm|flac|ogg|aac|mp4|mpeg|mpg)$/i
 const JOB_KINDS: JobKind[] = ['image', 'edit', 'video', 'music', 'sfx', 'voice', 'transcribe']
@@ -319,6 +374,12 @@ const fallbackModels: ModelCache = {
     baseModel('seedance-2-0-image-to-video', 'Seedance 2.0 (I2V)', 'video'),
     baseModel('seedance-2-0-text-to-video', 'Seedance 2.0 (T2V)', 'video'),
     baseModel('wan-2-7-image-to-video', 'Wan 2.7 (I2V)', 'video'),
+    baseModel('topaz-video-upscale', 'Topaz Video Upscale', 'video', {
+      modelType: 'video',
+      supportsSourceVideo: true,
+      resolutionOptions: ['2x', '4x'],
+      durationOptions: ['Auto'],
+    }),
   ],
   musicModels: [
     baseModel('elevenlabs-music', 'ElevenLabs Music', 'music'),
@@ -575,6 +636,78 @@ function readStoredDuration(key: string, fallback: number): string {
 function writeStoredDuration(key: string, value: string) {
   try {
     localStorage.setItem(key, value)
+  } catch {
+    // Local storage can be unavailable in preview or restricted environments.
+  }
+}
+
+function storedString(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function storedBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+function storedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback
+}
+
+function normalizeMediaControlPreferences(value: unknown): MediaControlPreferences {
+  const record = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const image = record.image && typeof record.image === 'object' ? record.image as Record<string, unknown> : {}
+  const edit = record.edit && typeof record.edit === 'object' ? record.edit as Record<string, unknown> : {}
+  const video = record.video && typeof record.video === 'object' ? record.video as Record<string, unknown> : {}
+  const lockSeed = storedBoolean(image.lockSeed, DEFAULT_MEDIA_CONTROLS.image.lockSeed)
+  const randomSeed = lockSeed ? false : storedBoolean(image.randomSeed, DEFAULT_MEDIA_CONTROLS.image.randomSeed)
+
+  return {
+    image: {
+      aspectRatio: storedString(image.aspectRatio, DEFAULT_MEDIA_CONTROLS.image.aspectRatio),
+      resolution: storedString(image.resolution, DEFAULT_MEDIA_CONTROLS.image.resolution),
+      format: storedString(image.format, DEFAULT_MEDIA_CONTROLS.image.format),
+      variants: storedNumber(image.variants, DEFAULT_MEDIA_CONTROLS.image.variants, 1, 4),
+      steps: storedNumber(image.steps, DEFAULT_MEDIA_CONTROLS.image.steps, 1, 80),
+      cfgScale: storedNumber(image.cfgScale, DEFAULT_MEDIA_CONTROLS.image.cfgScale, 1, 20),
+      seed: storedString(image.seed, DEFAULT_MEDIA_CONTROLS.image.seed),
+      lockSeed,
+      randomSeed,
+      hideWatermark: storedBoolean(image.hideWatermark, DEFAULT_MEDIA_CONTROLS.image.hideWatermark),
+    },
+    edit: {
+      aspectRatio: storedString(edit.aspectRatio, DEFAULT_MEDIA_CONTROLS.edit.aspectRatio),
+      resolution: storedString(edit.resolution, DEFAULT_MEDIA_CONTROLS.edit.resolution),
+      upscaleScale: edit.upscaleScale === 4 ? 4 : 2,
+    },
+    video: {
+      duration: storedString(video.duration, DEFAULT_MEDIA_CONTROLS.video.duration),
+      resolution: storedString(video.resolution, DEFAULT_MEDIA_CONTROLS.video.resolution),
+      aspectRatio: storedString(video.aspectRatio, DEFAULT_MEDIA_CONTROLS.video.aspectRatio),
+      variants: storedNumber(video.variants, DEFAULT_MEDIA_CONTROLS.video.variants, 1, MAX_VIDEO_VARIANTS),
+      upscaleFactor: video.upscaleFactor === 1 || video.upscaleFactor === 4 ? video.upscaleFactor : 2,
+    },
+  }
+}
+
+let cachedMediaControlPreferences: MediaControlPreferences | undefined
+
+function readMediaControlPreferences(): MediaControlPreferences {
+  if (cachedMediaControlPreferences) return cachedMediaControlPreferences
+  try {
+    const raw = localStorage.getItem(STORAGE_MEDIA_CONTROLS)
+    cachedMediaControlPreferences = normalizeMediaControlPreferences(raw ? JSON.parse(raw) : null)
+  } catch {
+    cachedMediaControlPreferences = normalizeMediaControlPreferences(null)
+  }
+  return cachedMediaControlPreferences
+}
+
+function writeMediaControlPreferences(value: MediaControlPreferences) {
+  cachedMediaControlPreferences = value
+  try {
+    localStorage.setItem(STORAGE_MEDIA_CONTROLS, JSON.stringify(value))
   } catch {
     // Local storage can be unavailable in preview or restricted environments.
   }
@@ -1205,18 +1338,19 @@ export function App() {
   const [imageTitle, setImageTitle] = useState('')
   const [prompt, setPrompt] = useState('')
   const [negativePrompt, setNegativePrompt] = useState('')
-  const [aspectRatio, setAspectRatio] = useState('1:1')
-  const [imageResolution, setImageResolution] = useState('')
-  const [imageFormat, setImageFormat] = useState('webp')
-  const [variants, setVariants] = useState(1)
-  const [steps, setSteps] = useState(28)
-  const [cfgScale, setCfgScale] = useState(7.5)
-  const [seed, setSeed] = useState('')
-  const [lockSeed, setLockSeed] = useState(false)
-  const [randomSeed, setRandomSeed] = useState(true)
-  const [hideWatermark, setHideWatermark] = useState(true)
+  const [aspectRatio, setAspectRatio] = useState(() => readMediaControlPreferences().image.aspectRatio)
+  const [imageResolution, setImageResolution] = useState(() => readMediaControlPreferences().image.resolution)
+  const [imageFormat, setImageFormat] = useState(() => readMediaControlPreferences().image.format)
+  const [variants, setVariants] = useState(() => readMediaControlPreferences().image.variants)
+  const [steps, setSteps] = useState(() => readMediaControlPreferences().image.steps)
+  const [cfgScale, setCfgScale] = useState(() => readMediaControlPreferences().image.cfgScale)
+  const [seed, setSeed] = useState(() => readMediaControlPreferences().image.seed)
+  const [lockSeed, setLockSeed] = useState(() => readMediaControlPreferences().image.lockSeed)
+  const [randomSeed, setRandomSeed] = useState(() => readMediaControlPreferences().image.randomSeed)
+  const [hideWatermark, setHideWatermark] = useState(() => readMediaControlPreferences().image.hideWatermark)
 
   const [sourceImage, setSourceImage] = useState('')
+  const [sourceVideo, setSourceVideo] = useState('')
   // Reference-to-video (R2V) multimodal inputs. Order maps to the <Image N>,
   // <Video N>, <Audio N> prompt tokens consumed by seedance-2-0-reference-to-video
   // and the other *-reference-to-video models.
@@ -1224,13 +1358,14 @@ export function App() {
   const [referenceVideos, setReferenceVideos] = useState<string[]>(() => Array(VIDEO_REFERENCE_VIDEO_LIMIT).fill(''))
   const [referenceAudios, setReferenceAudios] = useState<string[]>(() => Array(VIDEO_REFERENCE_AUDIO_LIMIT).fill(''))
   const [editSourceImages, setEditSourceImages] = useState<string[]>(() => Array(EDIT_SOURCE_LIMIT).fill(''))
-  const [editAspectRatio, setEditAspectRatio] = useState('1:1')
-  const [editResolution, setEditResolution] = useState('')
-  const [upscaleScale, setUpscaleScale] = useState<UpscaleScale>(2)
-  const [videoDuration, setVideoDuration] = useState('5s')
-  const [videoResolution, setVideoResolution] = useState('720p')
-  const [videoAspectRatio, setVideoAspectRatio] = useState('16:9')
-  const [videoVariants, setVideoVariants] = useState(1)
+  const [editAspectRatio, setEditAspectRatio] = useState(() => readMediaControlPreferences().edit.aspectRatio)
+  const [editResolution, setEditResolution] = useState(() => readMediaControlPreferences().edit.resolution)
+  const [upscaleScale, setUpscaleScale] = useState<UpscaleScale>(() => readMediaControlPreferences().edit.upscaleScale)
+  const [videoDuration, setVideoDuration] = useState(() => readMediaControlPreferences().video.duration)
+  const [videoResolution, setVideoResolution] = useState(() => readMediaControlPreferences().video.resolution)
+  const [videoAspectRatio, setVideoAspectRatio] = useState(() => readMediaControlPreferences().video.aspectRatio)
+  const [videoVariants, setVideoVariants] = useState(() => readMediaControlPreferences().video.variants)
+  const [videoUpscaleFactor, setVideoUpscaleFactor] = useState<VideoUpscaleFactor>(() => readMediaControlPreferences().video.upscaleFactor)
 
   const [lyrics, setLyrics] = useState('')
   const [musicDuration, setMusicDuration] = useState(() => readStoredDuration(STORAGE_MUSIC_DURATION, DEFAULT_MUSIC_DURATION_SECONDS))
@@ -1588,6 +1723,35 @@ export function App() {
   }, [concurrency])
 
   useEffect(() => {
+    writeMediaControlPreferences({
+      image: {
+        aspectRatio,
+        resolution: imageResolution,
+        format: imageFormat,
+        variants,
+        steps,
+        cfgScale,
+        seed,
+        lockSeed,
+        randomSeed,
+        hideWatermark,
+      },
+      edit: {
+        aspectRatio: editAspectRatio,
+        resolution: editResolution,
+        upscaleScale,
+      },
+      video: {
+        duration: videoDuration,
+        resolution: videoResolution,
+        aspectRatio: videoAspectRatio,
+        variants: videoVariants,
+        upscaleFactor: videoUpscaleFactor,
+      },
+    })
+  }, [aspectRatio, cfgScale, editAspectRatio, editResolution, hideWatermark, imageFormat, imageResolution, lockSeed, randomSeed, seed, steps, upscaleScale, variants, videoAspectRatio, videoDuration, videoResolution, videoUpscaleFactor, videoVariants])
+
+  useEffect(() => {
     if (actionStartedAt === null) return
     setElapsedMs(Date.now() - actionStartedAt)
     const timer = window.setInterval(() => {
@@ -1599,6 +1763,7 @@ export function App() {
   const currentImageModel = imageModels.find((model) => model.id === imageModel)
   const currentEditModel = editModels.find((model) => model.id === editModel)
   const currentVideoModel = videoModels.find((model) => model.id === videoModel)
+  const isVideoUpscale = currentVideoModel?.id === 'topaz-video-upscale'
   const isReferenceToVideo = controlBool(currentVideoModel, 'isReferenceToVideo', false)
   // Text-to-video models cannot accept a source image; Venice rejects them with
   // "image_url is not supported for text to video models". Detect via the same
@@ -2391,6 +2556,11 @@ export function App() {
     setSourceImage(dataUrl)
   }
 
+  async function loadSourceVideo(file: File) {
+    const dataUrl = await fileToDataUrl(file)
+    setSourceVideo(dataUrl)
+  }
+
   async function loadTranscribeFile(file: File) {
     const dataUrl = await fileToDataUrl(file)
     setTranscribeAudio(dataUrl)
@@ -2506,42 +2676,60 @@ export function App() {
 
   function queueVideo(event: FormEvent) {
     event.preventDefault()
-    const variantCount = clampVariantCount(videoVariants, MAX_VIDEO_VARIANTS)
+    if (isVideoUpscale && !sourceVideo) {
+      setError('Add an MP4, MOV, or WebM video to upscale')
+      setStatus('Needs attention')
+      setLastActionMs(null)
+      return
+    }
+
+    const variantCount = isVideoUpscale ? 1 : clampVariantCount(videoVariants, MAX_VIDEO_VARIANTS)
     const batchId = `video-${Date.now()}-${Math.random().toString(16).slice(2)}`
-    const batchTitle = variantCount > 1 ? `Videos · ${variantCount} variants` : 'Video'
+    const batchTitle = isVideoUpscale
+      ? `Video Upscale · ${videoUpscaleFactor}x`
+      : variantCount > 1 ? `Videos · ${variantCount} variants` : 'Video'
 
     // Reference-to-video (R2V) models take ordered reference arrays instead of a
     // single first-frame image. Plain I2V/T2V keeps the sourceImage path.
     const referenceImageUrls = referenceImages.map((value) => value.trim()).filter(Boolean)
     const referenceVideoUrls = referenceVideos.map((value) => value.trim()).filter(Boolean)
     const referenceAudioUrls = referenceAudios.map((value) => value.trim()).filter(Boolean)
-    if (isReferenceToVideo && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0) {
+    if (!isVideoUpscale && isReferenceToVideo && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0) {
       setError('Add at least one reference image or video for Reference-to-Video')
       setStatus('Needs attention')
       setLastActionMs(null)
       return
     }
 
-    const request: Record<string, unknown> = {
-      model: videoModel,
-      prompt,
-      negativePrompt,
-      duration: selectedVideoDuration || undefined,
-      resolution: selectedVideoResolution || undefined,
-      aspectRatio: selectedVideoAspectRatio || undefined,
-    }
-    if (isReferenceToVideo) {
+    const request: Record<string, unknown> = isVideoUpscale
+      ? {
+          model: 'topaz-video-upscale',
+          prompt: '',
+          sourceVideo,
+          upscaleFactor: videoUpscaleFactor,
+        }
+      : {
+          model: videoModel,
+          prompt,
+          negativePrompt,
+          duration: selectedVideoDuration || undefined,
+          resolution: selectedVideoResolution || undefined,
+          aspectRatio: selectedVideoAspectRatio || undefined,
+        }
+    if (!isVideoUpscale && isReferenceToVideo) {
       if (referenceImageUrls.length > 0) request.referenceImageUrls = referenceImageUrls
       if (referenceVideoUrls.length > 0) request.referenceVideoUrls = referenceVideoUrls
       if (referenceAudioUrls.length > 0) request.referenceAudioUrls = referenceAudioUrls
-    } else if (!isTextToVideo) {
+    } else if (!isVideoUpscale && !isTextToVideo) {
       // Plain I2V/V2V models keep the source-image path. Text-to-video models
       // cannot accept an image, so we omit it entirely.
       request.sourceImage = sourceImage
     }
 
     for (let variantIndex = 1; variantIndex <= variantCount; variantIndex += 1) {
-      const label = variantCount > 1 ? `Video generation v${variantIndex}/${variantCount}` : 'Video generation'
+      const label = isVideoUpscale
+        ? `Video upscale ${videoUpscaleFactor}x`
+        : variantCount > 1 ? `Video generation v${variantIndex}/${variantCount}` : 'Video generation'
       enqueueJob('video', label, async () => {
         const startedAt = Date.now()
         const queued = await call<QueueResult>('queue_video', { request })
@@ -2915,7 +3103,22 @@ export function App() {
             {mode === 'video' && (
               <form onSubmit={queueVideo} className="tool-form">
                 <ModelSelect label="Model" value={videoModel} onChange={setVideoModel} models={videoModels} recentModelIds={recentModels.video} />
-                {isReferenceToVideo ? (
+                {isVideoUpscale ? (
+                  <div className="reference-panel">
+                    <MediaSlot
+                      label="Source Video"
+                      accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm"
+                      icon={Video}
+                      source={sourceVideo}
+                      onFile={loadSourceVideo}
+                      onClear={() => setSourceVideo('')}
+                    />
+                    <div className="notice inline" role="note">
+                      <Maximize2 size={16} />
+                      <span className="notice-message">Topaz preserves the source duration and FPS. Choose 1x for enhancement, 2x for standard upscale, or 4x for maximum upscale.</span>
+                    </div>
+                  </div>
+                ) : isReferenceToVideo ? (
                   <div className="reference-panel">
                     {maxReferenceImages > 0 && (
                       <div className="reference-section">
@@ -3002,17 +3205,30 @@ export function App() {
                 ) : (
                   <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />
                 )}
-                <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />
-                <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />
+                {!isVideoUpscale && <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />}
+                {!isVideoUpscale && <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />}
                 <div className="control-grid">
-                  {videoDurations.length > 0 && <SelectField label="Duration" value={selectedVideoDuration} onChange={setVideoDuration} options={videoDurations} />}
-                  {videoResolutions.length > 0 && <SelectField label="Resolution" value={selectedVideoResolution} onChange={setVideoResolution} options={videoResolutions} />}
-                  {videoRatios.length > 0 && <SelectField label="Aspect" value={selectedVideoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />}
-                  <NumberField label="Variants" value={videoVariants} min={1} max={MAX_VIDEO_VARIANTS} step={1} onChange={setVideoVariants} />
+                  {isVideoUpscale ? (
+                    <SelectField
+                      label="Scale"
+                      value={`${videoUpscaleFactor}x`}
+                      onChange={(value) => setVideoUpscaleFactor(Number.parseInt(value, 10) as VideoUpscaleFactor)}
+                      options={['1x', '2x', '4x']}
+                    />
+                  ) : (
+                    <>
+                      {videoDurations.length > 0 && <SelectField label="Duration" value={selectedVideoDuration} onChange={setVideoDuration} options={videoDurations} />}
+                      {videoResolutions.length > 0 && <SelectField label="Resolution" value={selectedVideoResolution} onChange={setVideoResolution} options={videoResolutions} />}
+                      {videoRatios.length > 0 && <SelectField label="Aspect" value={selectedVideoAspectRatio} onChange={setVideoAspectRatio} options={videoRatios} />}
+                      <NumberField label="Variants" value={videoVariants} min={1} max={MAX_VIDEO_VARIANTS} step={1} onChange={setVideoVariants} />
+                    </>
+                  )}
                   <NumberField label="Concurrent" value={concurrency.video} min={1} max={12} step={1} onChange={(value) => updateConcurrency('video', value)} />
                 </div>
                 <QueueSummary label="Video queue" stats={jobStats.video} limit={concurrency.video} now={jobNow} />
-                <SubmitButton busy={jobStats.video.running > 0} icon={Video}>Queue Video</SubmitButton>
+                <SubmitButton busy={jobStats.video.running > 0} icon={isVideoUpscale ? Maximize2 : Video}>
+                  {isVideoUpscale ? 'Scale Video' : 'Queue Video'}
+                </SubmitButton>
               </form>
             )}
 
@@ -4010,7 +4226,7 @@ function MediaSlot({
         <span className={classNames('source-label', source && 'loaded')}>
           <Icon size={18} />
           {label}
-          <small>{fileName || 'Drag/Drop/Browse'}</small>
+          <small>{fileName || 'Browse to select'}</small>
         </span>
       </div>
       <button className="icon-button compact source-browse" type="button" onClick={() => inputRef.current?.click()} title={`Browse for ${label}`}>

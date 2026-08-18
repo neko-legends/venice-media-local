@@ -712,6 +712,8 @@ button {
   display: grid;
   position: relative;
   min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .source-file-input {
@@ -776,7 +778,9 @@ button {
 
 .reference-panel {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
+  min-width: 0;
 }
 
 .reference-section {
