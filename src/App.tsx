@@ -30,7 +30,7 @@ import {
   X,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, MouseEvent, ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, ClipboardEvent, DragEvent, FocusEvent, FormEvent, Fragment, MouseEvent, ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
 import { AngleHelper } from './AngleHelper'
 
 const APP_ICON_URL = '/app-icon.png'
@@ -1079,6 +1079,21 @@ function isTranscribableFile(file: File): boolean {
 
 function isImageFile(file: File): boolean {
   return file.type.startsWith('image/')
+}
+
+function fileMatchesAccept(file: File, accept: string): boolean {
+  const fileName = file.name.toLowerCase()
+  const fileType = file.type.toLowerCase()
+
+  return accept
+    .split(',')
+    .map((rule) => rule.trim().toLowerCase())
+    .filter(Boolean)
+    .some((rule) => {
+      if (rule.startsWith('.')) return fileName.endsWith(rule)
+      if (rule.endsWith('/*')) return fileType.startsWith(rule.slice(0, -1))
+      return fileType === rule
+    })
 }
 
 function clipboardFile(items: DataTransferItemList): File | null {
@@ -2904,16 +2919,31 @@ export function App() {
           {modes.map((item) => {
             const Icon = item.icon
             return (
-              <button
-                key={item.id}
-                className={classNames('mode-button', mode === item.id && 'active')}
-                onClick={() => setMode(item.id)}
-                type="button"
-                title={item.label}
-              >
-                <Icon size={18} />
-                <span>{item.label}</span>
-              </button>
+              <Fragment key={item.id}>
+                <button
+                  className={classNames('mode-button', mode === item.id && (item.id !== 'video' || !isVideoUpscale) && 'active')}
+                  onClick={() => setMode(item.id)}
+                  type="button"
+                  title={item.label}
+                >
+                  <Icon size={18} />
+                  <span>{item.label}</span>
+                </button>
+                {item.id === 'video' && (
+                  <button
+                    className={classNames('mode-button', mode === 'video' && isVideoUpscale && 'active')}
+                    onClick={() => {
+                      setMode('video')
+                      setVideoModel('topaz-video-upscale')
+                    }}
+                    type="button"
+                    title="Scale Video"
+                  >
+                    <Maximize2 size={18} />
+                    <span>Scale Video</span>
+                  </button>
+                )}
+              </Fragment>
             )
           })}
         </nav>
@@ -4210,11 +4240,28 @@ function MediaSlot({
   onClear?: () => void
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const [dragging, setDragging] = useState(false)
+
+  function chooseFile(file: File) {
+    if (fileMatchesAccept(file, accept)) void onFile(file)
+  }
 
   function handleInput(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
-    if (file) void onFile(file)
+    if (file) chooseFile(file)
     event.currentTarget.value = ''
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault()
+    setDragging(false)
+    const file = Array.from(event.dataTransfer.files).find((candidate) => fileMatchesAccept(candidate, accept))
+    if (file) chooseFile(file)
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLDivElement>) {
+    const nextTarget = event.relatedTarget
+    if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) setDragging(false)
   }
 
   const fileName = deriveMediaFileName(source)
@@ -4222,11 +4269,34 @@ function MediaSlot({
   return (
     <div className={classNames('source-picker', className)}>
       <input ref={inputRef} className="source-file-input" type="file" accept={accept} onChange={handleInput} />
-      <div className={classNames('source-input', source && 'loaded')}>
+      <div
+        className={classNames('source-input', source && 'loaded', dragging && 'dragging')}
+        onClick={() => inputRef.current?.click()}
+        onDragEnter={(event) => {
+          event.preventDefault()
+          setDragging(true)
+        }}
+        onDragLeave={handleDragLeave}
+        onDragOver={(event) => {
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+          setDragging(true)
+        }}
+        onDrop={handleDrop}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            inputRef.current?.click()
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        title={`Drop or browse for ${label}`}
+      >
         <span className={classNames('source-label', source && 'loaded')}>
           <Icon size={18} />
           {label}
-          <small>{fileName || 'Browse to select'}</small>
+          <small>{fileName || 'Drop or browse'}</small>
         </span>
       </div>
       <button className="icon-button compact source-browse" type="button" onClick={() => inputRef.current?.click()} title={`Browse for ${label}`}>
