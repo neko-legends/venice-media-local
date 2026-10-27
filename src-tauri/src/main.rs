@@ -284,6 +284,11 @@ struct QueueMediaRequest {
     negative_prompt: Option<String>,
     #[serde(alias = "source_image")]
     source_image: Option<String>,
+    /// Optional end frame for models that support first/last-frame generation
+    /// (e.g. flux-3-first-last-frame-to-video, seedance-2-5-image-to-video-basic).
+    /// Forwarded to Venice as `end_image_url`.
+    #[serde(default, alias = "end_image", alias = "endImageUrl", alias = "end_image_url")]
+    end_image: Option<String>,
     #[serde(alias = "source_video")]
     source_video: Option<String>,
     duration: Option<String>,
@@ -5485,6 +5490,12 @@ async fn queue_video_inner(
         .filter(|value| !value.trim().is_empty())
     {
         add_video_source_image(&mut body, &request.model, value);
+    }
+    if let Some(value) = request
+        .end_image
+        .filter(|value| !value.trim().is_empty())
+    {
+        body["end_image_url"] = json!(value);
     }
     if let Some(value) = request
         .source_video

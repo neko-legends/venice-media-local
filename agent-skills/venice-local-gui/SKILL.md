@@ -1,247 +1,114 @@
 ---
 name: venice-local-gui
-description: Control a running VeniceMediaLocal desktop app over the network (Tailscale) so generations and edits appear live in the open GUI on the target Windows machine. The "theater mode" for agent-driven media work.
-tags: [venice, media, gui, remote-control, tailscale]
+description: Generate and edit images (and queue video, music, sound effects, speech) through the human's own running Venice Media Local app instead of asking for a Venice API key. Use whenever a task needs AI image generation or image editing, or any Venice media model. Results appear live in the open app window and are saved in its output folder.
+tags: [venice, media, image-generation, image-edit, gui, remote-control, tailscale]
 ---
 
-# Venice Local GUI Control Skill
+# Venice Media Local: agent control
 
-This skill lets the Hermes agent drive a **live VeniceMediaLocal GUI** running on another machine (e.g. the Windows "ripper" on the same Tailscale network).
+The human runs **Venice Media Local** (a desktop app) on their Windows machine. It holds their Venice API key and
+exposes a small HTTP control API. **You never need a Venice API key**: you send requests to the app, it calls Venice,
+saves the result in its output folder, and shows the card live in its window (the human watches it happen).
 
-The human sitting at the Windows machine will see cards, progress, and results appear in the app exactly as if they were using it themselves.
+Use this skill for any AI image work (new images, edits, combining images, background removal, upscaling) and for
+Venice video, music, SFX, speech and transcription.
 
-## Core Idea
+## 1. Connect
 
-- The Windows app runs normally (user has it open).
-- It exposes a small HTTP control API on the Tailscale network.
-- This skill teaches you (the agent) the API and gives you reliable ways to call it.
-- All file saving, burn logic, model cache, and output organization still happen exactly as in the GUI.
+You need two things from the human: the **control address** (e.g. `http://100.64.x.x:9876`, a Tailscale IP) and the
+**control token**. The app shows the address in **Settings > AI Agent Control** (toggle "Enable AI Agent Remote
+Control"); the token is provisioned there and is never returned by the API or the discovery file.
 
-See `references/implementation-notes.md` for the exact Rust wiring, live-toggle logic, how to add more endpoints, and the captured "theater mode" design decisions (including the exact UI text the user wanted and the preference for embedded HTTP so the human literally watches cards appear in the open app).
+- Ask the human once if you don't have them. Keep them **out of every repo and commit**: pass them as environment
+  variables (`VML_URL`, `VML_TOKEN`) for the command, or keep them in `~/.config/venice-media-local/agent.json`
+  (`{"url": "...", "token": "..."}`), which `scripts/vml.py` reads.
+- **Where to run calls:** from a machine on the human's tailnet. A cloud sandbox usually can't reach a `100.64.x.x`
+  address; if you have a shell on the human's own computer (a linked device), run the calls there.
+- Check it's up: `python3 scripts/vml.py state` (version, key configured, output folder, model counts).
 
-## Configuration (Human sets this once)
+How to read failures:
 
-In the VeniceMediaLocal app, go to **Settings > AI Agent Control** and turn on the toggle labeled **"Enable AI Agent Remote Control"**.
+| What you see | Meaning |
+|---|---|
+| `404` with an empty body | Wrong path. Everything is under **`/api/v1/`** (`/api/v1/state`, not `/state` or `/health`). It is not an auth problem. |
+| `401 Invalid bearer token` | Wrong token. Ask the human for the current one. |
+| Connection refused / timeout | App closed, agent control toggled off, or no route to the tailnet. See `references/remote-access-troubleshooting.md`. |
 
-The help text (exact user-preferred wording) is:
+## 2. Do the work: `scripts/vml.py` (stdlib Python, recommended)
 
-"Starts a local HTTP API. AI agents on the same Tailscale network (recommended) or trusted local LAN can trigger generations and edits. Results appear live in this window. A discovery file is written automatically."
+```bash
+python3 scripts/vml.py state
+python3 scripts/vml.py models edit                       # model ids the app lists (see the note on edit models below)
+python3 scripts/vml.py generate "a voxel cat knight at dawn" --aspect 16:9 --variants 2 --out out/
+python3 scripts/vml.py edit "open the moon's eyes, keep everything else the same" --image ending.png --out out/
+python3 scripts/vml.py compare "same instruction" --image ending.png --models gpt-image-2-5-flare-edit,nano-banana-2-1-edit --out out/
+```
 
-When enabled, the app shows the listening address. Provision the bearer credential through the local app; it is stored in the OS credential store and is not returned by the HTTP API.
+It saves every result to `--out` (`gen_0.png`, `edit_0.png`, `<model>_0.png` ...), prints a short JSON summary with
+timings and the file the app saved (`appFile`), and never prints image data. `compare` runs the same edit through
+several models in parallel so you can show the human a side-by-side with real timings.
 
-Then store the target:
+### Default models (the house picks; change them when better ones ship)
 
-**Preferred:** Add to `~/.hermes/config.yaml` under a `venice_local` section (example from verified 2026-05-21 instance):
+| Job | Default | Notes |
+|---|---|---|
+| Generate (text -> image) | `gpt-image-2-5-flare` | |
+| Edit (image + instruction) | `gpt-image-2-5-flare-edit` | Chosen 2026-10-09 over `nano-banana-2-1-edit` in a side-by-side: brighter, happier, kept the scene intact; ~20 s vs ~16 s for 1280x720. |
+
+The defaults live at the top of `scripts/vml.py` (`DEFAULT_MODELS`); `--model` overrides per call. When the human
+asks to try a new model, run `compare` against the current default and let them pick; then update the table and
+`DEFAULT_MODELS`. See `references/models.md` for how to find model ids.
+
+**Edit models the app doesn't list still work.** The app's edit list (`models edit`) only includes Venice models it
+classifies as edit-capable image models. Venice's newer edit models are typed `inpaint` by Venice (e.g.
+`gpt-image-2-5-flare-edit`, `nano-banana-2-1-edit`, `nano-banana-pro-edit`) and may be missing from that list, but
+`/api/v1/edit-image` passes the model id straight to Venice, so they work when named. The public list of Venice
+model ids is `https://api.venice.ai/api/v1/models?type=all` (no key needed).
+
+## 3. Rules that save time and credits
+
+- **Edits take images as data URLs, not file paths** (`data:image/png;base64,...`, up to 3 images). `vml.py` does
+  this for you. If you call the API yourself, write the JSON body to a file and send it with
+  `curl --data-binary @body.json`: the body is far too big for a command-line argument.
+- **Responses are huge.** Each result carries the full image as a base64 `dataUrl`, and edit results also echo the
+  input images back under `metadata.request.images`. Never print a raw response; extract `dataUrl` and write the file.
+- **Keep every result.** The edit endpoint needs the image itself, so save outputs as you go to chain
+  generate -> edit -> upscale without regenerating. To get an image back later, re-run generate with the same `seed`
+  or read the file from the app's output folder.
+- **Output size can differ from the input** (a 1280x720 input came back 1536x864). Resize to the size you need before
+  placing it in a project.
+- **For a faithful edit**, say what must stay the same ("keep everything exactly the same: ... Only change ...").
+- One request at a time per image job is fine; the app serializes heavy work. Edits take ~15-25 s.
+- Never burn/clear the human's output folder (`burn-folder`, `clear-results`, `move-to-burn`) without their explicit OK.
+- After a visible action, tell the human it's in the app: "It's in the Venice Media Local window now: N images from
+  <model>." (They like watching the cards appear: "theater mode".)
+
+## 4. The API (all under `http://<host>:<port>/api/v1`, header `Authorization: Bearer <token>`)
+
+Images: `POST /generate-image` {model, prompt, variants 1-4, aspectRatio?, resolution?, seed?, negativePrompt?,
+format?} · `POST /edit-image` {model, prompt, images:[dataUrl x1-3], aspectRatio?, resolution?} ·
+`POST /remove-background` {sourceImage} · `POST /upscale-image` {sourceImage, scale: 2|4}
+
+Video/audio (queue, then poll): `POST /queue-video` · `POST /retrieve-video` {queueId} · `POST /queue-music` ·
+`POST /queue-sfx` · `POST /retrieve-audio` {queueId} · `POST /generate-speech` · `POST /transcribe-audio`
+
+App: `GET /state` · `POST /refresh-models` · `POST /navigate` · `POST /open-output-folder` · `POST /open-burn-folder`
+· `POST /clear-results` · `POST /burn-folder` · `GET /burn-folder-stats` · `POST /move-to-burn` {paths}
+
+Any POST may add `"navigate": true` to switch the app to the matching tab. Exact request structs and examples:
+`references/venice-local-gui-request-types.md`. Server internals and how to add endpoints:
+`references/implementation-notes.md`. The routes above are revision-1 compatibility routes; revision-2 operations
+(event replay, sealed uploads, artifact streaming, transfer grants) are described in the implementation notes.
+
+## 5. Hermes users
+
+Hermes can keep the connection in `~/.hermes/config.yaml`:
 
 ```yaml
 venice_local:
-  target_host: "100.64.x.x"   # Tailscale IP of the Windows machine
-  port: 9876                  # default; use the discovery file/settings value
-  token: "<locally provisioned>" # never read this from discovery or API state
-  # output dir on Windows (from /api/v1/state): C:\Users\you\Desktop\VeniceMedia
+  target_host: "100.64.x.x"   # Tailscale IP of the machine running the app
+  port: 9876
+  token: "<locally provisioned>"
 ```
 
-Fallback: use the memory tool with the same keys.
-
-The app also writes the discovery file `%APPDATA%\community.venice.media.local\control-api.json` on startup when the feature is on. Use its `address`, `port`, manifest/health URLs, and credential fingerprint. It intentionally contains no bearer credential.
-
-## Available Control Endpoints (v1)
-
-All endpoints live under `http://<host>:<port>/api/v1`. The routes below are revision-1 compatibility routes; new automation should use revision-2 operations, event replay, sealed uploads, and artifact streaming.
-
-Revision-2 transfers require both `X-Transfer-Grant-ID` and `X-Transfer-Grant`. Never reuse a broad operation secret: each grant is exact-bound to operation/attempt/assignment/capability, method/path/scope, resource identity and media facts, validity interval, and use count. Upload IDs and hashes must already appear in the admitted `inputArtifacts`; completing staging cannot add or alter operation input.
-
-Auth header (required for now):
-`Authorization: Bearer ***
-
-### Core actions (these update the live GUI when we emit events)
-
-- `POST /api/v1/generate-image`
-  Body: ImageGenerationRequest (see types below)
-
-- `POST /api/v1/edit-image`          (ImageMultiEditRequest - body: model, prompt, images: [dataUrl], aspectRatio?)
-- `POST /api/v1/remove-background`
-- `POST /api/v1/upscale-image`
-
-- `POST /api/v1/queue-video`
-- `POST /api/v1/retrieve-video`   (poll with queue_id)
-
-- `POST /api/v1/queue-music`
-- `POST /api/v1/queue-sfx`
-- `POST /api/v1/retrieve-audio`
-
-- `POST /api/v1/generate-speech`
-- `POST /api/v1/transcribe-audio`
-
-### Management
-
-- `GET  /api/v1/state`                 → full AppState (models, settings, key status)
-- `POST /api/v1/refresh-models`
-- Model discovery is available through revision-2 `media.models.list` operations. There is no `/api/v1/models` route.
-- `POST /api/v1/navigate`
-- `POST /api/v1/open-output-folder`
-- `POST /api/v1/open-burn-folder`
-- `POST /api/v1/clear-results`
-- `POST /api/v1/burn-folder`           { seed?: string }
-- `GET  /api/v1/burn-folder-stats`
-- `POST /api/v1/move-to-burn`          { paths: string[] }
-- `POST /api/v1/actions/shutdown`       dedicated release action; requires the server-assigned `application:shutdown` permission independently of the body scope, exact instance/manifest binding, <=60 second validity, no successful replay or forced fallback
-
-### Types (authoritative, kept current)
-
-See the dedicated support file for the exact structs extracted from the live app source during real usage:
-
-`references/venice-local-gui-request-types.md`
-
-This file contains the full ImageGenerationRequest, AgentRequest wrapper, proven examples, and the verification-first flow that succeeded in practice.
-
-## How to actually call it (agent usage)
-
-**Proven pattern (verified against real instance 2026-05-21):**
-## How to actually call it (agent usage)
-
-**Proven pattern (verified against real instance 2026-05-21):**
-
-1. Always start with a quick health + model check:
-   ```bash
-   curl -H "Authorization: Bearer *** \
-     http://<host>:<port>/api/v1/state
-   ```
-   This returns current models, settings, output dir, and confirms the server is reachable.
-
-2. For image generation (primary use):
-   Use the exact shapes in `references/venice-local-gui-request-types.md`.
-
-   Minimal working example (succeeded in live test):
-   ```bash
-   curl -X POST \
-     http://100.64.131.86:<port>/api/v1/generate-image \
-     -H "Authorization: Bearer *** \
-     -H "Content-Type: application/json" \
-     -d '{
-       "model": "flux-2-max",
-       "prompt": "cyberpunk cat on a neon motorcycle",
-       "variants": 2,
-       "aspectRatio": "16:9"
-     }'
-   ```
-
-3. **CRITICAL — save the dataUrl immediately after every generation:**
-
-   The generation response contains the full base64 `dataUrl` of every output image.
-   The edit endpoint requires a dataUrl — NOT a Windows file path.
-   If you don't cache it, you will have to re-generate just to get the dataUrl back, wasting time and credits.
-
-   Always do this right after a successful generate call:
-   ```python
-   import json
-   result = json.loads(response_text)
-   # result may be a list (one item per variant) or a single dict
-   items = result if isinstance(result, list) else [result]
-   for i, item in enumerate(items):
-       path = f"/tmp/vml_last_generated_{i}.txt"
-       with open(path, "w") as f:
-           f.write(item["dataUrl"])
-   # Also save name for reference
-   with open("/tmp/vml_last_generated_name.txt", "w") as f:
-       f.write(items[0].get("name", ""))
-   ```
-
-   Then for any subsequent edit, read it back:
-   ```python
-   with open("/tmp/vml_last_generated_0.txt") as f:
-       dataurl = f.read().strip()
-   ```
-
-   For multi-variant generations, `_0`, `_1`, `_2`, `_3` correspond to each variant.
-   These files persist for the session so you can chain generate → edit → upscale seamlessly.
-
-4. **Sending edit payloads — always use a temp file, never --data-raw:**
-
-   Edit payloads contain a full base64 dataUrl and will exceed shell argument limits.
-   Always write the JSON body to a file and use `--data-binary @file`:
-   ```python
-   import json, subprocess
-   payload = {"model": "...", "prompt": "...", "images": [dataurl]}
-   with open("/tmp/vml_edit_payload.json", "w") as f:
-       json.dump(payload, f)
-   subprocess.run(["curl", "-s", "-X", "POST", url,
-       "-H", "Authorization: Bearer ***
-       "-H", "Content-Type: application/json",
-       "--data-binary", "@/tmp/vml_edit_payload.json"], ...)
-   ```
-
-5. **Mandatory theater-mode feedback** (user preference, do not skip):
-
-3. For image editing (`POST /api/v1/edit-image`):
-
-   The `images` field requires **base64 data URLs** (e.g. `data:image/webp;base64,...`), NOT Windows file paths.
-
-   **PITFALL:** Data URLs are hundreds of KB — far too large for curl's `--data` / `-d` argv. Always write the body to a temp file and use `--data-binary @/tmp/payload.json`:
-
-   ```python
-   import json, subprocess, tempfile
-   payload = {
-       "model": "grok-imagine-quality-edit",
-       "prompt": "place the cat in Venice, Italy...",
-       "images": [dataurl],   # full base64 data URL string
-       "navigate": True
-   }
-   with open('/tmp/edit_payload.json', 'w') as f:
-       json.dump(payload, f)
-   subprocess.run(["curl", "-s", "-X", "POST",
-       "http://<host>:<port>/api/v1/edit-image",
-       "-H", "Authorization: Bearer ***
-       "-H", "Content-Type: application/json",
-       "--data-binary", "@/tmp/edit_payload.json"],
-       capture_output=True, text=True, timeout=120)
-   ```
-
-   **Recovery tip:** If you didn't capture the dataUrl from generation, re-generate with the same `seed` value to get an identical image and its dataUrl. The seed is returned in the generation response.
-
-4. **Mandatory theater-mode feedback** (user preference, do not skip):
-   After any successful remote action (generate, edit, upscale, queue, etc.) say:
-   > "Check the Venice Media Local window on the ripper — I just [generated N variants / edited / queued ...] using [model] and they should be visible now."
-
-   This is the core of the "theater mode" experience the user wants.
-
-The response from generate/edit endpoints contains the saved file paths on the Windows machine.
-
-See `references/venice-local-gui-request-types.md` for the complete, up-to-date request structs and the recommended verification-first flow.
-
-## Current Status (as of 2026-05-21 verification)
-
-- Live toggle in Settings (off by default, starts/stops HTTP server immediately on flip, no app restart): **done**
-- HTTP server on the configured Tailscale/loopback bind (or explicit all-interface opt-in) with constant-time bearer authentication and OS-protected credential storage: **done**
-- Discovery file `control-api.json` written to app data dir automatically when enabled: **done**
-- Core endpoints implemented and wired directly to the real internal Rust functions (GUI updates live):
-  - GET /api/v1/state — **verified working**
-  - POST /api/v1/generate-image — **verified working** (with full event emission for live cards)
-  - POST /api/v1/refresh-models — **verified working**
-- POST /api/v1/edit-image — **verified working** (body: model, prompt, images:[dataUrl]; images field requires base64 data URLs, NOT file paths; payload too large for curl argv — must write to file and use --data-binary @file)
-- Additional endpoints (remove-background, upscale, video/audio queues, speech, burn, navigate): available and follow the same patterns (verified via source inspection)
-- Tauri event emission for instant card updates in GUI: **working in practice** (theater mode confirmed)
-- Skill is bundled inside the VeniceMediaLocal repo at `agent-skills/venice-local-gui/` (with README for open-source install)
-- New support file `references/venice-local-gui-request-types.md` added with exact Rust structs and proven usage pattern from live session
-
-This delivers the core "theater mode": the Hermes agent (on Linux via Tailscale) drives the live open Windows GUI and the human watches the cards appear in real time.
-
-## Safety Rules for the Agent
-
-- Never burn the folder without explicit human confirmation.
-- When doing long-running queue/retrieve, give progress updates.
-- If the target is unreachable, fall back to the normal direct `venice-media` skill and tell the human.
-- Always surface the "Check the Venice Media Local window on the ripper" message after remote actions.
-
-## Next Steps for the Human
-
-1. Give the agent the discovery address plus the separately provisioned credential. Never expect discovery or API state to reveal credential material.
-2. The agent will store it in `~/.hermes/config.yaml` under `venice_local`.
-3. Then you can say things like:
-   "Use the local app on the ripper to generate 3 variants of a cyberpunk city at night with flux-2-max"
-
-The agent will handle the rest and you will see it happen in the GUI.
-
----
-
-**This skill is the single source of truth for the agent about how to talk to your local Venice GUI.**
+and export it as `VML_URL` / `VML_TOKEN` before running `scripts/vml.py`.
