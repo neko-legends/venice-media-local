@@ -4530,6 +4530,15 @@ fn is_text_to_video_image_rejection(message: &str) -> bool {
 /// capability. Returns `(images, videos, audio)`. Non-R2V models return
 /// `(0, 0, 0)`.
 fn video_reference_limits(model_id: &str) -> (usize, usize, usize) {
+    // Video-to-video recast models (e.g. minimax-h3-max-recast) take a source video
+    // plus character/style reference images.
+    if model_id.contains("recast") {
+        return (4, 0, 0);
+    }
+    // Seedance 2.5 R2V: up to 9 images / 3 videos / 3 audios like Seedance 2.0.
+    if model_id.starts_with("seedance-2-5-reference-to-video") {
+        return (9, 3, 3);
+    }
     if !is_reference_to_video_model(model_id) {
         return (0, 0, 0);
     }
