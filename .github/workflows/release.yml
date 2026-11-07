@@ -37,6 +37,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          # GStreamer plugins that bundleMediaFramework copies into the AppImage.
+          # Without them WebKit finds no audio sink and its web process aborts
+          # the moment a <video> or <audio> preview loads.
+          sudo apt-get install -y gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-pulseaudio
       - uses: actions/setup-node@v5
         with:
           node-version: 22
