@@ -26,7 +26,7 @@ Normal Windows builds still use `Build-Windows.ps1`; the specific Phase 5H owner
 
 Platform note:
 
-This is a Tauri desktop app, so it is not Windows-only. Windows, macOS, and Linux users can build it from source. This repo may only provide Windows `.exe` builds in releases because that is the machine used to package and test official binaries right now. macOS and Linux users should ask their AI coding agent, or a developer friend, to install the local prerequisites and build the app on their own machine.
+This is a Tauri desktop app. Releases include Windows builds and a Linux AppImage (`Venice.Media.Local_<version>_amd64.AppImage`): make it executable (`chmod +x`) and run it, or let [Neko Legends Control Center](https://github.com/neko-legends/neko-legends-control-center) install, update and launch it for you. Tested on Omarchy (Arch Linux + Hyprland, Wayland, NVIDIA). On Linux the Venice API key is kept in the system keyring. macOS users can build from source.
 
 Installed and portable Windows builds share the same app identity, settings, and local control API. Venice Media Local runs as a single instance, so launching the portable app while the installed app is already open brings the existing window forward instead of starting a second copy.
 
@@ -77,7 +77,7 @@ Why this can be nicer than using a hosted web UI:
 - **Model control.** Use **Get Latest From Venice** to refresh models, then add/remove models locally for your own workflow.
 - **Community modifiable.** Because this is an open local app, the community can add presets, batch tools, naming rules, galleries, export packs, prompt templates, or workflow shortcuts without waiting for the official UI.
 - **Themeable.** The included themes give the app a few polished dark and light looks.
-- **Locally buildable.** It can produce a normal Windows setup executable from source, with macOS/Linux builds possible through Tauri.
+- **Locally buildable.** Releases ship Windows and Linux (AppImage) builds, and macOS builds are possible from source through Tauri.
 
 This is not meant to replace Venice. It is a local power-user workbench for Venice media generation.
 
