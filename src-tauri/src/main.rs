@@ -892,8 +892,16 @@ fn capability_machine_id() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "local-machine".to_string());
+        .filter(|value| !value.is_empty());
+    // HOSTNAME is a shell variable that is usually not exported on Linux.
+    #[cfg(target_os = "linux")]
+    let raw = raw.or_else(|| {
+        fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let raw = raw.unwrap_or_else(|| "local-machine".to_string());
     let normalized = raw
         .chars()
         .map(|ch| {
@@ -1156,7 +1164,15 @@ fn default_output_dir(app: &AppHandle) -> Result<String, String> {
     if let Some(dir) = TEST_APP_DATA_DIR.get() {
         return Ok(dir.join("output").to_string_lossy().to_string());
     }
+    #[cfg(not(target_os = "linux"))]
     let desktop = app.path().desktop_dir().map_err(|err| err.to_string())?;
+    // Many Linux setups have no Desktop folder (or XDG_DESKTOP_DIR points at
+    // $HOME), so use the XDG desktop dir only when it exists, else $HOME.
+    #[cfg(target_os = "linux")]
+    let desktop = match app.path().desktop_dir() {
+        Ok(dir) if dir.is_dir() => dir,
+        _ => app.path().home_dir().map_err(|err| err.to_string())?,
+    };
     Ok(desktop.join("VeniceMedia").to_string_lossy().to_string())
 }
 
@@ -7787,6 +7803,13 @@ async fn await_agent_control_stop(
 }
 
 fn main() {
+    // WebKitGTK's DMA-BUF renderer crashes on Wayland with NVIDIA
+    // ("Error 71 (Protocol error) dispatching to Wayland display").
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     if let Some(exit_code) = try_run_phase5h_migration_cli() {
         std::process::exit(exit_code);
     }

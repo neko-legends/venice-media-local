@@ -729,7 +729,10 @@ function pathDirectory(path: string): string {
 function joinPath(directory: string, fileName: string): string {
   if (!directory) return fileName
   if (!fileName) return directory
-  return /[\\/]$/.test(directory) ? `${directory}${fileName}` : `${directory}\\${fileName}`
+  if (/[\\/]$/.test(directory)) return `${directory}${fileName}`
+  // Windows paths use backslashes (or a drive letter); POSIX paths use '/'.
+  const separator = directory.includes('\\') || /^[a-zA-Z]:/.test(directory) ? '\\' : '/'
+  return `${directory}${separator}${fileName}`
 }
 
 function defaultSavePath(preferredPath: string, lastSaveDir: string): string {
