@@ -3805,6 +3805,14 @@ function fileFilterForResult(result: MediaResult) {
 
 type ImageSaveFormat = 'png' | 'webp'
 
+// WebKitGTK's GStreamer video path stutters badly in the Linux AppImage, so on
+// Linux the preview's play button hands the file to the desktop's default player.
+const PLAY_VIDEO_EXTERNALLY = typeof navigator !== 'undefined' && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
+
+function openMediaFile(path: string) {
+  call<string>('open_media_file', { path }).catch((err) => console.error('Failed to open media file', err))
+}
+
 function mediaSourceForResult(result: MediaResult) {
   if (result.mimeType.startsWith('audio/') && result.dataUrl) return result.dataUrl
   return result.filePath ? convertFileSrc(result.filePath) : result.dataUrl
@@ -3846,7 +3854,27 @@ const ResultCard = memo(function ResultCard({
           }}
         />
       )}
-      {result.mimeType.startsWith('video/') && (
+      {result.mimeType.startsWith('video/') && PLAY_VIDEO_EXTERNALLY && result.filePath ? (
+        <button
+          className="video-external"
+          type="button"
+          title="Play in default video player"
+          onClick={() => openMediaFile(result.filePath)}
+        >
+          <video
+            src={`${previewSource}#t=0.1`}
+            preload="metadata"
+            muted
+            tabIndex={-1}
+            onError={() => {
+              if (!useDataUrlPreview && result.dataUrl) setUseDataUrlPreview(true)
+            }}
+          />
+          <span className="video-external-play" aria-hidden="true">
+            <Play size={28} />
+          </span>
+        </button>
+      ) : result.mimeType.startsWith('video/') ? (
         <video
           src={previewSource}
           controls
@@ -3855,7 +3883,7 @@ const ResultCard = memo(function ResultCard({
             if (!useDataUrlPreview && result.dataUrl) setUseDataUrlPreview(true)
           }}
         />
-      )}
+      ) : null}
       {result.mimeType.startsWith('audio/') && <audio src={mediaSource} controls />}
       {result.mimeType.startsWith('text/') && <pre className="transcript-preview">{result.text}</pre>}
       <div className="result-meta">
@@ -3878,6 +3906,12 @@ const ResultCard = memo(function ResultCard({
             <button className="link-button" type="button" onClick={onSave}>
               <Download size={16} />
               Save
+            </button>
+          )}
+          {result.mimeType.startsWith('video/') && result.filePath && (
+            <button className="link-button" type="button" onClick={() => openMediaFile(result.filePath)}>
+              <Play size={14} />
+              Open in player
             </button>
           )}
           {onEdit && (

@@ -4321,6 +4321,7 @@ fn open_folder_path(path: &Path) -> Result<(), String> {
     let mut command = {
         let mut command = Command::new("xdg-open");
         command.arg(path);
+        strip_appimage_environment(&mut command);
         command
     };
 
@@ -4328,6 +4329,81 @@ fn open_folder_path(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
+}
+
+/// Open a file with the desktop's default application (e.g. mpv for video).
+fn open_file_with_default_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", ""]).arg(path);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        strip_appimage_environment(&mut command);
+        command
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
+}
+
+/// Inside an AppImage the runtime points LD_LIBRARY_PATH, GTK/GIO/GStreamer
+/// module paths, XDG_DATA_DIRS etc. into its own mount. Host programs launched
+/// via xdg-open (Nautilus, mpv, the browser) load the bundled, older libraries
+/// and crash ("undefined symbol: g_string_new_take"), so drop every entry that
+/// points into $APPDIR plus the AppImage bookkeeping variables.
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn strip_appimage_environment(command: &mut Command) {
+    let Some(appdir) = std::env::var_os("APPDIR") else {
+        return;
+    };
+    let appdir = appdir.to_string_lossy().trim_end_matches('/').to_string();
+    if appdir.is_empty() {
+        return;
+    }
+    for (key, value) in std::env::vars_os() {
+        let value = value.to_string_lossy().to_string();
+        if !value.contains(&appdir) {
+            continue;
+        }
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|entry| !entry.is_empty() && !entry.starts_with(&appdir))
+            .collect();
+        if kept.is_empty() {
+            command.env_remove(&key);
+        } else {
+            command.env(&key, kept.join(":"));
+        }
+    }
+    for key in [
+        "APPDIR",
+        "APPIMAGE",
+        "ARGV0",
+        "OWD",
+        "GTK_THEME",
+        "GST_REGISTRY_REUSE_PLUGIN_SCANNER",
+        "WEBKIT_DISABLE_DMABUF_RENDERER",
+    ] {
+        command.env_remove(key);
+    }
 }
 
 fn open_url(url: &str) -> Result<(), String> {
@@ -4354,6 +4430,7 @@ fn open_url(url: &str) -> Result<(), String> {
     let mut command = {
         let mut command = Command::new("xdg-open");
         command.arg(trimmed);
+        strip_appimage_environment(&mut command);
         command
     };
 
@@ -4403,6 +4480,18 @@ fn open_file_folder(app: AppHandle, path: String) -> Result<String, String> {
         .ok_or_else(|| "Saved file has no parent folder".to_string())?;
     open_folder_path(folder)?;
     Ok(folder.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_media_file(app: AppHandle, path: String) -> Result<String, String> {
+    let _permit = claim_direct_work(&app)?;
+    let file_path = PathBuf::from(path.trim());
+    if !file_path.is_file() {
+        return Err(format!("File not found: {}", file_path.to_string_lossy()));
+    }
+    ensure_under_output(&app, &file_path)?;
+    open_file_with_default_app(&file_path)?;
+    Ok(file_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -7903,6 +7992,7 @@ fn main() {
             open_output_folder,
             open_burn_folder,
             open_file_folder,
+            open_media_file,
             burn_folder,
             refresh_models,
             check_for_update,
