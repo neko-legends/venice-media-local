@@ -171,6 +171,10 @@ struct ModelCache {
     voice_models: Vec<ModelRecord>,
     #[serde(default)]
     transcribe_models: Vec<ModelRecord>,
+    /// True when edit_models came from Venice's live type=inpaint catalog; the
+    /// built-in edit fallbacks (some retired upstream) are then not merged in.
+    #[serde(default)]
+    edit_catalog_live: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1629,6 +1633,7 @@ fn fallback_model_cache() -> ModelCache {
                 transcribe_controls(true, true),
             ),
         ],
+        edit_catalog_live: false,
     }
 }
 
@@ -1649,7 +1654,7 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
     }
     if cache.edit_models.is_empty() {
         cache.edit_models = fallback.edit_models.clone();
-    } else {
+    } else if !cache.edit_catalog_live {
         append_missing_models(&mut cache.edit_models, &fallback.edit_models);
     }
     if cache.video_models.is_empty() {
@@ -3152,6 +3157,7 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
     };
     let image_entries = category("image", image_result);
     let inpaint_entries = category("inpaint", inpaint_result);
+    let edit_catalog_live = !inpaint_entries.is_empty();
     let video_entries = category("video", video_result);
     let music_entries = category("music", music_result);
     let tts_entries = category("tts", tts_result);
@@ -3237,6 +3243,7 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
             .collect(),
         voice_models,
         transcribe_models,
+        edit_catalog_live,
     };
 
     if cache.image_models.is_empty() {
@@ -3244,6 +3251,7 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
     }
     if cache.edit_models.is_empty() {
         cache.edit_models = previous.edit_models;
+        cache.edit_catalog_live = previous.edit_catalog_live;
     }
     if cache.video_models.is_empty() {
         cache.video_models = previous.video_models;
@@ -4339,7 +4347,7 @@ fn open_folder_path(path: &Path) -> Result<(), String> {
 
     command
         .spawn()
-        .map(|_| ())
+        .map(reap_in_background)
         .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
 }
 
@@ -4372,8 +4380,16 @@ fn open_file_with_default_app(path: &Path) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ())
+        .map(reap_in_background)
         .map_err(|err| format!("Failed to open {}: {err}", path.to_string_lossy()))
+}
+
+/// Wait on a launcher process (xdg-open, explorer, open) off-thread so it
+/// does not linger as a zombie after it hands off to the real app.
+fn reap_in_background(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Inside an AppImage the runtime points LD_LIBRARY_PATH, GTK/GIO/GStreamer
@@ -4448,7 +4464,7 @@ fn open_url(url: &str) -> Result<(), String> {
 
     command
         .spawn()
-        .map(|_| ())
+        .map(reap_in_background)
         .map_err(|err| format!("Failed to open update URL: {err}"))
 }
 
@@ -8058,6 +8074,25 @@ mod tests {
         let record = normalize_model(entry, "inpaint").expect("inpaint model");
         assert_eq!(record.kind, "edit");
         assert_eq!(record.modes, vec!["edit-image".to_string()]);
+    }
+
+    #[test]
+    fn live_edit_catalog_skips_retired_fallbacks() {
+        let live_model = normalize_model(
+            json!({ "id": "krea-3-edit", "type": "inpaint", "model_spec": { "name": "Krea 3" } }),
+            "inpaint",
+        )
+        .unwrap();
+        let mut live = fallback_model_cache();
+        live.edit_models = vec![live_model.clone()];
+        live.edit_catalog_live = true;
+        apply_model_fallbacks(&mut live);
+        assert_eq!(live.edit_models.len(), 1);
+
+        let mut stale = fallback_model_cache();
+        stale.edit_models = vec![live_model];
+        apply_model_fallbacks(&mut stale);
+        assert!(stale.edit_models.iter().any(|model| model.id == "qwen-edit"));
     }
 
     #[test]
