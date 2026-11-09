@@ -821,7 +821,9 @@ function modelList(cache: ModelCache, overrides: Overrides, kind: ModelKind): Mo
   const stock = cache[kindToCacheKey[kind]] ?? []
   const custom = overrides.custom[kind] ?? []
   const byId = new Map<string, ModelRecord>()
-  for (const model of [...stock, ...custom]) {
+  // Catalog entries from "Get latest from Venice" win over a custom entry with
+  // the same id: they carry the live controls (aspect ratios, resolutions, ...).
+  for (const model of [...custom, ...stock]) {
     if (!hidden.has(model.id)) byId.set(model.id, model)
   }
   return Array.from(byId.values()).sort((a, b) => modelDisplayName(a).localeCompare(modelDisplayName(b)))
