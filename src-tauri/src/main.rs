@@ -2953,8 +2953,10 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
     );
 
     match model_type {
-        "image" => {
-            let is_edit = text_contains_edit_signal(&haystack)
+        // Venice lists its edit models under type=inpaint (krea-3-edit, ...).
+        "image" | "inpaint" => {
+            let is_edit = model_type == "inpaint"
+                || text_contains_edit_signal(&haystack)
                 || value_contains_edit_signal(&constraints)
                 || value_contains_edit_signal(&capabilities)
                 || value_contains_edit_signal(&entry);
@@ -3120,14 +3122,16 @@ async fn fetch_model_type(model_type: &str) -> Result<Vec<Value>, String> {
 
 async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
     let previous = read_model_cache(app);
-    let (image_result, video_result, music_result, tts_result, asr_result) = tokio::join!(
+    let (image_result, inpaint_result, video_result, music_result, tts_result, asr_result) = tokio::join!(
         fetch_model_type("image"),
+        fetch_model_type("inpaint"),
         fetch_model_type("video"),
         fetch_model_type("music"),
         fetch_model_type("tts"),
         fetch_model_type("asr")
     );
     let any_success = image_result.is_ok()
+        || inpaint_result.is_ok()
         || video_result.is_ok()
         || music_result.is_ok()
         || tts_result.is_ok()
@@ -3147,6 +3151,7 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
         }
     };
     let image_entries = category("image", image_result);
+    let inpaint_entries = category("inpaint", inpaint_result);
     let video_entries = category("video", video_result);
     let music_entries = category("music", music_result);
     let tts_entries = category("tts", tts_result);
@@ -3160,9 +3165,16 @@ async fn refresh_models_inner(app: &AppHandle) -> Result<ModelCache, String> {
             .collect()
     };
 
+    let mut image_like_seen = HashSet::new();
     let image_like: Vec<ModelRecord> = image_entries
         .into_iter()
         .filter_map(|entry| normalize_model(entry, "image"))
+        .chain(
+            inpaint_entries
+                .into_iter()
+                .filter_map(|entry| normalize_model(entry, "inpaint")),
+        )
+        .filter(|entry| image_like_seen.insert(format!("{}:{}", entry.kind, entry.id)))
         .collect();
     let video_models = push_unique(
         video_entries
@@ -8029,6 +8041,41 @@ fn main() {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn inpaint_catalog_models_are_edit_models() {
+        // Venice's type=inpaint list is the edit catalog; trust the type even
+        // when neither the id nor the display name says "edit".
+        let entry = json!({
+            "id": "future-model-x",
+            "type": "inpaint",
+            "model_spec": {
+                "name": "Future Model X",
+                "constraints": { "aspectRatios": ["auto", "1:1"] },
+                "offline": false
+            }
+        });
+        let record = normalize_model(entry, "inpaint").expect("inpaint model");
+        assert_eq!(record.kind, "edit");
+        assert_eq!(record.modes, vec!["edit-image".to_string()]);
+    }
+
+    #[test]
+    fn live_inpaint_catalog_all_become_edit_models() {
+        let Ok(path) = std::env::var("VENICE_INPAINT_FIXTURE") else {
+            return;
+        };
+        let payload: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let entries = payload["data"].as_array().unwrap().clone();
+        let total = entries.len();
+        let records: Vec<ModelRecord> = entries
+            .into_iter()
+            .filter_map(|entry| normalize_model(entry, "inpaint"))
+            .collect();
+        assert!(records.iter().all(|record| record.kind == "edit"));
+        assert!(records.iter().any(|record| record.id == "krea-3-edit"));
+        eprintln!("live inpaint: {total} listed, {} edit models", records.len());
+    }
 
     struct TestControlTokenStore {
         value: RefCell<Option<String>>,
