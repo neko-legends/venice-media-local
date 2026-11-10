@@ -1673,6 +1673,13 @@ fn apply_model_fallbacks(cache: &mut ModelCache) {
         cache.transcribe_models = fallback.transcribe_models;
     }
 
+    // Caches written before the edit/image split was fixed list image
+    // generation models (catalog type "image") as edit models.
+    cache.edit_models.retain(|model| {
+        model.raw.get("type").and_then(Value::as_str) != Some("image")
+            || text_contains_edit_signal(&format!("{} {}", model.id, model.name))
+    });
+
     for model in &mut cache.image_models {
         apply_known_image_resolution_controls(model);
     }
@@ -2596,17 +2603,6 @@ fn text_contains_edit_signal(value: &str) -> bool {
             .any(|pattern| normalized.contains(pattern))
 }
 
-fn value_contains_edit_signal(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text_contains_edit_signal(text),
-        Value::Array(items) => items.iter().any(value_contains_edit_signal),
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, item)| text_contains_edit_signal(key) || value_contains_edit_signal(item)),
-        _ => false,
-    }
-}
-
 fn model_name(entry: &Value) -> String {
     let spec = entry.get("model_spec").unwrap_or(&Value::Null);
     as_string(spec, "name")
@@ -2960,11 +2956,11 @@ fn normalize_model(entry: Value, model_type: &str) -> Option<ModelRecord> {
     match model_type {
         // Venice lists its edit models under type=inpaint (krea-3-edit, ...).
         "image" | "inpaint" => {
-            let is_edit = model_type == "inpaint"
-                || text_contains_edit_signal(&haystack)
-                || value_contains_edit_signal(&constraints)
-                || value_contains_edit_signal(&capabilities)
-                || value_contains_edit_signal(&entry);
+            // Only the catalog type and the model's own id/name decide this.
+            // Descriptions can't: an image model's blurb often names its edit
+            // sibling ("It pairs with Seedream V5.5 Edit").
+            let is_edit =
+                model_type == "inpaint" || text_contains_edit_signal(&format!("{id} {name}"));
             let kind = if is_edit { "edit" } else { "image" };
             let mode = if is_edit {
                 "edit-image"
@@ -8109,6 +8105,29 @@ mod tests {
         let record = normalize_model(entry, "inpaint").expect("inpaint model");
         assert_eq!(record.kind, "edit");
         assert_eq!(record.modes, vec!["edit-image".to_string()]);
+    }
+
+    #[test]
+    fn image_model_describing_its_edit_sibling_stays_an_image_model() {
+        let entry = json!({
+            "id": "seedream-v5-5",
+            "type": "image",
+            "model_spec": {
+                "name": "Seedream V5.5",
+                "description": "Generates images. It pairs with Seedream V5.5 Edit.",
+                "constraints": { "aspectRatios": ["1:1"] }
+            }
+        });
+        let record = normalize_model(entry, "image").expect("image model");
+        assert_eq!(record.kind, "image");
+        assert_eq!(record.modes, vec!["generate-image".to_string()]);
+
+        let mut cache = fallback_model_cache();
+        let mut misfiled = record.clone();
+        misfiled.kind = "edit".to_string();
+        cache.edit_models.push(misfiled);
+        apply_model_fallbacks(&mut cache);
+        assert!(!cache.edit_models.iter().any(|model| model.id == "seedream-v5-5"));
     }
 
     #[test]

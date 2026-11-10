@@ -858,6 +858,15 @@ function selectedOrFirstModelId(
     : firstModelId(models)
 }
 
+// Venice pairs a generation model with an edit sibling: "seedream-v5-5" and
+// "seedream-v5-5-edit". When a selection holds the id from the wrong side of the
+// pair, return the sibling that belongs in this list.
+function pairedModelId(models: ModelRecord[], id: string, kind: 'image' | 'edit'): string {
+  if (!id || models.some((model) => model.id === id)) return ''
+  const sibling = kind === 'edit' ? `${id}-edit` : id.replace(/-edit$/, '')
+  return sibling !== id && models.some((model) => model.id === sibling) ? sibling : ''
+}
+
 // Venice image inputs take PNG or JPEG. Anything else (WebP, GIF, AVIF, ...) is converted to PNG.
 async function normalizeImageDataUrl(dataUrl: string): Promise<string> {
   if (!dataUrl.startsWith('data:') || /^data:image\/(png|jpeg);/i.test(dataUrl)) return dataUrl
@@ -1809,6 +1818,10 @@ export function App() {
     const selectedModels = settings.selectedModels ?? {}
     if (!imageModel && imageModels.length > 0) setImageModel(selectedOrFirstModelId(imageModels, selectedModels, 'image'))
     if (!editModel && editModels.length > 0) setEditModel(selectedOrFirstModelId(editModels, selectedModels, 'edit'))
+    const pairedImageModel = pairedModelId(imageModels, imageModel, 'image')
+    if (pairedImageModel) setImageModel(pairedImageModel)
+    const pairedEditModel = pairedModelId(editModels, editModel, 'edit')
+    if (pairedEditModel) setEditModel(pairedEditModel)
     if (!videoModel && videoModels.length > 0) setVideoModel(selectedOrFirstModelId(videoModels, selectedModels, 'video'))
     if (!musicModel && musicModels.length > 0) setMusicModel(selectedOrFirstModelId(musicModels, selectedModels, 'music'))
     if (!sfxModel && sfxModels.length > 0) setSfxModel(selectedOrFirstModelId(sfxModels, selectedModels, 'sfx'))
