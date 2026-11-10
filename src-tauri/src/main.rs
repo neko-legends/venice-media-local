@@ -4510,6 +4510,40 @@ fn open_file_folder(app: AppHandle, path: String) -> Result<String, String> {
     Ok(folder.to_string_lossy().to_string())
 }
 
+/// Reads an image file that was dropped on the window, as a data URL.
+///
+/// On Linux a drop from a file manager can arrive as a `file://` path instead of a file object,
+/// so the page asks for the bytes here. Only real image files are returned.
+#[tauri::command]
+fn read_dropped_image(path: String) -> Result<String, String> {
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path).map_err(|err| format!("Could not read the dropped file: {err}"))?;
+    if !metadata.is_file() {
+        return Err("The dropped item is not a file".to_string());
+    }
+    if metadata.len() > MAX_BYTES {
+        return Err("The dropped image is larger than 64 MB".to_string());
+    }
+    let bytes = fs::read(&path).map_err(|err| format!("Could not read the dropped file: {err}"))?;
+    let mime_type = dropped_image_mime(&bytes).ok_or_else(|| "The dropped file is not an image".to_string())?;
+    let encoded = general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+fn dropped_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") {
+        return Some("image/avif");
+    }
+    sniff_media_mime(bytes).filter(|mime| mime.starts_with("image/"))
+}
+
 #[tauri::command]
 fn open_media_file(app: AppHandle, path: String) -> Result<String, String> {
     let _permit = claim_direct_work(&app)?;
@@ -8021,6 +8055,7 @@ fn main() {
             open_burn_folder,
             open_file_folder,
             open_media_file,
+            read_dropped_image,
             burn_folder,
             refresh_models,
             check_for_update,

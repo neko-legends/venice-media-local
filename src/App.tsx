@@ -857,6 +857,21 @@ function selectedOrFirstModelId(
     : firstModelId(models)
 }
 
+// Venice image inputs take PNG or JPEG. Anything else (WebP, GIF, AVIF, ...) is converted to PNG.
+async function normalizeImageDataUrl(dataUrl: string): Promise<string> {
+  if (!dataUrl.startsWith('data:') || /^data:image\/(png|jpeg);/i.test(dataUrl)) return dataUrl
+  return convertImageDataUrl(dataUrl, 'image/png')
+}
+
+async function imageFileToDataUrl(file: File): Promise<string> {
+  let dataUrl = await fileToDataUrl(file)
+  if (!dataUrl.startsWith('data:image/')) {
+    const mimeType = imageMimeFromName(file.name) || 'image/png'
+    dataUrl = dataUrl.replace(/^data:[^;,]*/, `data:${mimeType}`)
+  }
+  return normalizeImageDataUrl(dataUrl)
+}
+
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -1082,8 +1097,40 @@ function isTranscribableFile(file: File): boolean {
   return TRANSCRIBE_FILE_EXTENSION.test(file.name)
 }
 
+const IMAGE_EXTENSION_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  avif: 'image/avif',
+}
+
+function imageMimeFromName(name: string): string {
+  return IMAGE_EXTENSION_MIME[name.toLowerCase().split('.').pop() ?? ''] ?? ''
+}
+
+// Some Linux file managers drop files without a MIME type, so the file name counts too.
 function isImageFile(file: File): boolean {
-  return file.type.startsWith('image/')
+  return file.type.startsWith('image/') || (!file.type && imageMimeFromName(file.name) !== '')
+}
+
+// Local image files named in a drop's `text/uri-list` (how some Linux drops arrive instead of file objects).
+function droppedImagePaths(dataTransfer: DataTransfer): string[] {
+  const text = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain')
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('file://'))
+    .map((line) => {
+      try {
+        return decodeURIComponent(new URL(line).pathname)
+      } catch {
+        return ''
+      }
+    })
+    .filter((path) => imageMimeFromName(path) !== '')
 }
 
 function fileMatchesAccept(file: File, accept: string): boolean {
@@ -2571,9 +2618,24 @@ export function App() {
     setResultGroups([])
   }
 
+  // Does not use runAction: an image can be dropped while a generation is running.
+  async function loadImageInput(load: () => Promise<string>): Promise<string | null> {
+    try {
+      return await load()
+    } catch (err) {
+      setError(`Could not load that image: ${err instanceof Error ? err.message : String(err)}`)
+      return null
+    }
+  }
+
   async function loadSourceImage(file: File) {
-    const dataUrl = await fileToDataUrl(file)
-    setSourceImage(dataUrl)
+    const dataUrl = await loadImageInput(() => imageFileToDataUrl(file))
+    if (dataUrl) setSourceImage(dataUrl)
+  }
+
+  async function setSourceImageFromData(value: string) {
+    const dataUrl = await loadImageInput(() => normalizeImageDataUrl(value))
+    if (dataUrl) setSourceImage(dataUrl)
   }
 
   async function loadSourceVideo(file: File) {
@@ -2597,8 +2659,13 @@ export function App() {
   }
 
   async function loadEditSourceImage(index: number, file: File) {
-    const dataUrl = await fileToDataUrl(file)
-    setEditSourceImages((existing) => existing.map((source, sourceIndex) => (sourceIndex === index ? dataUrl : source)))
+    const dataUrl = await loadImageInput(() => imageFileToDataUrl(file))
+    if (dataUrl) setEditSourceImage(index, dataUrl)
+  }
+
+  async function setEditSourceImageFromData(index: number, value: string) {
+    const dataUrl = await loadImageInput(() => normalizeImageDataUrl(value))
+    if (dataUrl) setEditSourceImage(index, dataUrl)
   }
 
   function setEditSourceImage(index: number, dataUrl: string) {
@@ -2630,8 +2697,13 @@ export function App() {
   }
 
   async function loadReferenceImage(index: number, file: File) {
-    const dataUrl = await fileToDataUrl(file)
-    setReferenceImage(index, dataUrl)
+    const dataUrl = await loadImageInput(() => imageFileToDataUrl(file))
+    if (dataUrl) setReferenceImage(index, dataUrl)
+  }
+
+  async function setReferenceImageFromData(index: number, value: string) {
+    const dataUrl = await loadImageInput(() => normalizeImageDataUrl(value))
+    if (dataUrl) setReferenceImage(index, dataUrl)
   }
 
   function clearReferenceImage(index: number) {
@@ -3072,7 +3144,7 @@ export function App() {
                     label="Image 1"
                     source={editSourceImages[0]}
                     onFile={(file) => loadEditSourceImage(0, file)}
-                    onSource={(value) => setEditSourceImage(0, value)}
+                    onSource={(value) => void setEditSourceImageFromData(0, value)}
                     onFlip={() => flipEditSourceImage(0)}
                     onClear={() => clearEditSourceImage(0)}
                   />
@@ -3083,7 +3155,7 @@ export function App() {
                         label={`Ref Image ${index + 1}`}
                         source={editSourceImages[index]}
                         onFile={(file) => loadEditSourceImage(index, file)}
-                        onSource={(value) => setEditSourceImage(index, value)}
+                        onSource={(value) => void setEditSourceImageFromData(index, value)}
                         onFlip={() => flipEditSourceImage(index)}
                         onClear={() => clearEditSourceImage(index)}
                       />
@@ -3167,7 +3239,7 @@ export function App() {
                             label="Image 1"
                             source={referenceImages[0] ?? ''}
                             onFile={(file) => loadReferenceImage(0, file)}
-                            onSource={(value) => setReferenceImage(0, value)}
+                            onSource={(value) => void setReferenceImageFromData(0, value)}
                             onFlip={() => flipReferenceImage(0)}
                             onClear={() => clearReferenceImage(0)}
                           />
@@ -3179,7 +3251,7 @@ export function App() {
                                   label={`Image ${index + 1}`}
                                   source={referenceImages[index] ?? ''}
                                   onFile={(file) => loadReferenceImage(index, file)}
-                                  onSource={(value) => setReferenceImage(index, value)}
+                                  onSource={(value) => void setReferenceImageFromData(index, value)}
                                   onFlip={() => flipReferenceImage(index)}
                                   onClear={() => clearReferenceImage(index)}
                                 />
@@ -3238,7 +3310,7 @@ export function App() {
                     <span className="notice-message">This is a text-to-video model — images are not supported and won&apos;t be sent.</span>
                   </div>
                 ) : (
-                  <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={setSourceImage} />
+                  <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={(value) => void setSourceImageFromData(value)} />
                 )}
                 {!isVideoUpscale && <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />}
                 {!isVideoUpscale && <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />}
@@ -4188,7 +4260,18 @@ function SourcePicker({
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault()
     setDragging(false)
-    chooseFile(Array.from(event.dataTransfer.files).find(isImageFile))
+    const file = Array.from(event.dataTransfer.files).find(isImageFile)
+    if (file) {
+      chooseFile(file)
+      return
+    }
+    const path = droppedImagePaths(event.dataTransfer)[0]
+    if (path) {
+      invoke<string>('read_dropped_image', { path })
+        .then((dataUrl) => chooseSource(dataUrl))
+        .catch(() => undefined)
+      return
+    }
     chooseSource(event.dataTransfer.getData('application/x-venice-image') || event.dataTransfer.getData('text/uri-list') || event.dataTransfer.getData('text/plain'))
   }
 
