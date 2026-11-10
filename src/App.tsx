@@ -1,4 +1,5 @@
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { listen } from '@tauri-apps/api/event'
 import { open, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import {
@@ -1488,6 +1489,72 @@ export function App() {
       updateBurnSeed(pointerSeed)
     })
   }
+
+  // Linux: the webview does not deliver file drops to the page (it opens the file instead), so the
+  // window takes them natively (tauri.linux.conf.json) and hands the path to the picker under the
+  // pointer, or to the first empty image picker on screen. Other platforms use the HTML drop events.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    const pickers = () =>
+      Array.from(document.querySelectorAll<HTMLElement>('[data-image-drop-target]')).filter((element) => element.offsetParent !== null)
+    const pickerAt = (position: { x: number; y: number } | undefined) => {
+      if (!position) return null
+      for (const scale of [window.devicePixelRatio || 1, 1]) {
+        const hit = document.elementFromPoint(position.x / scale, position.y / scale)?.closest<HTMLElement>('[data-image-drop-target]')
+        if (hit) return hit
+      }
+      return null
+    }
+    const highlight = (target: HTMLElement | null) => {
+      for (const element of document.querySelectorAll('.source-input.dragging-native')) {
+        if (element !== target) element.classList.remove('dragging-native', 'dragging')
+      }
+      target?.classList.add('dragging-native', 'dragging')
+    }
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload
+        if (payload.type === 'over' || payload.type === 'enter') {
+          highlight(pickerAt(payload.position))
+          return
+        }
+        highlight(null)
+        if (payload.type !== 'drop') return
+        const path = payload.paths.find((candidate) => imageMimeFromName(candidate) !== '')
+        if (!path) return
+        const visible = pickers()
+        const target = pickerAt(payload.position) ?? visible.find((element) => !element.classList.contains('loaded')) ?? visible[0]
+        if (!target) {
+          setError('Open Edit (or another tab with an image slot) and drop the image there.')
+          return
+        }
+        invoke<string>('read_dropped_image', { path })
+          .then((dataUrl) => target.dispatchEvent(new CustomEvent('venice-image-drop', { detail: dataUrl })))
+          .catch((err) => setError(`Could not load that image: ${String(err)}`))
+      })
+      .then((stop) => {
+        if (disposed) stop()
+        else unlisten = stop
+      })
+      .catch(() => undefined)
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
+
+  // Keep a file dropped outside a picker from replacing the app with that file.
+  useEffect(() => {
+    const onOver = (event: globalThis.DragEvent) => event.preventDefault()
+    const onDrop = (event: globalThis.DragEvent) => event.preventDefault()
+    window.addEventListener('dragover', onOver)
+    window.addEventListener('drop', onDrop)
+    return () => {
+      window.removeEventListener('dragover', onOver)
+      window.removeEventListener('drop', onDrop)
+    }
+  }, [])
 
   useEffect(() => {
     let disposed = false
@@ -3921,9 +3988,10 @@ const ResultCard = memo(function ResultCard({
             if (!useDataUrlPreview && result.dataUrl) setUseDataUrlPreview(true)
           }}
           onDragStart={(event) => {
-            event.dataTransfer.setData('application/x-venice-image', result.dataUrl)
-            event.dataTransfer.setData('text/plain', result.dataUrl)
-            event.dataTransfer.setData('text/uri-list', result.dataUrl)
+            // Results kept on disk have no inline data: pass the file instead.
+            const value = result.dataUrl || (result.filePath ? `file://${encodeURI(result.filePath)}` : '')
+            event.dataTransfer.setData('application/x-venice-image', value)
+            event.dataTransfer.setData('text/plain', value)
             event.dataTransfer.effectAllowed = 'copy'
           }}
         />
@@ -4224,6 +4292,21 @@ function SourcePicker({
   const [dragging, setDragging] = useState(false)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const dropTargetRef = useRef<HTMLDivElement | null>(null)
+  const onSourceRef = useRef(onSource)
+  onSourceRef.current = onSource
+
+  // Images dropped through the native window drop (Linux) arrive here as data URLs.
+  useEffect(() => {
+    const element = dropTargetRef.current
+    if (!element) return
+    const onNativeDrop = (event: Event) => {
+      const dataUrl = String((event as CustomEvent<string>).detail ?? '')
+      if (dataUrl.startsWith('data:image/')) onSourceRef.current?.(dataUrl)
+    }
+    element.addEventListener('venice-image-drop', onNativeDrop)
+    return () => element.removeEventListener('venice-image-drop', onNativeDrop)
+  }, [])
 
   function chooseFile(file: File | undefined) {
     if (!file || !isImageFile(file)) return
@@ -4265,14 +4348,21 @@ function SourcePicker({
       chooseFile(file)
       return
     }
+    const inline = [
+      event.dataTransfer.getData('application/x-venice-image'),
+      event.dataTransfer.getData('text/uri-list'),
+      event.dataTransfer.getData('text/plain'),
+    ].find((value) => value.trim().startsWith('data:image/'))
+    if (inline) {
+      chooseSource(inline)
+      return
+    }
     const path = droppedImagePaths(event.dataTransfer)[0]
     if (path) {
       invoke<string>('read_dropped_image', { path })
         .then((dataUrl) => chooseSource(dataUrl))
         .catch(() => undefined)
-      return
     }
-    chooseSource(event.dataTransfer.getData('application/x-venice-image') || event.dataTransfer.getData('text/uri-list') || event.dataTransfer.getData('text/plain'))
   }
 
   function handlePaste(event: ClipboardEvent<HTMLDivElement>) {
@@ -4299,6 +4389,8 @@ function SourcePicker({
     <div className={classNames('source-picker', className)}>
       <input ref={inputRef} className="source-file-input" type="file" accept="image/*" onChange={handleInput} />
       <div
+        ref={dropTargetRef}
+        data-image-drop-target={onSource ? '' : undefined}
         role="button"
         tabIndex={0}
         className={classNames('source-input', source && 'loaded', dragging && 'dragging')}
@@ -4306,7 +4398,10 @@ function SourcePicker({
           event.preventDefault()
           setDragging(true)
         }}
-        onDragOver={(event) => event.preventDefault()}
+        onDragOver={(event) => {
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+        }}
         onDragLeave={() => setDragging(false)}
         onDrop={handleDrop}
         onPaste={handlePaste}

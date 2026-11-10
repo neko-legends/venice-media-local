@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Venice Media Local",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 540,
+        "backgroundColor": "#1e1f22",
+        "dragDropEnabled": true,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  }
+}
