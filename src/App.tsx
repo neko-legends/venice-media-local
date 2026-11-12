@@ -22,6 +22,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Scissors,
   Settings,
   Trash2,
@@ -95,6 +96,7 @@ type AppState = {
   buildVersion: string
   agentControlAddress: string
   startupTimings?: BackendStartupTimings
+  outputError?: string | null
 }
 
 type StartupTimingEntry = {
@@ -1117,6 +1119,8 @@ const IMAGE_EXTENSION_MIME: Record<string, string> = {
   avif: 'image/avif',
 }
 
+const IS_LINUX_DESKTOP = typeof navigator !== 'undefined' && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
+
 function imageMimeFromName(name: string): string {
   return IMAGE_EXTENSION_MIME[name.toLowerCase().split('.').pop() ?? ''] ?? ''
 }
@@ -1141,6 +1145,34 @@ function droppedImagePaths(dataTransfer: DataTransfer): string[] {
       }
     })
     .filter((path) => imageMimeFromName(path) !== '')
+}
+
+// What a native (Linux) window drop hands over: a local path for files from a file manager,
+// an asset.localhost or data: URL for a result dragged inside the app, or a web address for an
+// image dragged out of a browser. Resolves it to an image data URL.
+async function loadNativeDropImage(paths: string[]): Promise<string | null> {
+  for (const raw of paths) {
+    const entry = raw.trim()
+    if (!entry) continue
+    if (entry.startsWith('data:image/')) return entry
+    const asset = entry.match(/^(?:https?:\/\/)?asset\.localhost\/(.+)$/i) ?? entry.match(/^asset:\/\/localhost\/(.+)$/i)
+    if (asset) {
+      let path = asset[1].split(/[?#]/)[0]
+      if (/%[0-9a-f]{2}/i.test(path)) {
+        try {
+          path = decodeURIComponent(path)
+        } catch {
+          // keep it as is
+        }
+      }
+      return invoke<string>('read_dropped_image', { path: path.startsWith('/') ? path : `/${path}` })
+    }
+    if (/^https?:\/\//i.test(entry)) return invoke<string>('read_dropped_image_url', { url: entry })
+    if (entry.startsWith('/') && imageMimeFromName(entry.split(/[?#]/)[0]) !== '') {
+      return invoke<string>('read_dropped_image', { path: entry })
+    }
+  }
+  return null
 }
 
 function fileMatchesAccept(file: File, accept: string): boolean {
@@ -1530,16 +1562,18 @@ export function App() {
         }
         highlight(null)
         if (payload.type !== 'drop') return
-        const path = payload.paths.find((candidate) => imageMimeFromName(candidate) !== '')
-        if (!path) return
+        if (payload.paths.length === 0) return
         const visible = pickers()
         const target = pickerAt(payload.position) ?? visible.find((element) => !element.classList.contains('loaded')) ?? visible[0]
         if (!target) {
           setError('Open Edit (or another tab with an image slot) and drop the image there.')
           return
         }
-        invoke<string>('read_dropped_image', { path })
-          .then((dataUrl) => target.dispatchEvent(new CustomEvent('venice-image-drop', { detail: dataUrl })))
+        loadNativeDropImage(payload.paths)
+          .then((dataUrl) => {
+            if (dataUrl) target.dispatchEvent(new CustomEvent('venice-image-drop', { detail: dataUrl }))
+            else setError('That drop holds no image file.')
+          })
           .catch((err) => setError(`Could not load that image: ${String(err)}`))
       })
       .then((stop) => {
@@ -1550,6 +1584,40 @@ export function App() {
     return () => {
       disposed = true
       unlisten?.()
+    }
+  }, [])
+
+  // Linux: WebKitGTK fires no paste event on the image slots (they are not editable) and its
+  // clipboard API cannot read images, so Ctrl+V reads the clipboard natively and loads the image
+  // into the focused slot, the slot under the pointer, or the first empty one on screen.
+  useEffect(() => {
+    if (!IS_LINUX_DESKTOP) return
+    let pointer: { x: number; y: number } | null = null
+    const onMove = (event: globalThis.MouseEvent) => {
+      pointer = { x: event.clientX, y: event.clientY }
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'v') return
+      const active = document.activeElement
+      if (active instanceof HTMLElement && (active.matches('input, textarea, select') || active.isContentEditable)) return
+      const visible = Array.from(document.querySelectorAll<HTMLElement>('[data-image-drop-target]')).filter((element) => element.offsetParent !== null)
+      if (visible.length === 0) return
+      const focused = active instanceof HTMLElement ? active.closest<HTMLElement>('[data-image-drop-target]') : null
+      const hovered = pointer ? document.elementFromPoint(pointer.x, pointer.y)?.closest<HTMLElement>('[data-image-drop-target]') ?? null : null
+      const target = focused ?? hovered ?? visible.find((element) => !element.classList.contains('loaded')) ?? visible[0]
+      event.preventDefault()
+      invoke<string | null>('read_clipboard_image')
+        .then((dataUrl) => {
+          if (dataUrl) target.dispatchEvent(new CustomEvent('venice-image-drop', { detail: dataUrl }))
+          else setStatus('The clipboard holds no image')
+        })
+        .catch((err) => setError(`Could not paste the image: ${String(err)}`))
+    }
+    window.addEventListener('mousemove', onMove, { passive: true })
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('keydown', onKeyDown)
     }
   }, [])
 
@@ -1612,6 +1680,9 @@ export function App() {
         setAgentControlAddress(state.agentControlAddress)
         setStartupTimingSummary(summary)
         setStatus(formatStartupTimingStatus(summary))
+        if (state.outputError) {
+          setError(`Output folder unavailable (${state.settings.outputDir || 'default'}): ${state.outputError}. Check that the drive is mounted, or pick another folder in Settings.`)
+        }
         logStartupTimings(summary)
         finishStartup(appStateRequestEndedAt)
       })
@@ -3030,8 +3101,13 @@ export function App() {
       modes: [managerKind],
       controls: {},
     }
+    // Adding an id that was removed earlier brings it back: the hidden list
+    // filters custom entries too, so leaving it there would swallow the add.
     const next: Overrides = {
-      hidden: overrides.hidden,
+      hidden: {
+        ...overrides.hidden,
+        [managerKind]: (overrides.hidden[managerKind] ?? []).filter((entry) => entry !== id),
+      },
       custom: {
         ...overrides.custom,
         [managerKind]: [...(overrides.custom[managerKind] ?? []).filter((entry) => entry.id !== id), record],
@@ -3052,6 +3128,18 @@ export function App() {
       hidden: {
         ...overrides.hidden,
         [kind]: Array.from(new Set([...(overrides.hidden[kind] ?? []), id])),
+      },
+    }
+    setOverrides(next)
+    writeOverrides(next)
+  }
+
+  function restoreModel(kind: ModelKind, id: string) {
+    const next: Overrides = {
+      custom: overrides.custom,
+      hidden: {
+        ...overrides.hidden,
+        [kind]: (overrides.hidden[kind] ?? []).filter((entry) => entry !== id),
       },
     }
     setOverrides(next)
@@ -3541,6 +3629,17 @@ export function App() {
                   </button>
                 </form>
                 <ModelTable kind={managerKind} models={modelList(models, overrides, managerKind)} onHide={hideModel} />
+                {(overrides.hidden[managerKind] ?? []).length > 0 && (
+                  <>
+                    <h3 className="model-hidden-heading">Removed models</h3>
+                    <HiddenModelTable
+                      kind={managerKind}
+                      ids={overrides.hidden[managerKind] ?? []}
+                      catalog={models[kindToCacheKey[managerKind]] ?? []}
+                      onRestore={restoreModel}
+                    />
+                  </>
+                )}
               </div>
             )}
 
@@ -3961,7 +4060,7 @@ type ImageSaveFormat = 'png' | 'webp'
 
 // WebKitGTK's GStreamer video path stutters badly in the Linux AppImage, so on
 // Linux the preview's play button hands the file to the desktop's default player.
-const PLAY_VIDEO_EXTERNALLY = typeof navigator !== 'undefined' && /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent)
+const PLAY_VIDEO_EXTERNALLY = IS_LINUX_DESKTOP
 
 function openMediaFile(path: string) {
   call<string>('open_media_file', { path }).catch((err) => console.error('Failed to open media file', err))
@@ -4346,6 +4445,13 @@ function SourcePicker({
     } catch {
       // The normal paste event still works when direct clipboard reads are blocked.
     }
+    // WebKitGTK (Linux) cannot read clipboard images itself: ask the app.
+    try {
+      const dataUrl = await invoke<string | null>('read_clipboard_image')
+      if (dataUrl) chooseSource(dataUrl)
+    } catch {
+      // Nothing usable on the clipboard.
+    }
   }
 
   function handleInput(event: ChangeEvent<HTMLInputElement>) {
@@ -4618,6 +4724,38 @@ function modelConstraintSummary(model: ModelRecord): string {
   if (promptLimit !== null) details.push(`Prompt ${promptLimit.toLocaleString()} chars`)
 
   return details.join(' · ')
+}
+
+function HiddenModelTable({
+  kind,
+  ids,
+  catalog,
+  onRestore,
+}: {
+  kind: ModelKind
+  ids: string[]
+  catalog: ModelRecord[]
+  onRestore: (kind: ModelKind, id: string) => void
+}) {
+  const byId = new Map(catalog.map((model) => [model.id, model]))
+  return (
+    <div className="model-table">
+      {ids.map((id) => {
+        const model = byId.get(id)
+        return (
+          <div className="model-row" key={id}>
+            <div>
+              <strong>{model ? modelDisplayName(model) : id}</strong>
+              <small>{model ? id : `${id} · not in the current Venice catalog`}</small>
+            </div>
+            <button className="icon-button" type="button" onClick={() => onRestore(kind, id)} title="Restore model">
+              <RotateCcw size={16} />
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function ModelTable({

@@ -1445,6 +1445,13 @@ button {
   gap: 8px;
 }
 
+.model-hidden-heading {
+  margin: 8px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 .model-row {
   display: flex;
   align-items: center;

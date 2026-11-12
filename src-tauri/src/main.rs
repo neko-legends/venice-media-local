@@ -186,6 +186,9 @@ struct AppState {
     build_version: String,
     agent_control_address: String,
     startup_timings: StartupTimings,
+    /// Set when the output folder could not be prepared (for example an unmounted drive).
+    /// The rest of the state still loads so models and the version are not lost.
+    output_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4527,6 +4530,107 @@ fn read_dropped_image(path: String) -> Result<String, String> {
     Ok(format!("data:{mime_type};base64,{encoded}"))
 }
 
+/// Reads an image dropped as a web address (dragged from a browser) as a data URL.
+///
+/// Linux delivers such drops natively, as the address instead of the file, so the page asks for
+/// the bytes here. Only http(s) addresses that answer with real image bytes are accepted.
+#[tauri::command]
+async fn read_dropped_image_url(url: String) -> Result<String, String> {
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http(s) image addresses can be dropped".to_string());
+    }
+    // Image hosts and CDNs redirect a lot, unlike the Venice API the shared client is hardened for.
+    let response = reqwest::Client::builder()
+        .user_agent("venice-media-local/0.1")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|err| format!("Could not download the dropped image: {err}"))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| format!("Could not download the dropped image: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Could not download the dropped image: HTTP {}", response.status()));
+    }
+    if response.content_length().is_some_and(|length| length > MAX_BYTES as u64) {
+        return Err("The dropped image is larger than 64 MB".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("Could not download the dropped image: {err}"))?;
+    if bytes.len() > MAX_BYTES {
+        return Err("The dropped image is larger than 64 MB".to_string());
+    }
+    let mime_type = dropped_image_mime(&bytes).ok_or_else(|| "The dropped address is not an image".to_string())?;
+    Ok(format!("data:{mime_type};base64,{}", general_purpose::STANDARD.encode(&bytes)))
+}
+
+/// Reads an image from the system clipboard as a data URL, or `None` when it holds no image.
+///
+/// WebKitGTK neither fires paste events on the image slots (they are not editable) nor lets the
+/// async clipboard API read images, so on Linux the clipboard is read with wl-paste (Wayland,
+/// e.g. Omarchy screenshots) or xclip (X11).
+#[tauri::command]
+fn read_clipboard_image() -> Result<Option<String>, String> {
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let run = |program: &str, args: &[&str]| -> Option<Vec<u8>> {
+            let mut command = Command::new(program);
+            command.args(args).stdin(Stdio::null()).stderr(Stdio::null());
+            strip_appimage_environment(&mut command);
+            let output = command.output().ok()?;
+            output.status.success().then_some(output.stdout)
+        };
+        let types = if wayland {
+            run("wl-paste", &["--list-types"])
+        } else {
+            run("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        };
+        let Some(types) = types else {
+            return Err(if wayland {
+                "Could not read the clipboard: install wl-clipboard (wl-paste)".to_string()
+            } else {
+                "Could not read the clipboard: install xclip".to_string()
+            });
+        };
+        let types = String::from_utf8_lossy(&types);
+        let types: Vec<&str> = types.lines().map(str::trim).collect();
+        let preferred = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/avif"];
+        let Some(mime) = preferred
+            .iter()
+            .copied()
+            .find(|mime| types.contains(mime))
+            .or_else(|| types.iter().copied().find(|mime| mime.starts_with("image/")))
+        else {
+            return Ok(None);
+        };
+        let bytes = if wayland {
+            run("wl-paste", &["--no-newline", "--type", mime])
+        } else {
+            run("xclip", &["-selection", "clipboard", "-t", mime, "-o"])
+        }
+        .ok_or_else(|| "Could not read the image on the clipboard".to_string())?;
+        if bytes.len() > MAX_BYTES {
+            return Err("The clipboard image is larger than 64 MB".to_string());
+        }
+        let Some(mime_type) = dropped_image_mime(&bytes) else {
+            return Ok(None);
+        };
+        Ok(Some(format!("data:{mime_type};base64,{}", general_purpose::STANDARD.encode(&bytes))))
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
 fn dropped_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return Some("image/gif");
@@ -4874,7 +4978,7 @@ fn collect_app_state(
     });
 
     let started_at = Instant::now();
-    ensure_output_folders_for_settings(&app, &settings)?;
+    let output_error = ensure_output_folders_for_settings(&app, &settings).err();
     sections.push(StartupTimingEntry {
         name: "ensure output folders".to_string(),
         ms: elapsed_ms(started_at),
@@ -4906,6 +5010,7 @@ fn collect_app_state(
         key_configured: has_api_key(),
         models,
         build_version,
+        output_error,
         startup_timings: StartupTimings {
             setup_sections,
             app_state_sections: sections,
@@ -8052,6 +8157,8 @@ fn main() {
             open_file_folder,
             open_media_file,
             read_dropped_image,
+            read_dropped_image_url,
+            read_clipboard_image,
             burn_folder,
             refresh_models,
             check_for_update,
