@@ -1445,6 +1445,12 @@ button {
   gap: 8px;
 }
 
+.video-frame-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .model-hidden-heading {
   margin: 8px 0 0;
   font-size: 13px;

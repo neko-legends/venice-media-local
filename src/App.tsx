@@ -1460,6 +1460,8 @@ export function App() {
 
   const [sourceImage, setSourceImage] = useState('')
   const [sourceVideo, setSourceVideo] = useState('')
+  const [endImage, setEndImage] = useState('')
+  const [sourceAudio, setSourceAudio] = useState('')
   // Reference-to-video (R2V) multimodal inputs. Order maps to the <Image N>,
   // <Video N>, <Audio N> prompt tokens consumed by seedance-2-0-reference-to-video
   // and the other *-reference-to-video models.
@@ -1990,6 +1992,17 @@ export function App() {
   const maxReferenceImages = controlNumber(currentVideoModel, 'maxReferenceImages', isReferenceToVideo ? 3 : 0)
   const maxReferenceVideos = controlNumber(currentVideoModel, 'maxReferenceVideos', isReferenceToVideo ? 1 : 0)
   const maxReferenceAudios = controlNumber(currentVideoModel, 'maxReferenceAudios', 0)
+  const videoModelId = currentVideoModel?.id ?? ''
+  // Venice's catalog has no end-frame flag. First/last-frame models need one; Seedance
+  // image-to-video takes one optionally (Venice lists end_image among its media roles).
+  const requiresEndImage = /first-last-frame/.test(videoModelId)
+  const supportsEndImage = requiresEndImage || /^seedance-2-[05](-fast|-mini)?-image-to-video/.test(videoModelId)
+  // Video-to-video models (extend, recast, motion control, V2V) take a source video.
+  const supportsVideoInput = !isVideoUpscale && controlBool(currentVideoModel, 'supportsSourceVideo', false)
+  // Motion control animates a character image with the motion of the source video.
+  const supportsSourceImage = !isReferenceToVideo && !isTextToVideo
+    && (!supportsVideoInput || /motion-control/.test(videoModelId))
+  const supportsAudioInput = !isVideoUpscale && !isReferenceToVideo && controlBool(currentVideoModel, 'supportsAudioInput', false)
 
   // Resize the R2V reference arrays to match the selected model's caps when the
   // model changes. Preserves in-order entries and pads/truncates to the cap.
@@ -2794,6 +2807,20 @@ export function App() {
     setSourceVideo(dataUrl)
   }
 
+  async function loadEndImage(file: File) {
+    const dataUrl = await loadImageInput(() => imageFileToDataUrl(file))
+    if (dataUrl) setEndImage(dataUrl)
+  }
+
+  async function setEndImageFromData(value: string) {
+    const dataUrl = await loadImageInput(() => normalizeImageDataUrl(value))
+    if (dataUrl) setEndImage(dataUrl)
+  }
+
+  async function loadSourceAudio(file: File) {
+    setSourceAudio(await fileToDataUrl(file))
+  }
+
   async function loadTranscribeFile(file: File) {
     const dataUrl = await fileToDataUrl(file)
     setTranscribeAudio(dataUrl)
@@ -2937,8 +2964,19 @@ export function App() {
     const referenceImageUrls = referenceImages.map((value) => value.trim()).filter(Boolean)
     const referenceVideoUrls = referenceVideos.map((value) => value.trim()).filter(Boolean)
     const referenceAudioUrls = referenceAudios.map((value) => value.trim()).filter(Boolean)
-    if (!isVideoUpscale && isReferenceToVideo && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0) {
-      setError('Add at least one reference image or video for Reference-to-Video')
+    const missing = isVideoUpscale
+      ? ''
+      : isReferenceToVideo && referenceImageUrls.length === 0 && referenceVideoUrls.length === 0
+        ? 'Add at least one reference image or video for Reference-to-Video'
+        : requiresEndImage && (!sourceImage || !endImage)
+          ? 'First/last-frame video needs both a first frame and a last frame'
+          : supportsVideoInput && !sourceVideo
+            ? 'Add a source video (MP4, MOV or WebM) for this video-to-video model'
+            : /motion-control/.test(videoModelId) && !sourceImage
+              ? 'Motion control needs a character image and a source video'
+              : ''
+    if (missing) {
+      setError(missing)
       setStatus('Needs attention')
       setLastActionMs(null)
       return
@@ -2959,14 +2997,16 @@ export function App() {
           resolution: selectedVideoResolution || undefined,
           aspectRatio: selectedVideoAspectRatio || undefined,
         }
-    if (!isVideoUpscale && isReferenceToVideo) {
-      if (referenceImageUrls.length > 0) request.referenceImageUrls = referenceImageUrls
-      if (referenceVideoUrls.length > 0) request.referenceVideoUrls = referenceVideoUrls
-      if (referenceAudioUrls.length > 0) request.referenceAudioUrls = referenceAudioUrls
-    } else if (!isVideoUpscale && !isTextToVideo) {
-      // Plain I2V/V2V models keep the source-image path. Text-to-video models
-      // cannot accept an image, so we omit it entirely.
-      request.sourceImage = sourceImage
+    if (!isVideoUpscale) {
+      // Reference arrays go to R2V models and to any other model with reference slots
+      // (MiniMax Recast). Text-to-video models never get an image.
+      if (referenceImageUrls.length > 0 && maxReferenceImages > 0) request.referenceImageUrls = referenceImageUrls.slice(0, maxReferenceImages)
+      if (referenceVideoUrls.length > 0 && maxReferenceVideos > 0) request.referenceVideoUrls = referenceVideoUrls.slice(0, maxReferenceVideos)
+      if (referenceAudioUrls.length > 0 && maxReferenceAudios > 0) request.referenceAudioUrls = referenceAudioUrls.slice(0, maxReferenceAudios)
+      if (supportsSourceImage && sourceImage) request.sourceImage = sourceImage
+      if (supportsSourceImage && supportsEndImage && endImage) request.endImage = endImage
+      if (supportsVideoInput && sourceVideo) request.sourceVideo = sourceVideo
+      if (supportsAudioInput && sourceAudio) request.sourceAudio = sourceAudio
     }
 
     for (let variantIndex = 1; variantIndex <= variantCount; variantIndex += 1) {
@@ -3400,8 +3440,68 @@ export function App() {
                       <span className="notice-message">Topaz preserves the source duration and FPS. Choose 1x for enhancement, 2x for standard upscale, or 4x for maximum upscale.</span>
                     </div>
                   </div>
-                ) : isReferenceToVideo ? (
+                ) : (
                   <div className="reference-panel">
+                    {isTextToVideo && (
+                      <div className="notice inline warning" role="note">
+                        <Wand2 size={16} />
+                        <span className="notice-message">This is a text-to-video model — images are not supported and won&apos;t be sent.</span>
+                      </div>
+                    )}
+                    {supportsSourceImage && (supportsEndImage ? (
+                      <div className="reference-section">
+                        <div className="reference-section-head">
+                          <span>{requiresEndImage ? 'First and last frame' : 'Frames'}</span>
+                          <small className="reference-hint">
+                            {requiresEndImage ? 'The video starts on the first frame and ends on the last' : 'The last frame is optional'}
+                          </small>
+                        </div>
+                        <div className="video-frame-pair">
+                          <SourcePicker
+                            label="First Frame"
+                            source={sourceImage}
+                            onFile={loadSourceImage}
+                            onSource={(value) => void setSourceImageFromData(value)}
+                            onClear={() => setSourceImage('')}
+                          />
+                          <SourcePicker
+                            label={requiresEndImage ? 'Last Frame' : 'Last Frame (optional)'}
+                            source={endImage}
+                            onFile={loadEndImage}
+                            onSource={(value) => void setEndImageFromData(value)}
+                            onClear={() => setEndImage('')}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <SourcePicker
+                        label={/motion-control/.test(videoModelId) ? 'Character Image' : 'Source Image'}
+                        source={sourceImage}
+                        onFile={loadSourceImage}
+                        onSource={(value) => void setSourceImageFromData(value)}
+                        onClear={() => setSourceImage('')}
+                      />
+                    ))}
+                    {supportsVideoInput && (
+                      <MediaSlot
+                        label="Source Video"
+                        accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm"
+                        icon={Video}
+                        source={sourceVideo}
+                        onFile={loadSourceVideo}
+                        onClear={() => setSourceVideo('')}
+                      />
+                    )}
+                    {supportsAudioInput && (
+                      <MediaSlot
+                        label="Background Audio (optional)"
+                        accept="audio/mpeg,audio/wav,audio/x-wav,.mp3,.wav"
+                        icon={Volume2}
+                        source={sourceAudio}
+                        onFile={loadSourceAudio}
+                        onClear={() => setSourceAudio('')}
+                      />
+                    )}
                     {maxReferenceImages > 0 && (
                       <div className="reference-section">
                         <div className="reference-section-head">
@@ -3479,13 +3579,6 @@ export function App() {
                       </div>
                     )}
                   </div>
-                ) : isTextToVideo ? (
-                  <div className="notice inline warning" role="note">
-                    <Wand2 size={16} />
-                    <span className="notice-message">This is a text-to-video model — images are not supported and won&apos;t be sent.</span>
-                  </div>
-                ) : (
-                  <SourcePicker label="Source Image" source={sourceImage} onFile={loadSourceImage} onSource={(value) => void setSourceImageFromData(value)} />
                 )}
                 {!isVideoUpscale && <PromptArea label="Motion prompt" value={prompt} onChange={setPrompt} />}
                 {!isVideoUpscale && <PromptArea label="Negative prompt" value={negativePrompt} onChange={setNegativePrompt} rows={3} />}

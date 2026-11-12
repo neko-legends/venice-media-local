@@ -298,6 +298,10 @@ struct QueueMediaRequest {
     end_image: Option<String>,
     #[serde(alias = "source_video")]
     source_video: Option<String>,
+    /// Background audio for video models that take audio input (Wan 2.5-2.7).
+    /// Forwarded to Venice as `audio_url`.
+    #[serde(default, alias = "source_audio", alias = "audio_url", alias = "audioUrl")]
+    source_audio: Option<String>,
     duration: Option<String>,
     #[serde(alias = "duration_seconds")]
     duration_seconds: Option<String>,
@@ -5779,6 +5783,12 @@ async fn queue_video_inner(
         .filter(|value| !value.trim().is_empty())
     {
         body["video_url"] = json!(value);
+    }
+    if let Some(value) = request
+        .source_audio
+        .filter(|value| !value.trim().is_empty())
+    {
+        body["audio_url"] = json!(value);
     }
     {
         let (max_images, max_videos, max_audios) = video_reference_limits(&request.model);
