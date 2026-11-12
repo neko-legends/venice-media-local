@@ -3134,6 +3134,13 @@ export function App() {
     writeOverrides(next)
   }
 
+  function restoreAllModels() {
+    const next: Overrides = { custom: overrides.custom, hidden: {} }
+    setOverrides(next)
+    writeOverrides(next)
+    setStatus('Restored every removed model')
+  }
+
   function restoreModel(kind: ModelKind, id: string) {
     const next: Overrides = {
       custom: overrides.custom,
@@ -3618,6 +3625,16 @@ export function App() {
                   <button className="secondary-action" type="button" onClick={refreshModelCatalog}>
                     <RefreshCw size={16} />
                     Get Latest From Venice
+                  </button>
+                  <button
+                    className="secondary-action"
+                    type="button"
+                    onClick={restoreAllModels}
+                    disabled={!Object.values(overrides.hidden).some((ids) => (ids ?? []).length > 0)}
+                    title="Bring back every removed model, in every type"
+                  >
+                    <RotateCcw size={16} />
+                    Restore All
                   </button>
                 </div>
                 <form className="model-add" onSubmit={addCustomModel}>
@@ -4767,6 +4784,15 @@ function ModelTable({
   models: ModelRecord[]
   onHide: (kind: ModelKind, id: string) => void
 }) {
+  // Removing a row slides the next one under the pointer: ignore a second click right after,
+  // so a double-click cannot remove the neighbouring model too.
+  const lastRemoveAt = useRef(0)
+  function remove(id: string) {
+    const now = performance.now()
+    if (now - lastRemoveAt.current < 600) return
+    lastRemoveAt.current = now
+    onHide(kind, id)
+  }
   return (
     <div className="model-table">
       {models.map((model) => (
@@ -4775,7 +4801,7 @@ function ModelTable({
             <strong>{modelDisplayName(model)}</strong>
             <small title={modelConstraintSummary(model)}>{modelConstraintSummary(model)}</small>
           </div>
-          <button className="icon-button danger" type="button" onClick={() => onHide(kind, model.id)} title="Remove model">
+          <button className="icon-button danger" type="button" onClick={() => remove(model.id)} title="Remove model">
             <Trash2 size={16} />
           </button>
         </div>
